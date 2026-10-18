@@ -79,6 +79,57 @@ private:
 }
 
 // ---------------------------------------------------------------------------
+// Field traversal across an inheritance chain.
+//
+// TypeDescriptor::GetFieldCount reports *own* fields only (the descriptor for `Derived` deliberately does not list
+// `Base`'s members, so counts never double-count and the inspector can group them). Every consumer therefore has to
+// walk GetBaseType() itself — which this file initially did not, so a component with a reflected base saved without
+// its inherited fields: valid-looking output, silently missing data. Worst class of bug, hence the helper exists once
+// rather than at each call site.
+//
+// Order is base-first, then derived, so a scene file reads "the parts inherited from Base" followed by what the
+// specific type adds — which matches how the type is declared and keeps diffs stable when a field moves into a base.
+//
+// Constraint worth stating: field offsets in a descriptor are relative to the *most derived* object passed in, which
+// is correct for single inheritance (offset 0 for the base subobject). Multiple inheritance can place a base at a
+// non-zero offset, where the stored offset would be wrong; reflected component hierarchies use single inheritance, and
+// nothing in the engine needs more. Enforcing it at runtime would cost a check per field access to guard a case we do
+// not have, so it is documented instead.
+// ---------------------------------------------------------------------------
+
+//! Visits every serialisable field of `type` including inherited ones, base-first. `onField` receives the field and
+//! the offset-from-`object` address to read/write (always object + field.GetAddress(), see the constraint above).
+template <typename TCallback>
+void ForEachFieldInChain(const TypeDescriptor& type, TCallback&& onField)
+{
+    // Recursion depth here is the inheritance depth of a component type — a handful at most, and bounded in practice
+    // by registration (a base must already be registered), so no explicit stack is warranted.
+    if (const TypeDescriptor* base = type.GetBaseType(); base != nullptr)
+    {
+        ForEachFieldInChain(*base, onField);
+    }
+
+    for (Size index = 0; index < type.GetFieldCount(); ++index)
+    {
+        onField(type.GetField(index));
+    }
+}
+
+//! True when `name` is a field of `type` or of any base — needed so an inherited field is not reported as an unknown
+//! member while loading.
+[[nodiscard]] bool ChainHasField(const TypeDescriptor& type, std::string_view name)
+{
+    for (const TypeDescriptor* current = &type; current != nullptr; current = current->GetBaseType())
+    {
+        if (current->FindField(name) != nullptr)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Encode.
 // ---------------------------------------------------------------------------
 
@@ -90,23 +141,20 @@ JsonValue StructToJson(const void* object, const TypeDescriptor& type, DepthGuar
 {
     JsonObject members;
 
-    for (Size index = 0; index < type.GetFieldCount(); ++index)
-    {
-        const FieldDescriptor& field = type.GetField(index);
-
+    ForEachFieldInChain(type, [&](const FieldDescriptor& field) {
         // Runtime-only state never reaches disk. Skipped on both paths, so a file cannot smuggle a stale cached
         // pointer or accumulated timer back into a live component.
         if (field.HasFlag(FieldFlag_DontSerialize))
         {
-            continue;
+            return;
         }
 
         // Honoured on both paths: excluding read-only fields when writing but still loading them when reading would
-        // make a save/load pair asymmetric, so a component saved with the option off would be overwritten by a file
-        // that happens to contain the key.
+        // make a save/load pair asymmetric, so a component saved with the option off would still be overwritten by a
+        // file that happens to contain the key.
         if (!options.IncludeReadOnlyFields && field.HasFlag(FieldFlag_ReadOnly))
         {
-            continue;
+            return;
         }
 
         const std::string fieldPath = JoinPath(path, field.GetName());
@@ -118,11 +166,11 @@ JsonValue StructToJson(const void* object, const TypeDescriptor& type, DepthGuar
         // null, so this never discards a legitimately empty nested object.
         if (encoded.IsNull())
         {
-            continue;
+            return;
         }
 
         members.Set(field.GetName(), std::move(encoded));
-    }
+    });
 
     return JsonValue(std::move(members));
 }
@@ -333,7 +381,7 @@ bool StructFromJson(const JsonValue& json, void* object, const TypeDescriptor& t
     for (Size index = 0; index < source.GetCount(); ++index)
     {
         const std::string& key = source.GetKey(index);
-        if (type.FindField(key) == nullptr)
+        if (!ChainHasField(type, key))
         {
             diagnostics.Add(JoinPath(path, key) + ": '" + type.GetName() + "' has no field named '" + key +
                             "'; ignored");
@@ -343,17 +391,14 @@ bool StructFromJson(const JsonValue& json, void* object, const TypeDescriptor& t
     // Fields are visited in declaration order and a field absent from the JSON keeps its current value. That is what
     // makes adding a field to a component safe for every existing scene file: no migration, no version bump — the new
     // field simply gets the same default a freshly constructed component would have.
-    for (Size index = 0; index < type.GetFieldCount(); ++index)
-    {
-        const FieldDescriptor& field = type.GetField(index);
-
+    ForEachFieldInChain(type, [&](const FieldDescriptor& field) {
         if (field.HasFlag(FieldFlag_DontSerialize))
         {
-            continue;
+            return;
         }
         if (!options.IncludeReadOnlyFields && field.HasFlag(FieldFlag_ReadOnly))
         {
-            continue;
+            return;
         }
 
         // Deprecated needs no case here: that flag means "hidden from the inspector", not "not on disk" — old scenes
@@ -362,7 +407,7 @@ bool StructFromJson(const JsonValue& json, void* object, const TypeDescriptor& t
         const JsonValue* member = source.Find(field.GetName());
         if (member == nullptr)
         {
-            continue;  // Absent: keep the current/default value.
+            return;  // Absent from the file: keep the current/default value.
         }
 
         const std::string fieldPath = JoinPath(path, field.GetName());
@@ -370,7 +415,7 @@ bool StructFromJson(const JsonValue& json, void* object, const TypeDescriptor& t
         {
             allOk = false;
         }
-    }
+    });
 
     return allOk;
 }

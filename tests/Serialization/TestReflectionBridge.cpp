@@ -86,6 +86,26 @@ struct BridgeLevel1
     int Value = 1;
 };
 
+// A base + derived pair, to prove inherited fields are serialised. TypeDescriptor reports own fields only (so
+// counts never double-count and the inspector can group them), which means a consumer that forgets to walk
+// GetBaseType() silently saves a derived object without its base's data — valid-looking output, missing fields.
+struct BridgeBase
+{
+    int BaseValue = 1;
+    std::string Name = "base";
+};
+
+struct BridgeDerived : BridgeBase
+{
+    float OwnValue = 2.5f;
+};
+
+struct BridgeDerivedWithSkip : BridgeBase
+{
+    int OwnValue = 0;
+    int Skipped = 0;
+};
+
 FieldAttributes WithFlag(unsigned int flag)
 {
     FieldAttributes attributes;
@@ -122,6 +142,20 @@ const bool kBridgeTypesRegistered = []() {
         .Field("runtimeJunk", &BridgeComponent::RuntimeJunk, WithFlag(FieldFlag_DontSerialize))
         .Field("scriptState", &BridgeComponent::ScriptState, WithFlag(FieldFlag_ReadOnly))
         .Field("legacyValue", &BridgeComponent::LegacyValue, WithFlag(FieldFlag_Deprecated));
+
+    Registry::Get()
+        .RegisterType<BridgeBase>("BridgeBase")
+        .Field("baseValue", &BridgeBase::BaseValue)
+        .Field("name", &BridgeBase::Name);
+
+    Registry::Get()
+        .RegisterType<BridgeDerived>("BridgeDerived", "BridgeBase")
+        .Field("ownValue", &BridgeDerived::OwnValue);
+
+    Registry::Get()
+        .RegisterType<BridgeDerivedWithSkip>("BridgeDerivedWithSkip", "BridgeBase")
+        .Field("ownValue", &BridgeDerivedWithSkip::OwnValue)
+        .Field("skipped", &BridgeDerivedWithSkip::Skipped, WithFlag(FieldFlag_DontSerialize));
 
     Registry::Get().RegisterType<BridgeLevel3>("BridgeLevel3").Field("value", &BridgeLevel3::Value);
     Registry::Get()
@@ -169,6 +203,16 @@ BridgeComponent RoundTrip(const BridgeComponent& source)
     CHECK_FALSE(decodeErrors.HasErrors());
 
     return destination;
+}
+
+JsonValue ParseOrThrow(std::string_view text)
+{
+    JsonValue value;
+    JsonError error;
+    const bool ok = TryParseJson(text, value, &error);
+    INFO("parse failure: " << error.Format("<test>"));
+    REQUIRE(ok);
+    return value;
 }
 
 const char* FindFirst(const ConversionDiagnostics& diagnostics, const char* needle)
@@ -734,6 +778,98 @@ TEST_SUITE("Serialization/ReflectionBridge")
         CHECK(destination.Indices[4999] == 4999 * 3 - 1);
         CHECK(destination.Items.size() == 500u);
         CHECK(destination.Items[499].Count == 4990);
+    }
+
+    TEST_CASE("inherited fields are encoded, base-first")
+    {
+        const TypeDescriptor* type = Registry::Get().FindType("BridgeDerived");
+        REQUIRE(type != nullptr);
+        REQUIRE(type->GetBaseType() != nullptr);
+
+        // Sanity: the descriptor really does report own fields only, which is what makes this test meaningful.
+        CHECK(type->GetFieldCount() == 1u);
+
+        BridgeDerived derived;
+        derived.BaseValue = 42;
+        derived.Name = "from base";
+        derived.OwnValue = 3.75f;
+
+        ConversionDiagnostics diagnostics;
+        const JsonValue json = TypeToJson(&derived, *type, diagnostics);
+        CHECK_FALSE(diagnostics.HasErrors());
+
+        // All three fields present — the bug this guards against was the base's two fields vanishing entirely.
+        CHECK(json.FindMember("baseValue")->AsInt() == 42);
+        CHECK(json.FindMember("name")->AsString() == "from base");
+        CHECK(json.FindMember("ownValue")->AsDouble() == doctest::Approx(3.75));
+
+        // Base-first ordering: inherited members come before the derived type's own additions.
+        const JsonObject& object = json.AsObject();
+        REQUIRE(object.GetCount() == 3u);
+        CHECK(object.GetKey(0) == "baseValue");
+        CHECK(object.GetKey(1) == "name");
+        CHECK(object.GetKey(2) == "ownValue");
+    }
+
+    TEST_CASE("inherited fields decode, and are not reported as unknown members")
+    {
+        const TypeDescriptor* type = Registry::Get().FindType("BridgeDerived");
+        REQUIRE(type != nullptr);
+
+        // An inherited key must load without the "has no field named" diagnostic — that check has to consider bases.
+        const JsonValue json = ParseOrThrow(R"({"baseValue": 7, "name": "inherited", "ownValue": 1.5})");
+
+        BridgeDerived derived;
+        ConversionDiagnostics diagnostics;
+        REQUIRE(JsonToType(json, &derived, *type, diagnostics));
+        CHECK_FALSE(diagnostics.HasErrors());
+
+        CHECK(derived.BaseValue == 7);
+        CHECK(derived.Name == "inherited");
+        CHECK(derived.OwnValue == 1.5f);
+    }
+
+    TEST_CASE("inherited fields round-trip through text")
+    {
+        const TypeDescriptor* type = Registry::Get().FindType("BridgeDerived");
+        REQUIRE(type != nullptr);
+
+        BridgeDerived source;
+        source.BaseValue = -9;
+        source.Name = "round trip";
+        source.OwnValue = 0.125f;
+
+        ConversionDiagnostics encodeErrors;
+        const std::string text = WriteJson(TypeToJson(&source, *type, encodeErrors));
+        CHECK_FALSE(encodeErrors.HasErrors());
+
+        JsonValue reparsed;
+        REQUIRE(TryParseJson(text, reparsed));
+
+        BridgeDerived destination;
+        ConversionDiagnostics decodeErrors;
+        REQUIRE(JsonToType(reparsed, &destination, *type, decodeErrors));
+
+        CHECK(destination.BaseValue == source.BaseValue);
+        CHECK(destination.Name == source.Name);
+        CHECK(destination.OwnValue == source.OwnValue);
+    }
+
+    TEST_CASE("a DontSerialize flag on an inherited field is honoured")
+    {
+        const TypeDescriptor* type = Registry::Get().FindType("BridgeDerivedWithSkip");
+        REQUIRE(type != nullptr);
+
+        BridgeDerivedWithSkip value;
+        value.Skipped = 111;
+        value.BaseValue = 222;
+        value.OwnValue = 1.0f;
+
+        ConversionDiagnostics diagnostics;
+        const JsonValue json = TypeToJson(&value, *type, diagnostics);
+
+        CHECK(json.FindMember("skipped") == nullptr);
+        CHECK(json.FindMember("baseValue")->AsInt() == 222);
     }
 
     TEST_CASE("the bridge preserves values through text so a scene file is stable")

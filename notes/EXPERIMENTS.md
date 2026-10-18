@@ -472,3 +472,93 @@ mutation experiment into fabricated evidence. Skill `mutation-test-before-trusti
 * 470 doctest cases / 507 935 assertions across 6 executables, green in Debug (GCC) and under ASan+UBSan (clang).
 * Next: `.hpscene` load/save and prefabs on top of the bridge (entity identity by Guid, references, instantiation),
   then scripting so it can spawn them.
+
+---
+
+## Session 7 — `.hpscene` save/load, component factory, math-type descriptors
+
+### What was built
+
+* **`Scene::ComponentFactory`** — maps a scene-file component name to code that creates it. Loading knows only the name
+  written in the file; the ECS creates components through templated `AddComponent<T>`, so something must bridge
+  name → concrete type without the world knowing any component types (that open-type property is what lets plugins add
+  components at all). It lives in Scene, not ECS, so the ECS stays free of reflection/serialisation.
+* **`Scene::WriteScene` / `LoadScene` / `LoadSceneFromText`** — `.hpscene` format v1 with a version field, entity
+  identity by Guid, hierarchy by file-local id, components keyed by reflected type name.
+* **`MathReflection`** (new opt-in module) — descriptors for Vec2/Vec3/Vec4/Quat/Color.
+
+### Design decisions and why
+
+* **Two identity schemes.** `id` is a dense file-local index used for structure (parent links); `guid` is persistent
+  identity for cross-file references. GUIDs-only would force pasting UUIDs into every parent link, making hand-editing
+  a large scene miserable; indices-only would break references whenever entities are reordered between files. Both,
+  with the local index confined to one document, gets readable files *and* stable identity.
+* **Loading is two-phase** (create all entities → assign parents). Otherwise a child appearing before its parent in the
+  file could not link, forcing authoring tools and hand-editors to guarantee topological order for no benefit.
+* **Version refusal rather than best-effort.** A newer major version is refused, not partially loaded: the bridge
+  tolerates unknown fields, so a v2 file would "load successfully" while quietly discarding whatever structure v2 relies
+  on — data loss reported as success. Missing *fields* stay fine (they take defaults), which is forward compatibility
+  where it is safe and refusal where it is not.
+* **Structural errors abort; content errors degrade.** A malformed entity entry means the document cannot be trusted, so
+  the world is left untouched rather than half-replaced ("this level won't load" beats "this level half loaded and
+  something is missing"). An unknown component name or bad field value is a warning: those are the ordinary signature of
+  a newer/older build, and blocking the level over them is worse than skipping with a message naming it.
+* **`RegisterSceneTypes()` is explicit and idempotent, not a static initialiser.** This lives in a *static library*, and
+  a translation unit whose symbols nobody references is simply not linked in — so its registrations would silently never
+  run and scenes would save without transforms. `WriteScene`/`LoadScene` both call it; the cost is one atomic load.
+* **Math type names are stable strings** (`"Math.Vec3"`), not compiler-derived names: template-type output differs
+  across compilers (scene files would become compiler-specific) and a user component named `Vec3` could otherwise
+  collide with an engine type in the registry.
+
+### Bugs found (all by tests, none by reading)
+
+1. **Every component was silently skipped on save.** ECS storage identifies types by C++ *type info* name; Reflection
+   registers display names. Passing `storage.GetTypeName()` to `FindType()` looked exactly right and matched nothing —
+   saves "succeeded" while writing entities with no components at all. Fixed by resolving through the registry's
+   existing `FindTypeByTypeInfoName` index and keying files by the registered display name. Caught because 8 tests
+   failed at once, which is what a wrong *convention* looks like (a wrong code path fails one).
+2. **`ComponentFactory::Register<T>` was declared as a template but defined in the `.cpp`,** so no other translation
+   unit could instantiate it (`used but never defined`). Restructured: inline template over a non-template, type-erased
+   `RegisterFactory(typeName, callback, reflectionTypeName)`. The header exposes one small function and no container.
+3. **`WriteScene` hard-coded `"name": "UntitledScene"`,** writing a plausible-but-false value into every file. Replaced
+   with an optional `SceneName` that omits the key entirely when unset — an empty-looking name gets trusted by whatever
+   reads it.
+
+Also worth recording: **I asserted APIs that did not exist** while writing tests (`World::IsRoot`, `Registry::ForEachType`,
+`Entity::IsAlive`, `RegisterTypeWithBase`) and invented a helper (`TypeNameOf`) from memory of a design I had not
+actually built. Each cost one build cycle; the fix is to grep for the signature before writing call sites, which I did
+consistently after that.
+
+### Inheritance gap in the bridge (found while designing scene I/O, fixed there)
+
+`TypeDescriptor::GetFieldCount()` reports **own** fields only — so any consumer must walk `GetBaseType()`. The bridge
+did not, meaning a component with a reflected base saved *without its inherited fields*: valid-looking output, silently
+missing data. Fixed with one `ForEachFieldInChain` helper (base-first ordering) plus `ChainHasField` so an inherited key
+is not reported as unknown. Documented constraint: field offsets are relative to the most-derived object, correct for
+single inheritance; multiple inheritance could place a base at a non-zero offset, which reflected components do not use.
+
+Mutation-checked with the build gate in place: skipping base traversal fails 4 tests (the three inheritance cases plus
+one round-trip). Also verified `IsStale`/version mutations still fail their named tests after the refactor.
+
+### Methodology note
+
+Two of my own tests were **weak rather than wrong** and I only noticed via mutation testing:
+* "a child listed before its parent still links" asserted only root/child *counts*. A loader that resolves parents only
+  when already created keeps those counts right while dropping the actual edge — so the test could pass with a broken
+  hierarchy. Fixed by asserting `GetParent(child) == root` and positions, and by adding a case where the parent is a
+  **later** id (the direction that genuinely requires two-phase loading). That mutation now fails 4 tests instead of 3
+  unrelated ones.
+* A test named "destroying a subtree keeps only the survivor" asserted promotion behaviour that `DestroyEntity` does not
+  implement by default (promotion is an explicit opt-in, covered in the ECS suite). Renamed and split into two cases so
+  each mode is tested as documented rather than as I assumed.
+
+**Lesson.** A test that passes for the wrong reason is worse than no test: it retires your suspicion. Mutation testing
+finds these; asserting specific relationships (not counts) prevents them.
+
+### State at end of session 7
+
+* `main` = scaffold, Core, Math, Reflection, Serialization (JSON + bridge), **MathReflection**, ECS (+hierarchy),
+  **Scene** (transforms, `.hpscene` save/load, component factory).
+* **510 doctest cases / 502 622 assertions** across 6 executables; green in Debug (GCC) and ASan+UBSan (clang).
+* Next: prefabs (instantiate a saved document into an existing world — the `ClearWorldFirst=false` path is already
+  there), then scripting so it can spawn them, then Platform/renderer to make transforms visible.

@@ -53,7 +53,7 @@ bool Near(const Mat4& a, const Mat4& b, float epsilon = kEpsilon)
 Entity MakePlaceable(World& world, const Transform& local = Transform::Identity())
 {
     const Entity entity = world.CreateEntity();
-    world.AddComponent<LocalTransform>(entity).Value = local;
+    world.AddComponent<LocalTransform>(entity).SetFrom(local);
     return entity;
 }
 
@@ -62,21 +62,21 @@ Entity MakePlaceable(World& world, const Transform& local = Transform::Identity(
 Mat4 ExpectedWorld(const World& world, const Entity& entity)
 {
     Mat4 chain = Mat4::Identity();
-    std::vector<const Transform*> locals;
+    std::vector<Transform> locals;
 
     for (Entity cursor = entity; !cursor.IsNull();)
     {
         const LocalTransform* local = world.TryGetComponent<LocalTransform>(cursor);
         if (local != nullptr)
         {
-            locals.push_back(&local->Value);
+            locals.push_back(local->ToTransform());
         }
         cursor = world.GetParent(cursor);
     }
 
     for (auto it = locals.rbegin(); it != locals.rend(); ++it)
     {
-        chain = chain * (*it)->ToMatrix();
+        chain = chain * it->ToMatrix();
     }
 
     return chain;
@@ -135,7 +135,7 @@ TEST_SUITE("Scene/TransformHierarchy")
         // Rotate the pivot a quarter turn about +Y: the child must swing to -Z (right-handed convention).
         Transform rotated;
         rotated.Rotation = Quat::FromAxisAngle(Vec3(0.0f, 1.0f, 0.0f), kHalfPi).Normalized();
-        world.GetComponent<LocalTransform>(pivot).Value = rotated;
+        world.GetComponent<LocalTransform>(pivot).SetFrom(rotated);
 
         hierarchy.Update(world);
 
@@ -254,7 +254,7 @@ TEST_SUITE("Scene/TransformHierarchy")
 
         Transform moved;
         moved.Position = Vec3(0.0f, 50.0f, 0.0f);
-        world.GetComponent<LocalTransform>(root).Value = moved;
+        world.GetComponent<LocalTransform>(root).SetFrom(moved);
 
         hierarchy.Update(world);
         CHECK(Near(hierarchy.GetWorldMatrix(world, child).GetTranslation(), Vec3(1.0f, 50.0f, 0.0f)));

@@ -125,7 +125,7 @@ void TransformHierarchy::Update(World& world)
         // parentWorld * local, matching Transform::Concatenated (verified against it in tests). Composing matrices
         // rather than Transforms keeps one code path for the renderer's output and the gizmo/physics read-back, so
         // the two cannot drift apart.
-        m_WorldMatrices[entity.Slot] = inherited * local->Value.ToMatrix();
+        m_WorldMatrices[entity.Slot] = inherited * local->ToTransform().ToMatrix();
     }
 
     m_EvaluatedStructureVersion = world.GetStructureVersion();
@@ -238,7 +238,7 @@ Mat4 TransformHierarchy::ComposeAncestors(const World& world, const Entity& enti
     // correctly. Bounded by the entity count rather than trusting the tree to be acyclic — a cycle here would hang
     // the frame instead of reporting, and hangs are far harder to diagnose from a crash report.
     const LocalTransform* local = world.TryGetComponent<LocalTransform>(entity);
-    Mat4 result = local != nullptr ? local->Value.ToMatrix() : Mat4::Identity();
+    Mat4 result = local != nullptr ? local->ToTransform().ToMatrix() : Mat4::Identity();
 
     const Size budget = world.GetSlotCapacity() + 8;
     Size steps = 0;
@@ -255,7 +255,7 @@ Mat4 TransformHierarchy::ComposeAncestors(const World& world, const Entity& enti
         const LocalTransform* parentLocal = world.TryGetComponent<LocalTransform>(current);
         if (parentLocal != nullptr)
         {
-            result = parentLocal->Value.ToMatrix() * result;
+            result = parentLocal->ToTransform().ToMatrix() * result;
         }
 
         current = world.GetParent(current);

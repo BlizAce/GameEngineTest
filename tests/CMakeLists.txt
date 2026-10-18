@@ -38,6 +38,7 @@ endif()
 if(TARGET HollowpointScene)
     hp_add_module_test(Scene
         SOURCES
+            Scene/TestSceneIO.cpp
             Scene/TestTransformHierarchy.cpp
         LIBS Hollowpoint::Scene)
 endif()

@@ -99,7 +99,8 @@ Module → CMake target → directory:
 > **separate target** (`Hollowpoint::SerializationReflection`) because it needs Reflection; merging them would
 > make linking JSON drag Reflection along, and the layering rule would then rot quietly instead of failing a
 > build.
-| Scene          | `Hollowpoint::Scene`      | `engine/Scene`        | Core, Math, ECS           |
+| Scene          | `Hollowpoint::Scene`      | `engine/Scene`        | Core, Math, ECS, Reflection, Serialization(+Reflection), MathReflection |
+| MathReflection | `Hollowpoint::MathReflection` | `engine/MathReflection` | Core, Math, Reflection |
 | Asset          | `Hollowpoint::Asset`      | `engine/Asset`        | Core, Math, Serialization |
 | Platform       | `Hollowpoint::Platform`   | `engine/Platform`     | Core, Math (GLFW)     |
 | Graphics       | `Hollowpoint::Graphics`   | `engine/Graphics`     | Platform (NVRHI)      |

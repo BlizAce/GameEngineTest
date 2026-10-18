@@ -55,10 +55,12 @@ the shape the rest of the engine is designed to fit into; it is updated whenever
 | **Core** | ✅ complete | `tests/Core/` — 65 cases: assert routing, GUIDs, FNV hashing, logger (threaded, file sink), allocator + backends + stats, ref counting, clocks and game-time |
 | **Math** | ✅ complete | `tests/Math/` — 126 cases covering conventions (handedness, clip space, column-majority), transforms, volumes, colour transfer functions, RNG distribution |
 | **ECS** | ✅ core complete | `tests/ECS/` — 118 cases: entity handles + generations, sparse sets, world lifecycle with deferred destruction, component storage/iteration, parent-child hierarchy (cycle rejection, subtree destroy/promote, 20k-deep teardown) |
+| **MathReflection** | ✅ opt-in layer | descriptors for Vec2/Vec3/Vec4/Quat/Color; separate target so Math never depends on Reflection |
 | **Reflection** | ✅ core complete | `tests/Reflection/` — 34 cases: type/field descriptors, scalar bridge, enum + array handling, name interning |
 | **Serialization** | ✅ JSON layer complete | `tests/Serialization/` — 71 cases: document model, strict parser (grammar, UTF-8, surrogates, error positions), deterministic writer, round-trips incl. 20k random doubles |
 | **Scene** | ✅ transforms complete | `tests/Scene/` — 22 cases: world-transform evaluation (parent-before-child order, inheritance through transform-less nodes, staleness, 20k-deep chain) |
-| Prefabs / scene files | planned | instantiate from assets, references by Guid, `.hpscene` load/save on top of Serialization |
+| **Scene I/O** | ✅ `.hpscene` v1 complete | `tests/Scene/` — 36 cases: save/load round-trips, hierarchy + world-transform fidelity, two-phase parenting, version refusal, Guid identity/duplicates, unknown components, byte-stable re-save |
+| Prefabs | in progress | instantiate a saved document into an existing world (`ClearWorldFirst=false`), references by Guid, asset database on top |
 | Platform | planned | GLFW window, input, filesystem, threading |
 | Graphics | planned | NVRHI device, swapchain, buffers/textures, shader objects |
 | Asset | planned | glTF import, texture cook, asset database with GUIDs |

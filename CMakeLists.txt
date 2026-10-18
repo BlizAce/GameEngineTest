@@ -68,6 +68,7 @@ add_subdirectory(engine/Math)
 add_subdirectory(engine/Reflection)
 add_subdirectory(engine/Serialization)
 add_subdirectory(engine/ECS)
+add_subdirectory(engine/MathReflection)
 add_subdirectory(engine/Scene)
 
 if(HP_BUILD_TESTS)

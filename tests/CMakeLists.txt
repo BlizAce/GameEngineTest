@@ -23,6 +23,14 @@ if(TARGET HollowpointMath)
         LIBS Hollowpoint::Math)
 endif()
 
+if(TARGET HollowpointReflection)
+    hp_add_module_test(Reflection
+        SOURCES
+            Reflection/TestRegistry.cpp
+            Reflection/TestScalarAccess.cpp
+        LIBS Hollowpoint::Reflection)
+endif()
+
 if(TARGET HollowpointCore)
     hp_add_module_test(Core
         SOURCES

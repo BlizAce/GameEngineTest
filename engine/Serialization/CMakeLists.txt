@@ -25,3 +25,27 @@ target_link_libraries(HollowpointSerialization
     PUBLIC Hollowpoint::Core Hollowpoint::CompilerSetup)
 
 add_library(Hollowpoint::Serialization ALIAS HollowpointSerialization)
+
+# ---------------------------------------------------------------------------
+# Reflection-driven encode/decode — a SEPARATE target on purpose.
+#
+# The JSON layer above is a leaf (Core only) that anything may include. This bridge pulls in Reflection, and
+# Reflection will eventually want to be usable without serialization concerns. Keeping them apart is the only way
+# the "JSON depends on nothing" rule survives contact with future features: if they were one target, linking JSON
+# would drag Reflection along and the layering would rot quietly rather than failing a build.
+# ---------------------------------------------------------------------------
+
+add_library(HollowpointSerializationReflection STATIC)
+hp_set_engine_target(HollowpointSerializationReflection)
+
+target_include_directories(HollowpointSerializationReflection PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/Include")
+
+target_sources(HollowpointSerializationReflection PRIVATE
+    Include/Hollowpoint/Serialization/ReflectionBridge.h
+    Src/ReflectionBridge.cpp)
+
+target_link_libraries(HollowpointSerializationReflection
+    PUBLIC Hollowpoint::Serialization Hollowpoint::Reflection Hollowpoint::CompilerSetup)
+
+add_library(Hollowpoint::SerializationReflection ALIAS HollowpointSerializationReflection)

@@ -383,3 +383,92 @@ what makes 500-entity and 20k-deep cases meaningful instead of tautological.
   both toolchains are now part of the gate after a real portability bug passed GCC and failed clang.
 * Next: prefabs + `.hpscene` load/save on top of Serialization (reflection-driven component encode/decode, entity
   references by Guid), then Platform/renderer so the transform work becomes visible.
+
+---
+
+## Session 6 — Serialization: reflection-driven encode/decode (the bridge)
+
+### What was built and why it is shaped this way
+
+`Hollowpoint::SerializationReflection` (new **separate target**): reflected object ↔ `JsonValue`. This is what makes
+"declare a field once, get saving for free" true — scene files, prefabs and script-visible components all go through
+one implementation, so field layout knowledge exists in exactly one place.
+
+* **Separate CMake target on purpose.** The JSON layer must stay a Core-only leaf that anything can include; the bridge
+  pulls in Reflection. Merging them would make linking JSON drag Reflection along, and the layering rule would rot
+  quietly instead of failing a build.
+* **Field order follows declaration order** → deterministic output, diffable scene files.
+* **`DontSerialize` skipped on both paths**; `ReadOnly` saved by default (it describes the inspector, not the save
+  file — dropping it would reset scripted health/ammo on every load); `Deprecated` still loaded (that flag means
+  "hidden from the UI").
+* **Enums stored by name.** Inserting an enumerator mid-list then silently reinterpreting saved data is the failure
+  this prevents, and `"mode": "Directional"` beats `"mode": 2`. An unknown name is an error, not a fallback to zero:
+  `"Direcional"` quietly becoming `Point` is a bug nobody finds. Numeric form still loads (hand-written files, old builds).
+* **A field absent from JSON keeps its current value.** This is what makes adding a component field safe for every
+  existing scene file — no migration, no version bump; it simply gets the same default a fresh component would have.
+* **Unknown JSON members reported and skipped, not fatal** — the ordinary signature of a newer build or renamed field.
+  Losing one value with a message naming the type beats refusing to load the level.
+* **Diagnostics accumulate into a path-qualified list** (`BridgeComponent.nested.x: expected a number`) instead of
+  throwing or stopping at the first fault: a level with twelve bad fields should produce twelve messages in one pass,
+  because otherwise fixing them is a twelve-run errand.
+
+### Bug found (the expensive kind): double-applied field offsets
+
+Reflection's field helpers (`ReadFieldValue`, `ReadStringField`, `GetArrayElementAddress`, `ResizeArrayField`, …) all
+take the **containing object** and apply `field.GetAddress(object)` internally. The first bridge version passed
+already-offset field addresses into them, so the offset applied twice — not a wrong value but an out-of-bounds read,
+which segfaulted on the first `std::string` field. 27 of 34 new tests failed at once, which is what made it obvious
+the *convention* was wrong rather than one code path.
+
+Fix: every internal function in the file now takes `(object, field)` and never a pre-computed field address, with the
+rule written at the top of the file — "if you are tempted to hoist `GetAddress` as an optimisation, don't; either
+change every call in the function or none".
+
+**Lesson.** When an API's addressing convention is implicit, mixing it produces memory errors rather than type errors.
+State the convention once at the top of every file that touches it, in terms of what breaks.
+
+### Methodology flaw found while mutation-testing (worse than a test gap)
+
+Ran mutations to check the new tests are load-bearing. Mutation B (write enums numerically instead of by name)
+appeared **not** to be caught — the suite still reported 105/105 green. It had not been caught for a much dumber
+reason: **the mutation did not compile** (`-Werror=unused-variable` after neutering the condition), so ninja left the
+previous binary in place and I ran the old one.
+
+That is a false negative about my own test suite, recorded as evidence. Fixed by gating every mutation on build
+success:
+
+```sh
+cmake --build ... || { echo "BUILD FAILED (result meaningless)"; restore; exit 2; }
+./Tests
+```
+
+With the gate in place, all four semantic mutations were caught by exactly the intended tests:
+
+| Mutation | Caught by |
+| --- | --- |
+| `DontSerialize` ignored on write | `DontSerialize fields never reach the wire` |
+| Enums written numerically | `enums are stored by name, not number` |
+| Absent field resets to zero instead of keeping its value | `a field absent from JSON keeps its current value` |
+| Arrays never shrink | `arrays resize down when the file is shorter` |
+| Unknown members silently ignored | `an unknown JSON member is reported and skipped, not fatal` |
+
+**Lesson.** A negative result from a test run is only meaningful if you know which binary ran. Any "prove X fails"
+workflow must assert the build succeeded before trusting the run — otherwise `-Werror` (usually our friend) converts a
+mutation experiment into fabricated evidence. Skill `mutation-test-before-trusting-tests` updated with the gate.
+
+### Also found by tests, not reading
+
+* **Encode/decode asymmetry:** encode ignored `IncludeReadOnlyFields` while decode honoured it, so a file written with
+  the option off would still be loaded over a live component. Caught because both directions were tested against the
+  same option rather than each in isolation.
+* Two wrong expectations in my own tests (an unknown-key test asserted a pre-set value survived when the file did
+  contain that field; and `index * 3 - 1` at index 4999 is 14996, not 14997). Recorded because both looked like
+  implementation bugs for a minute — check the test's arithmetic before blaming the module.
+
+### State at end of session 6
+
+* `main` = scaffold, Core, Math, Reflection, Serialization (JSON + reflection bridge), ECS (+ hierarchy), Scene
+  (transforms).
+* 470 doctest cases / 507 935 assertions across 6 executables, green in Debug (GCC) and under ASan+UBSan (clang).
+* Next: `.hpscene` load/save and prefabs on top of the bridge (entity identity by Guid, references, instantiation),
+  then scripting so it can spawn them.

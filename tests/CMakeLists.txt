@@ -46,7 +46,8 @@ if(TARGET HollowpointSerialization)
     hp_add_module_test(Serialization
         SOURCES
             Serialization/TestJson.cpp
-        LIBS Hollowpoint::Serialization)
+            Serialization/TestReflectionBridge.cpp
+        LIBS Hollowpoint::Serialization Hollowpoint::SerializationReflection)
 endif()
 
 if(TARGET HollowpointReflection)

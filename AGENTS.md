@@ -94,9 +94,11 @@ Module → CMake target → directory:
 | Reflection     | `Hollowpoint::Reflection` | `engine/Reflection`   | Core, Math            |
 | Serialization  | `Hollowpoint::Serialization` | `engine/Serialization` | Core (JSON layer); +Math, +Reflection for the value bridge |
 
-> The JSON layer (`JsonValue`, parser, writer) depends on Core alone and must stay that way — it is a
-> leaf every module may include. Only the reflection-driven encode/decode bridge adds Math and
-> Reflection dependencies, and it belongs in its own target so the leaf property cannot rot.
+> The JSON layer (`Hollowpoint::Serialization`: `JsonValue`, parser, writer) depends on Core alone and must
+> stay that way — it is a leaf every module may include. The reflection-driven encode/decode bridge is a
+> **separate target** (`Hollowpoint::SerializationReflection`) because it needs Reflection; merging them would
+> make linking JSON drag Reflection along, and the layering rule would then rot quietly instead of failing a
+> build.
 | Scene          | `Hollowpoint::Scene`      | `engine/Scene`        | Core, Math, ECS           |
 | Asset          | `Hollowpoint::Asset`      | `engine/Asset`        | Core, Math, Serialization |
 | Platform       | `Hollowpoint::Platform`   | `engine/Platform`     | Core, Math (GLFW)     |

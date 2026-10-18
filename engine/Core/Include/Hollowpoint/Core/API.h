@@ -131,4 +131,9 @@
 #endif
 
 // Marks a value as intentionally unused; keeps -Werror=/W4 clean without (void) casts at call sites.
+//
+// MUST NOT wrap a side-effecting expression. It expands through sizeof, and sizeof does not evaluate its
+// operand — `HP_UNUSED(DoWork())` discards the call entirely and compiles silently. Use it only on names that
+// are bound but unread (parameters in disabled code paths, structured-binding placeholders). For a call whose
+// result is deliberately dropped, bind it to a named variable and static_cast<void> it, which does evaluate.
 #define HP_UNUSED(x) ((void)(sizeof((x), 0)))

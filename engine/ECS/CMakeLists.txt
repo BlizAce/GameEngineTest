@@ -13,7 +13,9 @@ target_include_directories(HollowpointECS PUBLIC
 target_sources(HollowpointECS PRIVATE
     Include/Hollowpoint/ECS/Detail/SparseSet.h
     Include/Hollowpoint/ECS/Entity.h
-    Src/Entity.cpp)
+    Include/Hollowpoint/ECS/World.h
+    Src/Entity.cpp
+    Src/World.cpp)
 
 target_link_libraries(HollowpointECS PUBLIC
     Hollowpoint::Core Hollowpoint::CompilerSetup)

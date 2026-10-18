@@ -28,6 +28,7 @@ if(TARGET HollowpointECS)
         SOURCES
             ECS/TestEntity.cpp
             ECS/TestSparseSet.cpp
+            ECS/TestWorld.cpp
         LIBS Hollowpoint::ECS)
 endif()
 

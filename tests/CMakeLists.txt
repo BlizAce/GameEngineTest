@@ -35,6 +35,13 @@ if(TARGET HollowpointECS)
         LIBS Hollowpoint::ECS)
 endif()
 
+if(TARGET HollowpointScene)
+    hp_add_module_test(Scene
+        SOURCES
+            Scene/TestTransformHierarchy.cpp
+        LIBS Hollowpoint::Scene)
+endif()
+
 if(TARGET HollowpointSerialization)
     hp_add_module_test(Serialization
         SOURCES

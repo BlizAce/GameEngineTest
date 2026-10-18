@@ -320,3 +320,66 @@ no logging); reporting lives where paths are known — the parser, and later the
 * 414 doctest cases / 481 405 assertions (65 Core + 126 Math + 34 Reflection + 71 Serialization + 118 ECS),
   green in Debug and under ASan+UBSan.
 * Next: reflection-driven encode/decode (engine types ↔ JSON with versioned fields), then transforms, prefabs/scenes.
+
+---
+
+## Session 5 — Scene: world-transform evaluation (+ ECS structure version)
+
+### What was built and why it is shaped this way
+
+New module `Hollowpoint::Scene` (Core + Math + ECS, no Graphics dependency — the renderer reads world matrices, never
+the other way round):
+
+* **`LocalTransform` stores the transform relative to its parent**, never in world space. It's the only representation
+  that survives reparenting (world coordinates either teleport the child or force a recompute of everything below),
+  and it lets an animator author "rotate the turret" without knowing where the tank is.
+* **`TransformHierarchy` derives world matrices** in one pass per frame and caches them by entity slot. World values
+  are *never* stored next to the local ones: two sources of truth require every write path (scripting, animation,
+  physics, editor gizmo, scene load) to remember to invalidate, one of them will forget, and the symptom — object
+  renders in the wrong place with correct data — reads as a renderer bug. With local-only storage, staleness is
+  impossible by construction.
+* **Traversal is parent-before-child and iterative.** Slot order would read a child's parent matrix before the parent
+  was updated this frame: a one-frame lag that appears as jitter on nested objects and disappears when things stop
+  moving — precisely the bug that survives review, so it has its own test (`evaluation order is parent-before-child
+  regardless of creation or slot order`). Iterative means depth costs worklist memory, never stack.
+* **Transform-less entities pass inheritance through.** A logic-only group node stores what it *inherited*, so a mesh
+  under it composes against the group's parent rather than snapping to world origin — behaviour users expect and which
+  then never needs explaining in docs.
+* **ECS gained `GetStructureVersion()`** (bumped by create/destroy/reparent-success) and **`GetEntityAtSlot()`**.
+  Derived caches compare one integer instead of every subsystem hooking three lifecycle events; nothing to forget
+  because there is nothing to hook. `Unchanged` reparents deliberately do *not* bump it — they happen constantly on
+  scene reload and would otherwise throw away every cache for nothing.
+
+### Experiment: are the new tests actually load-bearing?
+
+**Hypothesis.** A passing test suite proves the behaviours it claims are protected.
+
+**Method.** Mutate the implementation three ways after the suite goes green and check that a test fails — and that
+the *right* test fails, not some unrelated one:
+
+| Mutation | Result | Test that caught it |
+| --- | --- | --- |
+| Compose in slot order instead of parent-before-child | **caught** | `evaluation order is parent-before-child regardless of creation or slot order` |
+| Transform-less node stores identity instead of inheriting | **caught** | `entities without a LocalTransform pass their inherited transform to children` |
+| Never record the evaluated structure version | **caught** | `stale caches are detected and answered correctly rather than wrongly` |
+
+A fourth mutation (`IsStale` ignoring the version comparison) failed to compile because the member became unused —
+which is itself a signal: the compiler flags dead state that a subtler mutation would have left in place.
+
+**Conclusion.** All three semantic mutations were caught, each by the test named for that behaviour, so the suite is
+load-bearing rather than decorative. Method worth keeping: **write the implementation, then break it on purpose and
+check which test fires.** It costs minutes and directly measures what "the tests cover this" is actually worth. A test
+that never fails under mutation documents nothing.
+
+**Also worth keeping from this module:** every test compares against `ExpectedWorld()`, a deliberately naive reference
+implementation that walks up the parent chain. If both the system and the test used matrix composition tricks, an
+error in the trick would be invisible; comparing an O(depth) reference against the O(1)-per-entity production path is
+what makes 500-entity and 20k-deep cases meaningful instead of tautological.
+
+### State at end of session 5
+
+* `main` = scaffold, Core, Math, Reflection, Serialization (JSON), ECS (+ hierarchy), **Scene** (transforms).
+* 436 doctest cases / 502 210 assertions across 6 executables, green in Debug (GCC) and under ASan+UBSan (clang) —
+  both toolchains are now part of the gate after a real portability bug passed GCC and failed clang.
+* Next: prefabs + `.hpscene` load/save on top of Serialization (reflection-driven component encode/decode, entity
+  references by Guid), then Platform/renderer so the transform work becomes visible.

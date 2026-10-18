@@ -120,6 +120,24 @@ public:
         return m_Slots.size();
     }
 
+    //! Bumped by anything that changes *which* entities exist or how they are nested: creation, destruction and
+    //! reparenting. Derived state (world-transform caches, culling structures, navigation maps) compares against a
+    //! remembered value to decide whether its view of the structure is still valid — cheaper than every subsystem
+    //! hooking three lifecycle events, and impossible to forget because there is nothing to hook.
+    //!
+    //! Deliberately coarse: it does not change when a component value is written (the world cannot see those), so
+    //! it invalidates structural caches only, never data derived from component contents.
+    [[nodiscard]] Core::UInt64 GetStructureVersion() const noexcept
+    {
+        return m_StructureVersion;
+    }
+
+    //! Rebuilds a valid handle for a slot, or null when the slot is out of range or not alive. Needed by systems
+    //! that iterate by slot index (transform evaluation, spatial structures) and must produce handles carrying the
+    //! current generation — assembling one from a bare slot number would silently alias after a recycle, which is
+    //! exactly what generations exist to prevent. Prefer ForEachEntity when slot order is not required.
+    [[nodiscard]] Entity GetEntityAtSlot(Core::Index slot) const noexcept;
+
     // Identity --------------------------------------------------------------
 
     //! The entity's Guid, or nil when the handle is stale. Identities are assigned at creation and never
@@ -293,6 +311,9 @@ private:
     //! Takes a slot from the free list or appends a new one, without assigning an identity. Both public creation
     //! paths go through it so slot bookkeeping exists exactly once.
     [[nodiscard]] Entity AllocateSlot();
+
+    //! See GetStructureVersion. Starts at 1 so "zero" can stay a sentinel meaning "never observed" in caches.
+    Core::UInt64 m_StructureVersion = 1;
 
     std::vector<SlotRecord> m_Slots;
     std::vector<Core::Index> m_FreeSlots;

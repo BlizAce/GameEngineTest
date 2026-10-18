@@ -1,6 +1,7 @@
 # Hollowpoint — Architecture
 
-Status: **foundation** (Core + Math complete and fully tested). This document describes what exists and
+Status: **foundation complete; runtime layers landing** (Core, Math, Reflection, Serialization,
+ECS and Scene transforms are implemented and tested). This document describes what exists and
 the shape the rest of the engine is designed to fit into; it is updated whenever a module lands.
 
 ## Design decisions worth knowing
@@ -37,7 +38,7 @@ the shape the rest of the engine is designed to fit into; it is updated whenever
    └────┬────┘  └─────┬────┘  └──────┬───┘    └───────┬─────┘
         └─────────────┴──────┬───────┴────────────────┘
                         ┌────▼────┐
-                        │   ECS   │
+                        │   ECS   │◄─── Scene (transforms, prefabs)
                         └────┬────┘
                         ┌────▼────┐
                         │  Math   │
@@ -53,8 +54,11 @@ the shape the rest of the engine is designed to fit into; it is updated whenever
 |--------|-------|-------|
 | **Core** | ✅ complete | `tests/Core/` — 65 cases: assert routing, GUIDs, FNV hashing, logger (threaded, file sink), allocator + backends + stats, ref counting, clocks and game-time |
 | **Math** | ✅ complete | `tests/Math/` — 126 cases covering conventions (handedness, clip space, column-majority), transforms, volumes, colour transfer functions, RNG distribution |
-| ECS | planned next | sparse-set entities, component arrays, hierarchy, prefabs |
-| Reflection / Serialization | planned | component registry driving the editor inspector and scene format |
+| **ECS** | ✅ core complete | `tests/ECS/` — 118 cases: entity handles + generations, sparse sets, world lifecycle with deferred destruction, component storage/iteration, parent-child hierarchy (cycle rejection, subtree destroy/promote, 20k-deep teardown) |
+| **Reflection** | ✅ core complete | `tests/Reflection/` — 34 cases: type/field descriptors, scalar bridge, enum + array handling, name interning |
+| **Serialization** | ✅ JSON layer complete | `tests/Serialization/` — 71 cases: document model, strict parser (grammar, UTF-8, surrogates, error positions), deterministic writer, round-trips incl. 20k random doubles |
+| **Scene** | ✅ transforms complete | `tests/Scene/` — 22 cases: world-transform evaluation (parent-before-child order, inheritance through transform-less nodes, staleness, 20k-deep chain) |
+| Prefabs / scene files | planned | instantiate from assets, references by Guid, `.hpscene` load/save on top of Serialization |
 | Platform | planned | GLFW window, input, filesystem, threading |
 | Graphics | planned | NVRHI device, swapchain, buffers/textures, shader objects |
 | Asset | planned | glTF import, texture cook, asset database with GUIDs |

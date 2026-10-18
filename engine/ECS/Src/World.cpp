@@ -69,6 +69,7 @@ Entity World::CreateEntityWithGuid(const Core::Guid& guid)
 
 Entity World::AllocateSlot()
 {
+    ++m_StructureVersion;
     if (!m_FreeSlots.empty())
     {
         const Core::Index slot = m_FreeSlots.back();
@@ -175,6 +176,7 @@ void World::DestroyEntity(const Entity& entity, bool promoteChildrenToParent)
 
 void World::MarkSlotDead(Core::Index slot)
 {
+    ++m_StructureVersion;
     SlotRecord& record = m_Slots[slot];
     if (!record.Alive)
     {
@@ -296,6 +298,7 @@ void World::Clear()
     // The tree is reset first: clearing it drops every parent/child link, so the slot loop below does not have to
     // unlink entities one by one (and cannot leave a node pointing at a recycled slot).
     m_Hierarchy.Clear();
+    ++m_StructureVersion;  // Belt and braces: the destroy loop below already bumps it per entity.
 
     for (Size index = 0; index < m_Slots.size(); ++index)
     {
@@ -344,7 +347,17 @@ Hierarchy::ReparentResult World::SetParent(const Entity& entity, const Entity& n
     // The alive-slot count bounds which slot indices are meaningful: slots exist in the array before any entity
     // occupies them, and parenting to one of those would create links to nothing.
     const Size aliveSlotCount = static_cast<Size>(m_Slots.size());
-    return m_Hierarchy.SetParent(entity.Slot, newParent.IsNull() ? Core::InvalidIndex : newParent.Slot, aliveSlotCount);
+    const Hierarchy::ReparentResult result =
+        m_Hierarchy.SetParent(entity.Slot, newParent.IsNull() ? Core::InvalidIndex : newParent.Slot, aliveSlotCount);
+
+    // Only a real change invalidates: "Unchanged" happens constantly during scene reloads and scripted layout
+    // re-application, and treating it as structural would throw away every derived cache for no reason.
+    if (result == Hierarchy::ReparentResult::Success)
+    {
+        ++m_StructureVersion;
+    }
+
+    return result;
 }
 
 Hierarchy::ReparentResult World::DetachToRoot(const Entity& entity)
@@ -424,6 +437,15 @@ Core::UInt32 World::GetDepth(const Entity& entity) const
         return 0;
     }
     return m_Hierarchy.GetDepth(entity.Slot);
+}
+
+Entity World::GetEntityAtSlot(Core::Index slot) const noexcept
+{
+    if (slot >= m_Slots.size() || !m_Slots[slot].Alive)
+    {
+        return Entity();
+    }
+    return Entity(slot, m_Slots[slot].Generation);
 }
 
 Core::UInt32 World::GetGeneration(Core::Index slot) const noexcept

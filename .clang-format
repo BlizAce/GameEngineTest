@@ -1,0 +1,79 @@
+# Repository code style — see AGENTS.md §2 (Hazel/Cherno conventions).
+# Keep in sync with the naming table there; clang-format handles layout only, not naming.
+---
+Language: Cpp
+BasedOnStyle: Google
+ColumnLimit: 120
+IndentWidth: 4
+AccessModifierOffset: -4
+ContinuationIndentWidth: 4
+
+# Allman braces: every brace on its own line, including functions, classes and control statements.
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: true
+  AfterClass: true
+  AfterControlStatement: Always
+  AfterEnum: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterObjCDeclaration: true
+  AfterStruct: true
+  AfterUnion: true
+  AfterExternBlock: true
+  BeforeCatch: true
+  BeforeElse: true
+  BeforeLambdaBody: false
+  BeforeWhile: true
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+
+# Headers and includes.
+IncludeBlocks: Regroup
+# Order: the header a .cpp implements, then the standard library, then third-party, then engine.
+IncludeCategories:
+  # 1: the header this file implements (matched by name; see IncludeIsMainRegex).
+  - Regex: '^"[A-Za-z0-9_]+\.h"$'
+    Priority: 1
+  # 2: standard library (<vector>, <cstring>, ...).
+  - Regex: '^<[a-z_]+>$'
+    Priority: 2
+  # 3: third-party headers.
+  - Regex: '^<(glm|NVRHI|nvrhi|GLFW|glfw|sol|lua|lauxlib|lua\.h|Jolt|jolt|cgltf|stb|miniaudio|doctest|nlohmann)[^>]*>$'
+    Priority: 3
+  # 4: engine headers.
+  - Regex: '^"Hollowpoint/'
+    Priority: 4
+  # 5: everything else (project-local includes in tests, for example).
+  - Regex: '.*'
+    Priority: 5
+
+# Treat "Foo.h" as the main header of "Foo.cpp" even when the .cpp lives in Src/.
+IncludeIsMainRegex: '(|[.][A-Za-z0-9_]+)$'
+
+# Pointers and references hug the type: `void* pointer`, not `void *pointer`.
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
+
+AlwaysBreakTemplateDeclarations: Yes
+DerivePointerAlignment: false
+FixNamespaceComments: true
+IndentCaseLabels: true
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 2
+NamespaceIndentation: None
+IndentPPDirectives: BeforeHash
+SortIncludes: CaseSensitive
+SortUsingDeclarations: true
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+TabWidth: 4
+UseTab: Never

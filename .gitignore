@@ -1,0 +1,39 @@
+# .gitignore for the Hollowpoint engine.
+
+# Build trees
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+
+# CMake user files
+CMakeUserPresets.json
+
+# Editor / IDE
+.vs/
+.vscode/
+.idea/
+*.user
+.cache/
+compile_commands.json
+
+# Object files and libraries (only outside the build tree, e.g. from ad-hoc compiles)
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Executables produced into /bin
+/bin/
+
+# Logs and captures
+*.log
+*.cmp.png
+
+# OS cruft
+.DS_Store
+Thumbs.db

@@ -61,9 +61,14 @@ add_subdirectory(third_party)
 
 # ---------------------------------------------------------------------------
 # Engine modules (static libraries), added in dependency order as they land; see
-# docs/ARCHITECTURE.md (Core -> Math -> ECS -> ... -> Renderer). The tree deliberately
-# configures with no engine modules at all, so the build system can be verified on its own.
+# docs/ARCHITECTURE.md (Core -> Math -> ECS -> ... -> Renderer).
 # ---------------------------------------------------------------------------
+add_subdirectory(engine/Core)
+
+if(HP_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
 
 # ---------------------------------------------------------------------------
 # Summary

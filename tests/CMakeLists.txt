@@ -26,6 +26,7 @@ endif()
 if(TARGET HollowpointECS)
     hp_add_module_test(ECS
         SOURCES
+            ECS/TestComponents.cpp
             ECS/TestEntity.cpp
             ECS/TestSparseSet.cpp
             ECS/TestWorld.cpp

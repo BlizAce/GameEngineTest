@@ -168,12 +168,17 @@ void World::FlushPendingDestructions()
 
         const Entity entity(static_cast<Core::Index>(slot), record.Generation);
 
-        // Hooks run before the slot is handed back and while component storage is still intact, so a handler can
-        // read the entity's last state (its collider shape, its audio asset) to release what it owns.
+        // Hooks run first and while component storage is still intact, so a handler can read the entity's last
+        // state (its collider shape, its audio asset) to release what it owns.
         for (const DestructionHook& hook : m_DestructionHooks)
         {
             hook.Handler(entity, hook.UserData);
         }
+
+        // Components are released after the hooks and before the slot returns to the free list, so no component
+        // can outlive its entity and none can be inherited by whatever reuses the slot. Skipping this is the
+        // classic ECS leak: the next entity created in this slot starts with the dead one's components attached.
+        m_Registry.RemoveFromAll(slot);
 
         // The generation advances **here**, not at Destroy: handles held across the frame (script registries,
         // job parameters, render overrides) must keep failing IsAlive until the slot is genuinely recycled, and
@@ -246,6 +251,25 @@ void World::Clear()
     }
 
     FlushPendingDestructions();
+}
+
+void World::ForEachComponentStorage(const std::function<void(IComponentStorage&)>& callback)
+{
+    m_Registry.ForEachStorage(callback);
+}
+
+void World::ForEachComponentStorage(const std::function<void(const IComponentStorage&)>& callback) const
+{
+    m_Registry.ForEachStorage(callback);
+}
+
+Core::UInt32 World::GetGeneration(Core::Index slot) const noexcept
+{
+    if (slot >= m_Slots.size())
+    {
+        return 0;
+    }
+    return m_Slots[slot].Generation;
 }
 
 bool World::IsAlive(const Entity& entity) const noexcept

@@ -1,9 +1,13 @@
 #pragma once
 
+#include <functional>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "Hollowpoint/Core/Guid.h"
+#include "Hollowpoint/ECS/ComponentStorage.h"
 #include "Hollowpoint/ECS/Entity.h"
 
 namespace Hollowpoint::ECS
@@ -113,6 +117,74 @@ public:
 
     [[nodiscard]] Entity GetEntityByGuid(const Core::Guid& guid) const;
 
+    // Components ------------------------------------------------------------
+    //
+    // Stored per type (see ComponentStorage.h). Every accessor checks liveness before touching storage, which is
+    // what makes deferred physical reclamation safe: a logically dead entity cannot reach its own components even
+    // though their memory is still intact.
+
+    //! Adds (or returns the existing) component on an entity. Asserts for a stale or dead handle: attaching a
+    //! component to nothing would leak it into every subsequent query, since storage is keyed by slot and a
+    //! recycled slot would hand it to whoever reuses it.
+    // Not nodiscard: "ensure this component exists" is a common call shape where the reference is genuinely not
+    // wanted, and forcing a binding there would only add noise. Lookups are nodiscard instead — discarding those
+    // means the call did nothing at all.
+    template <typename TComponent, typename... TArgs>
+    TComponent& AddComponent(const Entity& entity, TArgs&&... args);
+
+    //! Adds a component only if the entity is alive; returns nullptr otherwise. For load and script paths where
+    //! "the target may have vanished" is an expected outcome rather than an engine bug.
+    template <typename TComponent, typename... TArgs>
+    TComponent* TryAddComponent(const Entity& entity, TArgs&&... args);
+
+    //! Returns the component or nullptr. The non-asserting form, and the one systems should use in a query loop.
+    template <typename TComponent>
+    [[nodiscard]] TComponent* TryGetComponent(const Entity& entity);
+
+    template <typename TComponent>
+    [[nodiscard]] const TComponent* TryGetComponent(const Entity& entity) const;
+
+    //! Component of type T, asserting when the entity is dead or lacks one. For call sites where absence would be
+    //! a bug (a render pass asking a mesh-less entity for its mesh).
+    template <typename TComponent>
+    [[nodiscard]] TComponent& GetComponent(const Entity& entity);
+
+    template <typename TComponent>
+    [[nodiscard]] const TComponent& GetComponent(const Entity& entity) const;
+
+    template <typename TComponent>
+    [[nodiscard]] bool HasComponent(const Entity& entity) const;
+
+    //! Removes the component of type T. Returns false when the entity did not have one (or is dead).
+    template <typename TComponent>
+    bool RemoveComponent(const Entity& entity);
+
+    //! Calls `callback(Entity, TComponent&)` for every live entity holding a TComponent.
+    //!
+    //! Destroying entities during the pass is safe and normal (a scripted "kill everything nearby"): an entity
+    //! destroyed before its turn comes is skipped, never handed over with a component that is about to belong to
+    //! somebody else. Adding or removing *this component type mid-pass is not safe — removal swaps the last element
+    //! into the hole, so the pass would skip or revisit an entity. Deferred mutation is the pattern for that:
+    //! collect entities while iterating and apply structural changes afterwards. Enforcing the rule at runtime
+    //! would cost a check per iteration to catch a mistake that is trivially avoided, so it is documented instead.
+    template <typename TComponent, typename TCallback>
+    void ForEach(TCallback&& callback);
+
+    template <typename TComponent, typename TCallback>
+    void ForEach(TCallback&& callback) const;
+
+    [[nodiscard]] Size GetComponentTypeCount() const noexcept
+    {
+        return m_Registry.GetStorageCount();
+    }
+
+    //! Iterates the component arrays of this world. The serializer (write every component of every entity) and
+    //! the inspector (list an entity's components generically) both need it, since neither knows the concrete
+    //! component types at compile time. Storage is visited in a deterministic order so saved scenes come out
+    //! byte-identical between runs — otherwise every diff of a level file is noise.
+    void ForEachComponentStorage(const std::function<void(IComponentStorage&)>& callback);
+    void ForEachComponentStorage(const std::function<void(const IComponentStorage&)>& callback) const;
+
     // Frame maintenance -----------------------------------------------------
 
     //! Reclaims dead entities: releases their slots (advancing generations), runs the registered destruction
@@ -167,6 +239,10 @@ private:
         void* UserData = nullptr;
     };
 
+    //! Current generation of a slot, for rebuilding an Entity handle during iteration. Returns zero for an
+    //! out-of-range slot so a stray index produces a handle that fails IsAlive rather than one that might match.
+    [[nodiscard]] Core::UInt32 GetGeneration(Core::Index slot) const noexcept;
+
     //! Takes a slot from the free list or appends a new one, without assigning an identity. Both public creation
     //! paths go through it so slot bookkeeping exists exactly once.
     [[nodiscard]] Entity AllocateSlot();
@@ -185,6 +261,199 @@ private:
 
     std::vector<Core::Index> m_PendingDestructions;
     Size m_AliveCount = 0;
+
+    ComponentRegistry m_Registry;
 };
+
+// ---------------------------------------------------------------------------
+// Component template definitions.
+//
+// Kept in the header because components are templates over caller types. They all funnel through the registry,
+// so a component type's storage is created on first use and never before — an unused component type costs
+// nothing at runtime.
+// ---------------------------------------------------------------------------
+
+template <typename TComponent, typename... TArgs>
+TComponent& World::AddComponent(const Entity& entity, TArgs&&... args)
+{
+    HP_ASSERT_MSG(IsAlive(entity), "AddComponent on a dead or stale entity");
+    if (!IsAlive(entity))
+    {
+        // Continuing past an assert is allowed by the engine's contract (Core/Assert.h), so this path has to be
+        // safe. A function-local static gives a valid object to reference; writes through it are lost, which is
+        // strictly better than dereferencing null on a code path that already reported a bug.
+        static TComponent fallback{};
+        return fallback;
+    }
+
+    ComponentStorage<TComponent>* storage =
+        m_Registry.template GetOrCreateStorage<TComponent>(typeid(TComponent).name());
+
+    TComponent* existing = storage->Find(entity.Slot);
+    if (existing != nullptr)
+    {
+        // Already present: returned untouched rather than reconstructed. Rebuilding a component would zero the
+        // accumulated state (health, an animation timer) of whatever code called Add "just to be sure" — a silent
+        // gameplay corruption that looks like a random reset.
+        return *existing;
+    }
+
+    return storage->GetStorage().Emplace(entity.Slot, std::forward<TArgs>(args)...);
+}
+
+template <typename TComponent, typename... TArgs>
+TComponent* World::TryAddComponent(const Entity& entity, TArgs&&... args)
+{
+    if (!IsAlive(entity))
+    {
+        return nullptr;
+    }
+    return &AddComponent<TComponent>(entity, std::forward<TArgs>(args)...);
+}
+
+template <typename TComponent>
+TComponent* World::TryGetComponent(const Entity& entity)
+{
+    if (!IsAlive(entity))
+    {
+        return nullptr;
+    }
+    ComponentStorage<TComponent>* storage = m_Registry.template FindStorage<TComponent>();
+    return storage != nullptr ? storage->Find(entity.Slot) : nullptr;
+}
+
+template <typename TComponent>
+const TComponent* World::TryGetComponent(const Entity& entity) const
+{
+    if (!IsAlive(entity))
+    {
+        return nullptr;
+    }
+    const ComponentStorage<TComponent>* storage = m_Registry.template FindStorage<TComponent>();
+    return storage != nullptr ? storage->Find(entity.Slot) : nullptr;
+}
+
+template <typename TComponent>
+TComponent& World::GetComponent(const Entity& entity)
+{
+    TComponent* component = TryGetComponent<TComponent>(entity);
+    HP_ASSERT_MSG(component != nullptr, "GetComponent for a component the entity does not have");
+    if (component == nullptr)
+    {
+        static TComponent fallback{};
+        return fallback;
+    }
+    return *component;
+}
+
+template <typename TComponent>
+const TComponent& World::GetComponent(const Entity& entity) const
+{
+    const TComponent* component = TryGetComponent<TComponent>(entity);
+    HP_ASSERT_MSG(component != nullptr, "GetComponent for a component the entity does not have");
+    if (component == nullptr)
+    {
+        static TComponent fallback{};
+        return fallback;
+    }
+    return *component;
+}
+
+template <typename TComponent>
+bool World::HasComponent(const Entity& entity) const
+{
+    return TryGetComponent<TComponent>(entity) != nullptr;
+}
+
+template <typename TComponent>
+bool World::RemoveComponent(const Entity& entity)
+{
+    if (!IsAlive(entity))
+    {
+        return false;
+    }
+    ComponentStorage<TComponent>* storage = m_Registry.template FindStorage<TComponent>();
+    return storage != nullptr && storage->Remove(entity.Slot);
+}
+
+template <typename TComponent, typename TCallback>
+void World::ForEach(TCallback&& callback)
+{
+    ComponentStorage<TComponent>* storage = m_Registry.template FindStorage<TComponent>();
+    if (storage == nullptr)
+    {
+        // Nobody has ever added this component type. Skipping without creating storage matters: otherwise every
+        // ForEach over an unused type allocates an array that lives for the rest of the session.
+        return;
+    }
+
+    Detail::SparseSet<TComponent>& set = storage->GetStorage();
+    const Size count = set.GetCount();
+    for (Size index = 0; index < count; ++index)
+    {
+        // Count captured up front and elements read by position, so a callback that destroys entities cannot
+        // change what this pass visits. See the ForEach contract above for the in-pass-mutation rule.
+        const Core::Index slot = set.GetSlotAt(index);
+        if (slot == Core::InvalidIndex)
+        {
+            break;
+        }
+
+        // Liveness is re-checked per entity rather than inferred from component presence. Components are reclaimed
+        // at flush, so an entity destroyed earlier in this very pass still has its component sitting in the array;
+        // handing it over would let a system write to a corpse, and after the flush that memory belongs to a
+        // different entity. A generation compare per visited entity is cheap next to what any real system does, so
+        // this guard is unconditional rather than debug-only.
+        const Entity handle(slot, GetGeneration(slot));
+        if (!IsAlive(handle))
+        {
+            continue;
+        }
+
+        TComponent* component = set.Find(slot);
+        if (component == nullptr)
+        {
+            continue;  // Component removed during this pass by a callback that broke the documented contract.
+        }
+
+        callback(handle, *component);
+    }
+}
+
+template <typename TComponent, typename TCallback>
+void World::ForEach(TCallback&& callback) const
+{
+    const ComponentStorage<TComponent>* storage = m_Registry.template FindStorage<TComponent>();
+    if (storage == nullptr)
+    {
+        return;
+    }
+
+    const Detail::SparseSet<TComponent>& set = storage->GetStorage();
+    const Size count = set.GetCount();
+    for (Size index = 0; index < count; ++index)
+    {
+        const Core::Index slot = set.GetSlotAt(index);
+        if (slot == Core::InvalidIndex)
+        {
+            break;
+        }
+
+        // See the mutable overload: entities destroyed earlier in this pass are skipped, not visited.
+        const Entity handle(slot, GetGeneration(slot));
+        if (!IsAlive(handle))
+        {
+            continue;
+        }
+
+        const TComponent* component = set.Find(slot);
+        if (component == nullptr)
+        {
+            continue;
+        }
+
+        callback(handle, *component);
+    }
+}
 
 }  // namespace Hollowpoint::ECS

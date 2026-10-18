@@ -194,6 +194,25 @@ public:
         return address;
     }
 
+    //! Constructs the element in place from constructor arguments (World::AddComponent forwards these). Falls back
+    //! to construct-then-assign for an existing element, because a component already present must not be rebuilt —
+    //! see AddComponent's contract about preserving accumulated state.
+    template <typename... TArgs>
+    TValue& Emplace(Core::Index slot, TArgs&&... args)
+    {
+        if (TValue* existing = Find(slot); existing != nullptr)
+        {
+            return *existing;
+        }
+
+        GrowSparseTo(slot);
+        m_Sparse[slot] = static_cast<Core::Index>(m_Count);
+        m_Values.emplace_back(std::forward<TArgs>(args)...);
+        m_Slots.push_back(slot);
+        ++m_Count;
+        return m_Values[m_Count - 1];
+    }
+
     //! Removes the value at `slot`, returning true when one was removed. Invalidates dense indices from the
     //! removal point onwards (the last element moves into the hole).
     bool Remove(Core::Index slot)

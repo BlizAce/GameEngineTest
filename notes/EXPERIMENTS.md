@@ -99,3 +99,74 @@ copies in the working tree — never copy a repository directory into itself.
   Lua+sol2 all compile in-tree.
 * Not yet implemented: ECS, Reflection/Serialization, Platform, Graphics, Asset, Renderer, Physics/Audio/
   Scripting wrappers, editor, runtime.
+
+---
+
+## Session 2 — pushing the foundation, and the Reflection module
+
+### Remote
+
+The repository is pushed to **`git@github.com:BlizAce/GameEngineTest.git`** (the user supplied this remote
+after `Hollowpoint` turned out not to exist and no API token was available to create it). `origin/main` tracks
+local `main`. Workflow correction agreed mid-session: **commit per unit as work proceeds**, not in one blob at
+the end — the Reflection module sat uncommitted across a long stretch, which is exactly what reviewable history
+is supposed to prevent.
+
+### Why Reflection exists before ECS
+
+The scene format and the editor inspector both need to read/write members of arbitrary component types. The
+alternative (a hand-written JSON writer plus ImGui widget per component) duplicates layout knowledge in three
+places and drifts. Registering a type once gives saving, loading, inspector and scripting bindings one source
+of truth, so this module is a prerequisite for ECS rather than an accessory to it.
+
+### Design decisions worth keeping
+
+* **`TypeTraits<T>` → `ValueKind`, with Struct as the fallback.** Anything not specialised is a nested struct
+  resolved by name, so adding a math or component type needs no change to reflection.
+* **Lazy sub-type resolution.** A field's struct/array-element descriptor is looked up by name on first use, so
+  translation-unit registration order cannot matter. Verified by registering `Vec2Fixture` *after* the type that
+  contains it.
+* **Member offsets measured, not cast.** The standard `offsetof` takes a member *name*, not a pointer-to-member
+  value, so it is unusable from a template. An object is constructed in aligned storage and the address
+  difference taken — well defined, unlike the null-base `reinterpret_cast` trick, and it costs one construction
+  per field at startup. Requiring default-constructibility is free: the ECS and serializer need it anyway.
+* **Type-erased `ArrayOps`, captured from the concrete member type.** An earlier draft read `begin`/`end` through
+  a hand-made three-pointer struct — that compiles and then breaks on another standard library. Function pointers
+  also let `std::vector<float>` work, which a descriptor-only design cannot express (a scalar has no
+  `TypeDescriptor`).
+* **One shared conversion policy** (`Detail/ScalarConvert.h`) for field writes *and* array-element writes. If the
+  two diverged, editing a value in the inspector and loading it from disk would store different bytes — invisible
+  until someone noticed an edit changing a value they did not touch.
+* **Writes clamp, never wrap.** 300 into an `Int8` stores 127, not 44. A wrapped field is a silent simulation
+  drift; a saturated one is visibly wrong in the inspector.
+* **NaN survives into float fields, and is zeroed for integers.** An earlier version rewrote NaN to zero
+  everywhere, destroying the only evidence of an upstream bug. Integers cannot represent it, so they degrade to
+  zero *and log*, which distinguishes "stored zero" from "had to discard a NaN".
+* **Leaked registry singleton.** Descriptors are referenced by raw pointer from scenes and UI, and the editor may
+  still draw an inspector during static destruction. A few dozen descriptors; no dangling-pointer class at exit.
+
+### Bugs found while building this module
+
+1. **`WriteScalar` silently refused bool fields** — `Boolean` is not a numeric kind, so every guard fell through
+   to `return false`. An inspector checkbox would have been dead on arrival. Caught by the first round-trip test.
+2. **A false-alarm error for every plain scalar array.** `GetArrayElementType()` reported "element type was never
+   registered" for `std::vector<int>`, which is legal and common (UVs, indices, sample data). Now null is returned
+   silently unless the elements are *supposed* to be reflected structs.
+3. **Diagnostics on a redraw path.** Resolution failures fired per call; with an inspector open that buries the
+   log. Now reported at most once per field (a warning nobody reads trains people to ignore the channel).
+4. **Redundant `ElementsAreStructs` flag** duplicating `ElementKind == Struct` — removed before it could drift.
+
+### Test-support addition
+
+`ScopedLogCapture` (tests/Support) attaches an `ILogSink` for a scope. Two subtleties handled once rather than per
+test: the dispatcher drops messages above its *global* maximum before formatting, so the ceiling must be raised
+too (refcounted, because captures nest and can span threads); and sinks run on arbitrary threads, so storage is
+mutex-guarded.
+
+### State at end of session 2
+
+* `main` = scaffold, Core, Math, docs, test-log-capture, **Reflection**.
+* 225 doctest cases (65 Core + 126 Math + 34 Reflection), green in Debug and under ASan+UBSan.
+* `scripts/run_tests.sh` (format → configure → build → ctest) is the commit gate; it caught its own formatting
+  regressions twice, which is the intended behaviour.
+* Next: ECS on top of Reflection, then Serialization (JSON scene format), then Platform.

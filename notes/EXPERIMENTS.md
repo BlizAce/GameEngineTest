@@ -243,3 +243,80 @@ guard inherited from "engines have depth limits" costs valid behaviour and buys 
 * 343 doctest cases / 420 895 assertions (65 Core + 126 Math + 34 Reflection + 118 ECS), green in
   Debug and under ASan+UBSan.
 * Next: serialization (JSON scene format) + prefabs, then transforms, then physics and scripting on top.
+
+---
+
+## Session 4 — Serialization: the engine's own JSON layer
+
+### What was built and why it is shaped this way
+
+`Hollowpoint::Serialization` now has a JSON document model (`JsonValue` / `JsonObject`), a strict parser, and a
+deterministic writer. nlohmann/json stays in the dependency list for tooling but the engine does not link it.
+
+* **Insertion-ordered objects** (parallel key/value arrays, not `std::map`/`unordered_map`). Scene files are committed
+  and reviewed; member order that changes between runs turns every save into a whole-file diff. Replacing a member
+  overwrites in place so "load → tweak one field → save" is a one-line diff.
+* **Numbers keep Int64 / UInt64 / Real apart.** JSON has one number type; an engine cannot. Entity indices, GUID halves
+  and 64-bit hashes must never pass through a double (precision dies above 2^53), and values in `(Int64Max, UInt64Max]`
+  are stored unsigned so they round-trip exactly.
+* **Errors never throw.** A malformed scene is expected input (hand-edited, truncated download, version skew). Parsing
+  returns `{Success, Root, Error}` with byte offset **and** line/column plus a caret-underlined excerpt — tools want
+  the offset, humans will not convert one. On failure `Root` is reset to null so a half-built tree cannot be mistaken
+  for data.
+* **Strict grammar.** Leading zeros, `+1`, `.5`, `1.`, `NaN`, `Infinity`, trailing commas and raw control characters in
+  strings are all rejected: accepting them produces files other readers refuse, and "loads here, fails there" is a
+  miserable bug to chase. Depth is bounded (`MaxWalkSteps`-style guard) because the parser recurses per open bracket —
+  without a limit, a file of `[[[[…` is a remote stack overflow.
+* **UTF-8 validated at the boundary** (no overlongs, no direct surrogate encoding, ≤ U+10FFFF), so every string in the
+  engine can be assumed valid and text/hash code needs no defensive checks of its own.
+
+### Experiment: write our own JSON or use nlohmann?
+
+**Hypothesis.** A general-purpose JSON library is good enough for scene files; writing a parser is wasted effort.
+
+**Test.** Before deciding, checked the three properties scene serialization actually depends on against what a general
+library exposes, and measured `std::to_chars` as the number backend:
+
+| Requirement | Generic library | Engine's own layer |
+| --- | --- | --- |
+| Shortest round-trip reals (`0.1`, not `0.10000000000000001`) | configurable, format leaks into diffs | guaranteed by `to_chars` |
+| Insertion-ordered members (diffable scenes) | no (sorted or hashed) | yes, by construction |
+| Error = byte offset + line/column + context excerpt | generic position only | exact, incl. CRLF handling |
+
+`to_chars` shortest-round-trip was fuzzed over **300 000 random bit patterns: 0 failures** (and it is locale-independent,
+unlike `snprintf("%g")`, which reads `1,5` as `1` in a European locale).
+
+**Conclusion.** Build the layer. The three properties are not cosmetics — they decide whether committed scene files are
+reviewable and whether an asset hash computed over serialised data is stable — and none of them are reachable through
+a general library's configuration surface. Cost: ~900 lines plus tests, one day.
+
+### Bugs found while building this module (all caught by tests, none by inspection)
+
+1. **Every negative integer parsed as zero.** `std::from_chars` rejects a `-` when the target type is unsigned and
+   leaves the output untouched; the code fed signed literals to an unsigned conversion and ignored
+   `invalid_argument`. Fixed by branching on the sign established during the grammar scan and converting magnitudes
+   separately, with `-2^63` handled explicitly (negating after the cast is signed overflow).
+2. **The object writer emitted an extra quote per key** — `{"a"":1,…}`. The separator string re-included the closing
+   quote that `WriteString` had already written. Caught by the compact round-trip test.
+3. **Whole-number floats silently changed kind on save.** `3.0` wrote as `3`, so a load/save cycle turned every
+   integral float into an integer: value preserved, type lost, diffs churned. Writer now appends `.0`.
+4. **Recursive JSON type is not portable when members are inline.** `std::vector<JsonValue>` with an incomplete
+   `JsonValue` is legal (P0448), but *using* `clear`/assignment of it while still incomplete compiles on libstdc++ and
+   fails on clang/libc++ (`arithmetic on a pointer to an incomplete type`) because libc++ instantiates eagerly. Debug
+   (GCC) was green for hours while the ASan (clang) configure could not build it. Rule recorded in the header: every
+   member whose body touches `JsonArray` is defined out-of-line.
+5. **A test asserted the wrong thing about its own fixture** (`AsString() == ""` on a value that was legitimately a
+   string). Recorded because it looked like an accessor bug for a minute — check the test before blaming the module.
+
+### Design note: no global error counters
+
+An early draft counted "report at most 16 kind mismatches per parse" in a function-local static. That makes diagnostics
+depend on process history and therefore on test order, which is how suites go flaky. Accessors are now pure (fallback,
+no logging); reporting lives where paths are known — the parser, and later the reflection bridge.
+
+### State at end of session 4
+
+* `main` = scaffold, Core, Math, Reflection, Serialization (JSON), ECS (+ hierarchy).
+* 414 doctest cases / 481 405 assertions (65 Core + 126 Math + 34 Reflection + 71 Serialization + 118 ECS),
+  green in Debug and under ASan+UBSan.
+* Next: reflection-driven encode/decode (engine types ↔ JSON with versioned fields), then transforms, prefabs/scenes.

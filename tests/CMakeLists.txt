@@ -35,6 +35,13 @@ if(TARGET HollowpointECS)
         LIBS Hollowpoint::ECS)
 endif()
 
+if(TARGET HollowpointSerialization)
+    hp_add_module_test(Serialization
+        SOURCES
+            Serialization/TestJson.cpp
+        LIBS Hollowpoint::Serialization)
+endif()
+
 if(TARGET HollowpointReflection)
     hp_add_module_test(Reflection
         SOURCES

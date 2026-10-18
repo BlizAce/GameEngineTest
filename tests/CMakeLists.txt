@@ -7,6 +7,22 @@ add_subdirectory(Support)
 
 include(HollowpointTestHelpers)
 
+if(TARGET HollowpointMath)
+    hp_add_module_test(Math
+        SOURCES
+            Math/TestVector.cpp
+            Math/TestMatrix.cpp
+            Math/TestQuaternion.cpp
+            Math/TestTransform.cpp
+            Math/TestAngles.cpp
+            Math/TestBoundingBox.cpp
+            Math/TestFrustum.cpp
+            Math/TestColor.cpp
+            Math/TestRandom.cpp
+            Math/TestMathFunctions.cpp
+        LIBS Hollowpoint::Math)
+endif()
+
 if(TARGET HollowpointCore)
     hp_add_module_test(Core
         SOURCES

@@ -64,6 +64,7 @@ add_subdirectory(third_party)
 # docs/ARCHITECTURE.md (Core -> Math -> ECS -> ... -> Renderer).
 # ---------------------------------------------------------------------------
 add_subdirectory(engine/Core)
+add_subdirectory(engine/Math)
 
 if(HP_BUILD_TESTS)
     enable_testing()

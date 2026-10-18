@@ -28,6 +28,8 @@ if(TARGET HollowpointECS)
         SOURCES
             ECS/TestComponents.cpp
             ECS/TestEntity.cpp
+            ECS/TestHierarchy.cpp
+            ECS/TestWorldHierarchy.cpp
             ECS/TestSparseSet.cpp
             ECS/TestWorld.cpp
         LIBS Hollowpoint::ECS)

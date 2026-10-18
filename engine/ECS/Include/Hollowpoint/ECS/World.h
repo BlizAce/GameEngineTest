@@ -9,6 +9,7 @@
 #include "Hollowpoint/Core/Guid.h"
 #include "Hollowpoint/ECS/ComponentStorage.h"
 #include "Hollowpoint/ECS/Entity.h"
+#include "Hollowpoint/ECS/Hierarchy.h"
 
 namespace Hollowpoint::ECS
 {
@@ -80,7 +81,17 @@ public:
     //! Destroys an entity, immediately making it not alive. Idempotent: destroying an already-dead entity (or a
     //! stale handle whose generation no longer matches) is reported and otherwise ignored, because scripts do
     //! this constantly ("destroy if still there") and crashing on the second call would be hostile.
-    void DestroyEntity(const Entity& entity);
+    //! Destroys an entity and, by default, its whole subtree.
+    //!
+    //! Recursive destruction is the default because it matches every engine convention (Unity, Godot, Unreal)
+    //! and because the alternative leaks: a parent removed with its children still attached leaves live entities
+    //! nothing can reach through the tree, which in an editor means invisible objects that cannot be selected or
+    //! deleted. `promoteChildrenToParent` opts into the other policy — children are re-parented to this entity's
+    //! parent instead, which is what "delete this component holder but keep the nodes" needs.
+    //!
+    //! The subtree walk uses an explicit worklist rather than recursion, so teardown cost is bounded by the tree
+    //! size and cannot overflow the stack at any depth.
+    void DestroyEntity(const Entity& entity, bool promoteChildrenToParent = false);
 
     //! Number of entities queued for reclamation. Zero outside a frame's script/system phase in practice.
     [[nodiscard]] Size GetPendingDestructionCount() const noexcept
@@ -116,6 +127,37 @@ public:
     [[nodiscard]] Core::Guid GetGuid(const Entity& entity) const;
 
     [[nodiscard]] Entity GetEntityByGuid(const Core::Guid& guid) const;
+
+    // Hierarchy -------------------------------------------------------------
+    //
+    // Parent/child links are world state rather than a component (see Hierarchy.h): the tree must stay
+    // well-formed whether or not any game type is loaded, and destroying an entity has to resolve its children
+    // without knowing about them.
+
+    //! Reparents an entity. Returns a result code rather than asserting because scripts produce invalid requests
+    //! routinely (a target destroyed between frames), and each failure mode means something different to the
+    //! caller — including "already like this", which is not an error at all.
+    Hierarchy::ReparentResult SetParent(const Entity& entity, const Entity& newParent);
+
+    //! Convenience overload for detaching to the scene root.
+    Hierarchy::ReparentResult DetachToRoot(const Entity& entity);
+
+    [[nodiscard]] bool HasParent(const Entity& entity) const;
+    [[nodiscard]] Entity GetParent(const Entity& entity) const;
+
+    [[nodiscard]] Entity GetFirstChild(const Entity& entity) const;
+    [[nodiscard]] Entity GetNextSibling(const Entity& entity) const;
+
+    //! Calls `callback(Entity)` for each direct child, in stable insertion order.
+    template <typename TCallback>
+    void ForEachChild(const Entity& entity, TCallback&& callback) const;
+
+    [[nodiscard]] Size GetChildCount(const Entity& entity) const;
+
+    //! True when `maybeDescendant` sits below `ancestor` (strict). Cycle detection for scripts that build trees.
+    [[nodiscard]] bool IsDescendantOf(const Entity& maybeDescendant, const Entity& ancestor) const;
+
+    [[nodiscard]] Core::UInt32 GetDepth(const Entity& entity) const;
 
     // Components ------------------------------------------------------------
     //
@@ -243,6 +285,11 @@ private:
     //! out-of-range slot so a stray index produces a handle that fails IsAlive rather than one that might match.
     [[nodiscard]] Core::UInt32 GetGeneration(Core::Index slot) const noexcept;
 
+    //! Marks one slot dead and queues it for reclamation. Idempotent, which is what lets the subtree walk in
+    //! DestroyEntity visit a node twice (reachable through two links after a bug elsewhere) without corrupting the
+    //! pending-destruction queue — a double entry there would put a live entity on the free list later.
+    void MarkSlotDead(Core::Index slot);
+
     //! Takes a slot from the free list or appends a new one, without assigning an identity. Both public creation
     //! paths go through it so slot bookkeeping exists exactly once.
     [[nodiscard]] Entity AllocateSlot();
@@ -263,6 +310,10 @@ private:
     Size m_AliveCount = 0;
 
     ComponentRegistry m_Registry;
+
+    //! Parent/child topology over entity slots. Kept separate from the slot array so it can be cleared and
+    //! rebuilt (scene reload) without touching identities.
+    Hierarchy m_Hierarchy;
 };
 
 // ---------------------------------------------------------------------------
@@ -453,6 +504,15 @@ void World::ForEach(TCallback&& callback) const
         }
 
         callback(handle, *component);
+    }
+}
+
+template <typename TCallback>
+void World::ForEachChild(const Entity& entity, TCallback&& callback) const
+{
+    for (Entity child = GetFirstChild(entity); !child.IsNull(); child = GetNextSibling(child))
+    {
+        callback(child);
     }
 }
 

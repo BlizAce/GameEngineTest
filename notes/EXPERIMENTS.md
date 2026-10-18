@@ -170,3 +170,76 @@ mutex-guarded.
 * `scripts/run_tests.sh` (format → configure → build → ctest) is the commit gate; it caught its own formatting
   regressions twice, which is the intended behaviour.
 * Next: ECS on top of Reflection, then Serialization (JSON scene format), then Platform.
+
+---
+
+## Session 3 — ECS: handles, world lifecycle, components, hierarchy
+
+### What was built and why it is shaped this way
+
+`Hollowpoint::ECS` now has entity handles + sparse sets, world lifecycle with deferred destruction, component
+storage/registry/iteration, and a first-class parent/child hierarchy.
+
+* **32-bit slot + 32-bit generation handle** (`Entity`), not a 64-bit id. A handle must be checked against the
+  world on every use regardless of id width, so the extra bits buy nothing except cache pressure; the generation
+  is what actually prevents use-after-destroy through a stale handle.
+* **Destruction is deferred** (`DestroyEntity` marks dead + queues; `FlushPendingDestructions` reclaims). Freeing
+  immediately would invalidate pointers handed to the caller's own iteration, and every engine convention (Unity
+  `Destroy`, Unreal `Kill`) defers for exactly that reason. Liveness is re-checked *per entity* inside `ForEach`,
+  so an entity destroyed earlier in the same pass is skipped rather than visited with components not yet freed.
+* **Hierarchy is world state, not a component.** Destroying an entity has to resolve its children; if the tree lived
+  in components, the world would need to know those types exist (breaking the open-type design) or leave orphaned
+  child lists whenever a module forgot a cleanup hook. It stores topology only — no transforms — so ECS still
+  depends on nothing but Core; the transform system will subscribe to reparent events later.
+* **Intrusive doubly-linked sibling lists** rather than per-parent vectors: no allocation per parent, O(1) insert and
+  remove, and children are appended never reordered, so iteration order is stable across runs — which is what keeps
+  saved scene files diffable in git.
+
+### Experiment: should tree depth be capped?
+
+**Hypothesis.** A hard `MaxDepth = 256` on the hierarchy is worthwhile protection, because recursive consumers
+(world-transform composition, recursive teardown, scene save) would overflow the stack on a pathological chain built
+by a scripted bug.
+
+**Experiment.** Wrote the cap into `SetParent`, then wrote the obvious stress test: build a 20 000-level chain and
+destroy it.
+
+**Result.** The test failed at level ~256 with `ReparentResult = 4` (`DepthLimitExceeded`) — the *setup* was refused,
+not the teardown. Investigating showed the cap protected nothing that the implementation needed:
+
+| Concern | With recursive walks | With the iterative walks actually shipped |
+| --- | --- | --- |
+| Stack overflow on deep trees | Real risk | Impossible — destroy uses an explicit worklist |
+| Cost of `SetParent` | O(depth) because of the cap's own depth walk | O(1) |
+| Valid content (long attachment/bone chains) | Rejected at 256 | Accepted; bounded only by entity count |
+
+**Conclusion.** The cap was removed, not raised. Raising it would have kept a limit that is arbitrary in both
+directions: too small for real content, and unnecessary because the walks it guarded are iterative. `MaxDepth` became
+`MaxWalkSteps = 1<<20`, used *only* as corruption detection — if a parent chase exceeds that, some other bug created a
+cycle and hanging is worse than reporting. The regression test was inverted into "deep chains are accepted" (5 000
+levels) plus the 20 000-level destroy test, so the decision is now enforced by CI rather than remembered in prose.
+
+**Lesson.** When a limit exists to protect against a failure mode, verify the failure mode survives without it. A
+guard inherited from "engines have depth limits" costs valid behaviour and buys nothing once the walks are iterative.
+
+### Bugs found while building this module
+
+1. **`ForEach` doc/implementation mismatch.** Docs promised "every live entity"; the body only tested component
+   presence, so an entity destroyed earlier in the same pass could still be visited with components not yet freed.
+   Both `ForEach` overloads now re-check liveness per entity.
+2. **Nested-type ordering in `Hierarchy.h`.** A member function's return type is *not* a complete-class context, so
+   `const Node*` cannot appear before `struct Node` is declared. Fixed by declaring the node struct above the
+   accessors.
+3. **`HP_UNUSED(x)` expands through `sizeof`, which does not evaluate its operand.** Wrapping a call in it silently
+   skips the call. All existing uses audited and safe, but it must never be used to "execute" a side effect — noted
+   in the style guide.
+4. **Test expectation arithmetic, not engine logic.** Entities were created with even-valued health, so the expected
+   post-increment total was `2*i+1`, not `i+1`. Worth recording because the failure looked like an ECS bug for a
+   minute: check the test's own arithmetic before blaming the system under test.
+
+### State at end of session 3
+
+* `main` = scaffold, Core, Math, Reflection, **ECS** (handles, world, components, hierarchy).
+* 343 doctest cases / 420 895 assertions (65 Core + 126 Math + 34 Reflection + 118 ECS), green in
+  Debug and under ASan+UBSan.
+* Next: serialization (JSON scene format) + prefabs, then transforms, then physics and scripting on top.

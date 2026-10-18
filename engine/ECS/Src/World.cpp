@@ -103,10 +103,14 @@ Entity World::AllocateSlot()
     m_Slots.push_back(record);
     ++m_AliveCount;
 
+    // Node storage tracks the slot array one-for-one, so a slot index is always a valid node index. Done here,
+    // in the only place slots are created, so no other path can forget it.
+    m_Hierarchy.ReserveSlotCapacity(m_Slots.size());
+
     return Entity(static_cast<Core::Index>(m_Slots.size() - 1), 0);
 }
 
-void World::DestroyEntity(const Entity& entity)
+void World::DestroyEntity(const Entity& entity, bool promoteChildrenToParent)
 {
     if (!IsAlive(entity))
     {
@@ -117,7 +121,66 @@ void World::DestroyEntity(const Entity& entity)
         return;
     }
 
-    SlotRecord& record = m_Slots[entity.Slot];
+    // Children are resolved before the entity itself is marked dead, so nothing is ever left attached to a slot
+    // that is about to be recycled: a stale child pointer into a reused slot is one of the nastier ECS bugs
+    // (the child silently becomes part of an unrelated entity).
+    const Core::Index newParentForChildren =
+        promoteChildrenToParent ? m_Hierarchy.GetParent(entity.Slot) : Core::InvalidIndex;
+    const std::vector<Core::Index> children = m_Hierarchy.UnlinkForDestruction(entity.Slot);
+
+    if (promoteChildrenToParent)
+    {
+        // Re-parented to the grandparent, keeping order. Each promotion re-runs the full cycle/depth validation,
+        // which is redundant here (the tree was acyclic and this cannot create a loop) but cheap and it keeps one
+        // code path for every structural change rather than an unchecked fast variant that could drift.
+        for (const Core::Index child : children)
+        {
+            if (newParentForChildren == Core::InvalidIndex)
+            {
+                m_Hierarchy.SetParent(child, Core::InvalidIndex, static_cast<Size>(m_Slots.size()));
+            }
+            else
+            {
+                m_Hierarchy.SetParent(child, newParentForChildren, static_cast<Size>(m_Slots.size()));
+            }
+        }
+    }
+    else
+    {
+        // Destroy the whole subtree. Iterative on purpose: a recursive walk costs stack proportional to depth,
+        // and while real hierarchies are shallow, a scripted bug that builds a 100k-deep chain should produce a
+        // log line, not a crash in the middle of teardown where the cause is invisible.
+        std::vector<Core::Index> worklist;
+        worklist.insert(worklist.end(), children.begin(), children.end());
+
+        while (!worklist.empty())
+        {
+            const Core::Index slot = worklist.back();
+            worklist.pop_back();
+
+            if (slot >= m_Slots.size() || !m_Slots[slot].Alive)
+            {
+                continue;  // Already destroyed by another path during this walk.
+            }
+
+            const std::vector<Core::Index> grandchildren = m_Hierarchy.UnlinkForDestruction(slot);
+            worklist.insert(worklist.end(), grandchildren.begin(), grandchildren.end());
+
+            MarkSlotDead(slot);
+        }
+    }
+
+    MarkSlotDead(entity.Slot);
+}
+
+void World::MarkSlotDead(Core::Index slot)
+{
+    SlotRecord& record = m_Slots[slot];
+    if (!record.Alive)
+    {
+        return;  // Already handled (a node reachable twice in one subtree walk).
+    }
+
     record.Alive = false;
     --m_AliveCount;
 
@@ -129,7 +192,7 @@ void World::DestroyEntity(const Entity& entity)
         record.Identity = Core::Guid();
     }
 
-    m_PendingDestructions.push_back(entity.Slot);
+    m_PendingDestructions.push_back(slot);
 }
 
 void World::FlushPendingDestructions()
@@ -230,6 +293,10 @@ void World::Clear()
     //
     // Slot memory itself is retained (bounded by peak concurrent entities), which is what we want between levels:
     // the next load then allocates nothing.
+    // The tree is reset first: clearing it drops every parent/child link, so the slot loop below does not have to
+    // unlink entities one by one (and cannot leave a node pointing at a recycled slot).
+    m_Hierarchy.Clear();
+
     for (Size index = 0; index < m_Slots.size(); ++index)
     {
         SlotRecord& record = m_Slots[index];
@@ -261,6 +328,102 @@ void World::ForEachComponentStorage(const std::function<void(IComponentStorage&)
 void World::ForEachComponentStorage(const std::function<void(const IComponentStorage&)>& callback) const
 {
     m_Registry.ForEachStorage(callback);
+}
+
+Hierarchy::ReparentResult World::SetParent(const Entity& entity, const Entity& newParent)
+{
+    if (!IsAlive(entity))
+    {
+        return Hierarchy::ReparentResult::EntityNotAlive;
+    }
+    if (!newParent.IsNull() && !IsAlive(newParent))
+    {
+        return Hierarchy::ReparentResult::EntityNotAlive;
+    }
+
+    // The alive-slot count bounds which slot indices are meaningful: slots exist in the array before any entity
+    // occupies them, and parenting to one of those would create links to nothing.
+    const Size aliveSlotCount = static_cast<Size>(m_Slots.size());
+    return m_Hierarchy.SetParent(entity.Slot, newParent.IsNull() ? Core::InvalidIndex : newParent.Slot, aliveSlotCount);
+}
+
+Hierarchy::ReparentResult World::DetachToRoot(const Entity& entity)
+{
+    return SetParent(entity, Entity());
+}
+
+bool World::HasParent(const Entity& entity) const
+{
+    return IsAlive(entity) && m_Hierarchy.HasParent(entity.Slot);
+}
+
+Entity World::GetParent(const Entity& entity) const
+{
+    if (!IsAlive(entity))
+    {
+        return Entity();
+    }
+    const Core::Index parentSlot = m_Hierarchy.GetParent(entity.Slot);
+    if (parentSlot == Core::InvalidIndex || parentSlot >= m_Slots.size() || !m_Slots[parentSlot].Alive)
+    {
+        return Entity();
+    }
+    return Entity(parentSlot, m_Slots[parentSlot].Generation);
+}
+
+Entity World::GetFirstChild(const Entity& entity) const
+{
+    if (!IsAlive(entity))
+    {
+        return Entity();
+    }
+    const Core::Index childSlot = m_Hierarchy.GetFirstChild(entity.Slot);
+    if (childSlot == Core::InvalidIndex || childSlot >= m_Slots.size() || !m_Slots[childSlot].Alive)
+    {
+        return Entity();
+    }
+    return Entity(childSlot, m_Slots[childSlot].Generation);
+}
+
+Entity World::GetNextSibling(const Entity& entity) const
+{
+    if (!IsAlive(entity))
+    {
+        return Entity();
+    }
+    const Core::Index siblingSlot = m_Hierarchy.GetNextSibling(entity.Slot);
+    if (siblingSlot == Core::InvalidIndex || siblingSlot >= m_Slots.size() || !m_Slots[siblingSlot].Alive)
+    {
+        return Entity();
+    }
+    return Entity(siblingSlot, m_Slots[siblingSlot].Generation);
+}
+
+Size World::GetChildCount(const Entity& entity) const
+{
+    if (!IsAlive(entity))
+    {
+        return 0;
+    }
+    return m_Hierarchy.GetChildCount(entity.Slot);
+}
+
+bool World::IsDescendantOf(const Entity& maybeDescendant, const Entity& ancestor) const
+{
+    if (!IsAlive(maybeDescendant) || !IsAlive(ancestor))
+    {
+        return false;
+    }
+    return m_Hierarchy.IsDescendantOf(maybeDescendant.Slot, ancestor.Slot);
+}
+
+Core::UInt32 World::GetDepth(const Entity& entity) const
+{
+    if (!IsAlive(entity))
+    {
+        return 0;
+    }
+    return m_Hierarchy.GetDepth(entity.Slot);
 }
 
 Core::UInt32 World::GetGeneration(Core::Index slot) const noexcept

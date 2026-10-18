@@ -14,9 +14,11 @@ target_sources(HollowpointECS PRIVATE
     Include/Hollowpoint/ECS/Detail/SparseSet.h
     Include/Hollowpoint/ECS/ComponentStorage.h
     Include/Hollowpoint/ECS/Entity.h
+    Include/Hollowpoint/ECS/Hierarchy.h
     Include/Hollowpoint/ECS/World.h
     Src/ComponentStorage.cpp
     Src/Entity.cpp
+    Src/Hierarchy.cpp
     Src/World.cpp)
 
 target_link_libraries(HollowpointECS PUBLIC

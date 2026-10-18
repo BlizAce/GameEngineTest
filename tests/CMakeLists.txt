@@ -23,6 +23,14 @@ if(TARGET HollowpointMath)
         LIBS Hollowpoint::Math)
 endif()
 
+if(TARGET HollowpointECS)
+    hp_add_module_test(ECS
+        SOURCES
+            ECS/TestEntity.cpp
+            ECS/TestSparseSet.cpp
+        LIBS Hollowpoint::ECS)
+endif()
+
 if(TARGET HollowpointReflection)
     hp_add_module_test(Reflection
         SOURCES

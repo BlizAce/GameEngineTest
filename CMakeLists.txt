@@ -66,6 +66,7 @@ add_subdirectory(third_party)
 add_subdirectory(engine/Core)
 add_subdirectory(engine/Math)
 add_subdirectory(engine/Reflection)
+add_subdirectory(engine/ECS)
 
 if(HP_BUILD_TESTS)
     enable_testing()

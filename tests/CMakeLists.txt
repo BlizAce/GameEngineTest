@@ -65,6 +65,7 @@ if(TARGET HollowpointGraphics)
         SOURCES
             Graphics/TestDraw.cpp
             Graphics/TestShaderBindings.cpp
+            Graphics/TestHdrRenderTarget.cpp
         LIBS Hollowpoint::Graphics Hollowpoint::Platform
         NO_LEAK_CHECK)
 endif()

@@ -358,6 +358,23 @@ if(HP_ENABLE_VULKAN)
     add_library(hp_glfw INTERFACE)
     target_link_libraries(hp_glfw INTERFACE ${hp_glfw_target})
 
+    # Same reasoning for glslang/SPIRV-Tools: their targets are created in this directory, so engine modules link
+    # the hp_shaderc interface wrapper instead of naming them directly.
+    add_library(hp_shaderc INTERFACE)
+    target_link_libraries(hp_shaderc INTERFACE glslang glslang-default-resource-limits SPIRV SPIRV-Tools-opt)
+
+    # The Vulkan loader. NVRHI's static Vulkan backend calls into it, and the final executable must resolve it —
+    # but this system has no `libvulkan.so` development symlink (only libvulkan.so.1), so find_package(Vulkan)
+    # fails and the library is located by its soname. Interface targets propagate a full path, which sidesteps the
+    # missing symlink entirely for every target that links this.
+    find_library(HP_VULKAN_LOADER NAMES vulkan libvulkan.so.1
+                 PATHS /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib)
+    if(NOT HP_VULKAN_LOADER)
+        message(FATAL_ERROR "Hollowpoint: the Vulkan loader (libvulkan.so.1) was not found; it is required at runtime")
+    endif()
+    add_library(hp_vulkan_loader INTERFACE)
+    target_link_libraries(hp_vulkan_loader INTERFACE "${HP_VULKAN_LOADER}" ${CMAKE_DL_LIBS})
+
     target_link_libraries(HollowpointThirdParty INTERFACE hp_glfw Vulkan::Headers nvrhi nvrhi_vk)
 endif()
 if(HP_ENABLE_PHYSICS AND TARGET Jolt::Jolt)

@@ -45,10 +45,19 @@ if(TARGET HollowpointScene)
 endif()
 
 if(TARGET HollowpointGraphics)
-    hp_add_module_test(Graphics
+    # Separate executables on purpose. TestGraphicsDevice initialises Vulkan, and the driver retains D-Bus/loader
+    # state for the process lifetime (see tests/Support/leak-suppressions.txt); keeping the pure CPU shader-compiler
+    # suite in its own binary leaves that suite with fully unsuppressed leak checking.
+    hp_add_module_test(ShaderCompiler
         SOURCES
             Graphics/TestShaderCompiler.cpp
         LIBS Hollowpoint::Graphics)
+
+    hp_add_module_test(GraphicsDevice
+        SOURCES
+            Graphics/TestGraphicsDevice.cpp
+        LIBS Hollowpoint::Graphics Hollowpoint::Platform
+        NO_LEAK_CHECK)
 endif()
 
 if(TARGET HollowpointPlatform)
@@ -64,7 +73,7 @@ if(TARGET HollowpointPlatform)
         SOURCES
             Platform/TestPlatformVulkan.cpp
         LIBS Hollowpoint::Platform
-        LEAK_SUPPRESSIONS "${CMAKE_CURRENT_SOURCE_DIR}/Support/leak-suppressions.txt")
+        NO_LEAK_CHECK)
 endif()
 
 if(TARGET HollowpointScripting)

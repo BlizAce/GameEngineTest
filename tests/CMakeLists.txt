@@ -142,5 +142,10 @@ if(TARGET HollowpointRenderer)
         SOURCES
             Renderer/TestCamera.cpp
         LIBS Hollowpoint::Renderer)
+
+    hp_add_module_test(Lights
+        SOURCES
+            Renderer/TestLights.cpp
+        LIBS Hollowpoint::Renderer)
 endif()
 

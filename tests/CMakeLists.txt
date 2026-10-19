@@ -44,6 +44,22 @@ if(TARGET HollowpointScene)
         LIBS Hollowpoint::Scene)
 endif()
 
+if(TARGET HollowpointPlatform)
+    hp_add_module_test(Platform
+        SOURCES
+            Platform/TestPlatform.cpp
+        LIBS Hollowpoint::Platform)
+
+    # Separate executable on purpose: it is the only test that initialises Vulkan through GLFW, and doing so loads
+    # the GPU driver, which retains D-Bus state for the process lifetime. Keeping it isolated means the main
+    # Platform suite runs with completely unsuppressed leak checking. See tests/Platform/TestPlatformVulkan.cpp.
+    hp_add_module_test(PlatformVulkan
+        SOURCES
+            Platform/TestPlatformVulkan.cpp
+        LIBS Hollowpoint::Platform
+        LEAK_SUPPRESSIONS "${CMAKE_CURRENT_SOURCE_DIR}/Support/leak-suppressions.txt")
+endif()
+
 if(TARGET HollowpointScripting)
     hp_add_module_test(Scripting
         SOURCES

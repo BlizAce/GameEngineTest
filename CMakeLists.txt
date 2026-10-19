@@ -71,6 +71,14 @@ add_subdirectory(engine/ECS)
 add_subdirectory(engine/MathReflection)
 add_subdirectory(engine/Scene)
 
+# Platform is the first module that needs a third-party windowing library, and GLFW is fetched only when
+# the graphics stack is enabled (see third_party/CMakeLists.txt), so Platform follows that switch. The
+# headless Null backend still works — it just presents nothing — which is what lets windowing be tested on
+# a machine with no display.
+if(HP_ENABLE_VULKAN)
+    add_subdirectory(engine/Platform)
+endif()
+
 if(HP_ENABLE_SCRIPTING)
     add_subdirectory(engine/Scripting)
 endif()

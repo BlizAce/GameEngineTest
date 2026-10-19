@@ -769,3 +769,118 @@ test would not have.
   get_position/set_position/spawn_prefab[_at]/time/log_*), `ScriptSystem` (bind + on_update/on_create/on_destroy).
 * Next: drive scripts from a frame loop with a real `.hpscene` + prefab asset set, then Platform/renderer so any of this
   is visible, then the comprehensive test scene.
+
+---
+
+## Session 10 — M10 Platform: window + input over GLFW
+
+### Goal and hypothesis
+
+Add the first module that touches the outside world: window creation, DPI-aware sizing, an input event
+queue, clipboard, and a Vulkan surface handle. Hypothesis worth testing explicitly: **windowing can be
+unit-tested on this machine at all**, since it is an ostree (Bazzite) system with a real Wayland session but
+no X11/Wayland *development* headers. If not, the fallback would be headless-only smoke tests, which would
+leave input handling unverified for the rest of the project.
+
+### Environment probes (each before writing code that depended on it)
+
+| Probe | Result | Consequence |
+|---|---|---|
+| Vulkan devices present | RTX 3080 (api 1.4) + llvmpipe, `vkCreateInstance` OK | renderer work is viable |
+| GLFW availability | only Linuxbrew (`glfw3Config.cmake`, 3.5.1); no system dev package | must resolve via CMake config, not `find_library` |
+| Window creation on Wayland session | works; a 64×64 content window reports fb 92×92 → **fractional scaling 1.4375** | DPI design (content vs framebuffer) is load-bearing, not theoretical |
+| Null backend (`glfwInitHint(GLFW_PLATFORM, NULL)`) | creates windows, no presentation | headless tests possible |
+| `glfw3native.h` | **needs `<wayland-client.h>` / `<X11/Xlib.h>`, absent here** | native-handle support must be compile-gated, not mandatory |
+| GLFW headers | need BOTH `GLFW_INCLUDE_NONE` (no `/usr/include/GL/gl.h`) and `GLFW_INCLUDE_VULKAN` (declares `glfwCreateWindowSurface`) | Platform depends on `Vulkan::Headers` |
+| Ad-hoc probe vs CMake build | hand-written g++ line linked `/usr/lib64/libglfw.so.3` (**3.4**); CMake target gets brew **3.5.1** via RPATH | probes must be built through a real CMake target or they measure the wrong library |
+
+The last row caused a wrong conclusion that cost time: an ad-hoc probe reported "Null backend → 0 Vulkan
+instance extensions". The real (CMake-built, 3.5.1) behaviour is `VK_KHR_surface` + `VK_EXT_headless_surface`.
+A test written against the probe would have asserted the opposite of reality.
+
+### Bugs found by my own tests (each a real defect, not a test artefact)
+
+1. **`glfwGetPlatform()` is a scalar enum, not a bitmask.** Values are consecutive from `GLFW_ANY_PLATFORM`
+   (0x60001 Win32 … 0x60005 Null). My initial `QueryBackend()` used `platform & GLFW_PLATFORM_WAYLAND`, which
+   also matches Win32 and Cocoa — so a Windows build would have been reported as running Wayland, and the
+   headless fallback decision would be made on a wrong value. My first probe *appeared* to confirm the bitmask
+   reading because it ran on the Null backend where only one bit matched by luck. Fixed with `switch`/equality.
+2. **Nested `PlatformScope` silently ignored an explicitly requested backend** — joining whatever the process
+   already had would let code that checked "is Wayland active?" believe whatever the first scope chose. Now a
+   mismatched explicit request makes *that scope* unusable (`IsInitialized()` false, `GetBackend()` None) while
+   leaving the shared initialisation intact.
+3. **Refcount imbalance:** the refused (non-usable) scope still decremented in its destructor, driving the count
+   to zero while GLFW was still initialised — every later window creation was then rejected as "windowing not
+   initialized" (17 tests failed at once). Increments and decrements must pair exactly.
+4. **`glfw` is an IMPORTED target created in `third_party/`**, so it is invisible to sibling dirs; linking it from
+   `engine/Platform` produced "header not found". Fixed by wrapping in the `hp_glfw` INTERFACE library (same pattern
+   as `hp_sol2`). Imported targets do not propagate across directory scope; normal targets do.
+5. **Test helper with unreachable logic:** `if (desc.Title.empty()) desc.Title = "…"` could never fire because
+   `WindowDesc::Title` defaults to a non-empty string, so the title test silently checked the wrong value. Caught
+   as a genuine failure — helpers should not contain hidden defaulting.
+
+### LeakSanitizer: isolating rather than suppressing
+
+Any test that queries GLFW's Vulkan instance extensions makes GLFW initialise the Vulkan loader → vendor driver →
+session **D-Bus** registration, which retains ~2 146 bytes for the process lifetime (stack entirely inside
+`libdbus-1`/`libvulkan`/the NVIDIA module). LSan reports per *process*, so one such call would force suppressions
+onto every windowing test and blunt engine leak checking for all of them.
+
+Resolution: `PlatformVulkanTests` is a **separate executable** holding only the Vulkan-touching assertions, with a
+narrow suppression file attached to it via `LEAK_SUPPRESSIONS` (a new opt-in option on `hp_add_module_test`). The
+main `PlatformTests` runs fully unsuppressed.
+
+Bisecting this was non-obvious: forcing the Null backend did *not* avoid it, individual tests leaked nothing in
+isolation, and doctest's `--first=N` does not limit to N cases (so an early bisect read as "test 1 leaks"). The
+actual trigger was found by running every test case individually.
+
+**Suppression verified load-bearing in both directions:**
+* without `LSAN_OPTIONS`, `PlatformVulkanTests` reports the 2 146-byte third-party leak;
+* with suppressions active, a deliberately leaked `Detail::WindowImpl` is still reported and fails the suite
+  (mutation reverted, both presets re-verified green).
+
+So the suppression removes noise without creating a blind spot.
+
+### Design decisions worth keeping
+
+* **Input is an ordered event queue**, not polled state: recordable/replayable, and two presses in one frame are
+  not collapsed (the classic "inputs skip when the framerate drops").
+* **Engine-owned `KeyCode`** with contiguous letter/digit/function ranges, so bindings never depend on a windowing
+  library's numeric values and range iteration needs no lookup table. Keypad digits are deliberately distinct from
+  top-row digits.
+* **Content vs framebuffer coordinates** everywhere, with DPI scale exposed; this machine's 1.4375 scaling makes
+  any equality assumption between the two wrong.
+* **Events queued, drained into a caller-supplied vector** — an idle frame allocates nothing. Queue is a `deque`
+  because the overflow policy drops from the front (a `vector::erase(begin())` would be O(n) per event).
+* **Queue cap (16 384) with chunked drop and one report per episode**: an app that stops pumping input must not
+  OOM because a key was held down.
+* **`InjectEvent`** is a product feature, not a test backdoor: the editor is meant to be agent-driven, so sending
+  synthetic input is required — it also makes the queue testable with no display at all. It goes through the same
+  queue and overflow policy as real events.
+* **Tests never map a window** (forced `Visible=false`, Null backend): a suite must not flash windows across the
+  user's screen or steal focus mid-keystroke. Nothing under test needs presentation.
+* **Native handles are compile-gated** (`HP_PLATFORM_HAS_NATIVE_HEADERS`): requiring X11/Wayland headers would make
+  the whole engine unbuildable on this OS to support one accessor.
+
+### Deliberately not asserted (would encode one compositor's behaviour)
+
+* That a window reads back as iconified — KDE does not iconify a never-mapped window, others do. What *is*
+  guaranteed and checked: restoring cannot leave a window reported iconified.
+* `IsVisible()` after `SetVisible(true)` — that would map the window onto the user's display.
+
+### Mutation tests
+
+| Mutation | Result |
+|---|---|
+| Leak a `Detail::WindowImpl` in `Window::Create` (suppressions active) | caught — LSan names `WindowImpl::WindowImpl()` and the suite fails |
+
+### State at end of session 10
+
+* **617 doctest cases / 503 665 assertions across 9 executables** — measured by summing each binary's doctest
+  summary rather than estimated, since an earlier section of these notes carried a hand-tallied figure that turned
+  out to be off. Debug (GCC) and ASan+UBSan (clang) both green, clang-format clean. Platform contributes 34 cases /
+  214 assertions, plus 2 Vulkan-surface cases in the separate target.
+* New module `engine/Platform` (`PlatformScope`, `Window`, `InputEvent`) wired behind `HP_ENABLE_VULKAN`.
+* Next: M11 Graphics — NVRHI device, offscreen render target, SPIR-V pipeline compile through glslang, and pixel
+  readback so "the triangle renders" is verified by pixels rather than by hope. Surface creation gets exercised
+  there with a real `VkInstance` (driver state being inherent to what is tested).

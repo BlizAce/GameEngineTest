@@ -351,7 +351,14 @@ add_library(HollowpointThirdParty INTERFACE)
 target_link_libraries(HollowpointThirdParty INTERFACE glm nlohmann_json::nlohmann_json hp_cgltf hp_stb)
 
 if(HP_ENABLE_VULKAN)
-    target_link_libraries(HollowpointThirdParty INTERFACE glfw Vulkan::Headers nvrhi nvrhi_vk)
+    # `glfw` is an IMPORTED target, and imported targets are visible only in the directory that created them
+    # and its subdirectories — so engine modules (siblings of third_party) cannot link it by name. Wrapping it
+    # in an INTERFACE library turns it into a normal target whose usage requirements propagate everywhere,
+    # which is how hp_sol2 already works for scripting.
+    add_library(hp_glfw INTERFACE)
+    target_link_libraries(hp_glfw INTERFACE ${hp_glfw_target})
+
+    target_link_libraries(HollowpointThirdParty INTERFACE hp_glfw Vulkan::Headers nvrhi nvrhi_vk)
 endif()
 if(HP_ENABLE_PHYSICS AND TARGET Jolt::Jolt)
     target_link_libraries(HollowpointThirdParty INTERFACE Jolt::Jolt)

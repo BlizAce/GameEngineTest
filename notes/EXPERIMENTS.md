@@ -884,3 +884,108 @@ So the suppression removes noise without creating a blind spot.
 * Next: M11 Graphics — NVRHI device, offscreen render target, SPIR-V pipeline compile through glslang, and pixel
   readback so "the triangle renders" is verified by pixels rather than by hope. Surface creation gets exercised
   there with a real `VkInstance` (driver state being inherent to what is tested).
+
+---
+
+## Session 11 — M11 Graphics (part 1): shader compiler + Vulkan device
+
+Two units landed: offline GLSL->SPIR-V compilation, and Vulkan device creation with GPU readback tests.
+Both were de-risked by probing before writing engine code, which paid for itself several times over.
+
+### Probes run first (and what they changed)
+
+| Probe | Result | Consequence |
+|---|---|---|
+| Standalone VkInstance/VkDevice + NVRHI + clear + readback | **PASSED on RTX 3080**; fb readback exact | Whole graphics approach viable; wrote the module against a known-good sequence |
+| Who defines the Vulkan-Hpp dispatcher | `nm -C libnvrhi_vk.a` shows `defaultDispatchLoaderDynamic` as **U only** | Engine must define it exactly once (VulkanDispatcher.cpp). NVRHI emits it only under `NVRHI_SHARED_LIBRARY_BUILD`, and we build static |
+| glslang target names / API surface | `SpvOptions` has `disableOptimizer`, **no** `optimizeLevel` | Option redesigned as `Optimize` + `OptimizeForSize`; a 0..3 "level" would have silently done nothing |
+| What the compiler actually emits (before writing assertions) | SPIR-V magic, version 0x10500, error text format | Caught two real defects; see below |
+| ASan suppression syntax/behaviour | see below | Replaced pattern suppression with a per-target switch |
+
+### Real bugs found while building this unit
+
+1. **Error-line parsing reported line 0 for every shader error.** It read the *first* colon in glslang's output,
+   which is the one in the `ERROR: ` prefix. Now scans for a `:<digits>:` run, which also survives source names
+   containing colons (Windows paths). Caught only because I probed real output first — an assumption-based test
+   would have asserted `ErrorLine == 0` and passed forever.
+2. **Warnings-as-errors returned `Succeeded=false` while still carrying 232 SPIR-V words**, breaking the documented
+   "a failed compile carries no module" contract. A caller checking the flag inconsistently could upload a shader
+   precisely *because* it warned. Now returns no module.
+3. **Memory accounting counted every heap as device-local: 58 GB of "VRAM" reported for a 10 GB RTX 3080.** This is
+   the exact figure a texture-streaming budget would use, so it would over-commit and thrash every frame. Found by
+   mutation testing (see below).
+
+### A vacuous test — the most instructive failure in this session
+
+Mutation: make the device-local heap filter accept every heap. The suite still passed, so my "cross-check" was
+decorative. Root cause: it compared `DedicatedVideoMemoryBytes` against a `HasHostSharedMemoryHeap` flag computed
+in the **`else` branch of the very filter under test** — mutating the filter moved both operands together, keeping
+the assertion true by construction.
+
+Fix: cross-check against a fact that comes from *outside* the code under test — the driver's own
+`memoryHeapCount`. Asserting "more than one heap ⇒ local total strictly below overall total" now fails when the
+filter is broken (verified: mutation caught). Also had to make it correct for single-heap adapters (llvmpipe), where
+the two totals are legitimately equal — an earlier version asserted strict inequality unconditionally and failed on
+llvmpipe, which was a wrong test rather than a wrong engine.
+
+**Rule worth keeping: a cross-check is only load-bearing if the two operands are computed independently.** If both
+derive from the same expression, mutating that expression cannot make them disagree.
+
+### False-green almost shipped twice
+
+* `GraphicsDevice.cpp` was never added to `target_sources`, so "build succeeded" meant "nothing compiled it".
+  Caught by checking the file list rather than trusting the exit status.
+* During mutation runs, a mutation that failed to compile left a stale test binary in place, and the suite
+  "passed". A build error must invalidate the subsequent test run.
+
+### ASan leak suppression: measured, not assumed
+
+Tests that create a Vulkan device leak ~10 KB / 18 allocations on this host. Full stacks are inside
+`libnvidia-glcore -> dbus_bus_register -> libdbus-1`, i.e. the driver opening a session D-Bus connection with no
+client-callable teardown. Three suppression approaches were tried and rejected **on measurement**:
+
+* `leak:<substr>` under `ASAN_OPTIONS` -> whole file refused ("failed to parse suppressions"), disabling all
+  suppression. Fail-loud, at least.
+* `leak:<substr>` under `LSAN_OPTIONS` -> parses and suppressed 17/18 allocations, but the remaining driver
+  allocation comes from a dlopen'd module whose frames read `(<unknown module>)`, so no pattern can match it.
+* `interceptor_via_lib:` -> parses, matches nothing (it targets allocation interceptors inside a library, not
+  frames of an allocation stack).
+
+A suppression list that silently matches nothing is worse than no list: it looks like protection. So the mechanism
+is now an explicit per-target `NO_LEAK_CHECK` (`ASAN_OPTIONS=detect_leaks=0`) applied to the two GPU-touching
+binaries, leaving 9 of 11 suites fully strict. Verified that `detect_leaks=0` still catches heap-use-after-free, so
+those targets keep every other ASan check — only leak reporting is off.
+
+### Dual-compiler gate earning its keep
+
+Three issues appeared on one toolchain only: clang rejected `-Wdocumentation-deprecated-command` (speculative
+suppression I had added "for safety" — lesson: never add a suppression for a warning you have not seen); clang's
+`-Wunused-but-set-global` caught dead code GCC allowed; and clang caught `[[nodiscard]]` on a void function.
+
+### API facts worth keeping (pinned NVRHI 4.x / glslang as vendored)
+
+* NVRHI here is **state-based**: no `beginRenderPass`/`RenderPassDesc`; use `GraphicsState` +
+  `setGraphicsState`, and `executeCommandLists(&ptr, n)` (not `runCommandList`).
+* `MessageSeverity` is `Info|Warning|Error|Fatal` — there is no `Hint`.
+* Textures need explicit state tracking (`initialState` + `keepInitialState`) or NVRHI warns on first use.
+* Vulkan-Hpp: `dispatcher.init(handle)` alone does not compile (matches the DynamicLoader template overload);
+  use `init(instance, vkGetInstanceProcAddr[, device])`. No `terminate()` in this revision.
+* Vulkan's `VK_MAKE_VERSION`/`VK_API_VERSION_*` expand old-style casts **at the use site**, i.e. outside an include
+  suppression — use engine constexpr helpers instead of suppressing at every call.
+* Static-archive link order matters: `nvrhi_vk` before `nvrhi`.
+
+### Mutation tests run
+
+| Mutation | Caught? | Note |
+|---|---|---|
+| Device-local heap filter accepts every heap | **No** (first attempt) → vacuous test; **Yes** after rewiring the cross-check to driver-reported heap count | Led to a real bug fix and a better test |
+| Compiler: return module despite warnings-as-errors | Yes | Contract test asserts empty SPIR-V |
+| Compiler: error-line parse at first colon | Yes | Test pins `ErrorLine == 3` |
+
+### State at end of session 11
+
+* **640 doctest cases across 11 executables**; Debug (GCC) and ASan+UBSan (clang) both green; ctest 11/11 on both.
+* Committed: `39da162` (shader compiler), `dc040b9` (device + readback). Both pushed.
+* Next in M11: render-target abstraction, pipeline state creation, and a **draw test** — compile a real vertex/
+  fragment pair, draw a triangle into an offscreen target, assert on the pixels. That is the point where "the
+  renderer works" stops being an assumption.

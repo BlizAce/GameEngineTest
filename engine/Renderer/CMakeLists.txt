@@ -15,10 +15,13 @@ target_sources(HollowpointRenderer PRIVATE
     Include/Hollowpoint/Renderer/ColorPipeline.h
     Include/Hollowpoint/Renderer/Lights.h
     Include/Hollowpoint/Renderer/PbrShading.h
+    Include/Hollowpoint/Renderer/ShadingConstants.h
+    Include/Hollowpoint/Renderer/ShadingModelGlsl.h
     Src/Camera.cpp
     Src/ColorPipeline.cpp
     Src/Lights.cpp
-    Src/PbrShading.cpp)
+    Src/PbrShading.cpp
+    Src/ShadingModelGlsl.cpp)
 
 # Graphics is not linked yet: the CPU shading reference is pure math, and keeping it free of the RHI means the
 # shading model can be tested (and used by tooling) without a GPU or a Vulkan loader.

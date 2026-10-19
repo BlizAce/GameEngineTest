@@ -2,6 +2,7 @@
 #include <cmath>
 
 #include "Hollowpoint/Renderer/ColorPipeline.h"
+#include "Hollowpoint/Renderer/ShadingConstants.h"
 
 namespace Hollowpoint::Renderer
 {
@@ -60,11 +61,13 @@ Float32 ToneMapAceFilmic(Float32 hdrValue) noexcept
     // to exactly 1 either way — but evaluating the rational form past ~1.16e19 overflows float32 (2.51x^2 exceeds the
     // range), producing inf/inf = NaN, which propagates through blending and destroys a whole frame with no error. One
     // max() makes that unreachable; huge values occur in practice from an unnormalised HDRI or a bug upstream.
-    constexpr Float32 kSaturationPoint = 8.0f;
+    constexpr Float32 kSaturationPoint = AceFilmic.SaturationPoint;
     const Float32 x = std::clamp(hdrValue, 0.0f, kSaturationPoint);
 
-    const Float32 numerator = x * (2.51f * x + 0.03f);
-    const Float32 denominator = x * (2.43f * x + 0.59f) + 0.14f;
+    // Coefficients come from ShadingConstants so the generated GLSL uses identical numbers — see AceFilmicCoefficients.
+    const Float32 numerator = x * (AceFilmic.NumeratorLinear * x + AceFilmic.NumeratorConstant);
+    const Float32 denominator =
+        x * (AceFilmic.DenominatorLinear * x + AceFilmic.DenominatorMiddle) + AceFilmic.DenominatorConstant;
 
     // For x >= 0 the denominator starts at 0.14 and increases (its derivative 4.86x + 0.59 is positive there), so no
     // zero guard is needed — the curve is smooth across its whole intended domain.

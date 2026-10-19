@@ -145,6 +145,14 @@ if(TARGET HollowpointRenderer)
             Renderer/TestCamera.cpp
         LIBS Hollowpoint::Renderer)
 
+    # Shading equivalence needs the RHI (it renders), so unlike the other Renderer tests it links Graphics and skips
+    # leak checking for the same reason the GPU targets above do.
+    hp_add_module_test(ShadingEquivalence
+        SOURCES
+            Renderer/TestShadingEquivalence.cpp
+        LIBS Hollowpoint::Renderer Hollowpoint::Graphics Hollowpoint::Platform
+        NO_LEAK_CHECK)
+
     hp_add_module_test(Lights
         SOURCES
             Renderer/TestLights.cpp

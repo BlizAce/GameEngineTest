@@ -2,6 +2,7 @@
 #include <cmath>
 
 #include "Hollowpoint/Renderer/Lights.h"
+#include "Hollowpoint/Renderer/ShadingConstants.h"
 
 namespace Hollowpoint::Renderer
 {
@@ -9,15 +10,15 @@ namespace Hollowpoint::Renderer
 namespace
 {
 
-constexpr Float32 kPi = 3.14159265358979323846f;
+using ShadingConstants::MinDistanceSquared;
+using ShadingConstants::Pi;
 
-//! Lower bound on squared distance in the inverse-square term.
-//!
-//! A surface point can coincide exactly with a light (a lamp placed on a table touches the tabletop), and 1/0 is
-//! infinite radiance that then spreads through bloom into a full-screen white flash. The bound corresponds to a
-//! physical radius of ~1cm, i.e. lights are treated as small emissive spheres rather than true points — which is also
-//! what stops the centre of a lit surface from blowing out while its edges look right.
-constexpr Float32 kMinDistanceSquared = 1e-4f;
+constexpr Float32 kPi = Pi;
+
+// The inverse-square term is floored at MinDistanceSquared (see ShadingConstants.h for why: a surface point can
+// coincide with a light, and infinite radiance spreads through bloom into a full-screen white flash). Aliased rather
+// than redefined so the CPU reference and the GPU shader cannot disagree about where that floor is.
+constexpr Float32 kMinDistanceSquared = MinDistanceSquared;
 
 [[nodiscard]] Float32 SmoothStep01(Float32 edge0, Float32 edge1, Float32 x)
 {

@@ -2,6 +2,7 @@
 #include <cmath>
 
 #include "Hollowpoint/Renderer/PbrShading.h"
+#include "Hollowpoint/Renderer/ShadingConstants.h"
 
 namespace Hollowpoint::Renderer
 {
@@ -11,20 +12,16 @@ using Math::Vec3;
 namespace
 {
 
-constexpr Float32 kPi = 3.14159265358979323846f;
+using ShadingConstants::Epsilon;
+using ShadingConstants::MinGgxAlpha;
+using ShadingConstants::Pi;
 
-//! Lower bound on GGX alpha.
-//!
-//! An exact-zero alpha makes the normal distribution evaluate to a/(pi*a^2) with a == 0 — infinite specular, then
-//! NaN once it reaches an accumulation buffer, and NaNs propagate silently through a whole frame. The value is a
-//! stability choice rather than physical: at 1e-3 the peak D is ~3.2e5, far above any visible roughness while keeping
-//! float accumulation well inside range. A perfectly mirror-like surface is instead expressed by rendering that case
-//! explicitly (reflection pass), not by an alpha of zero.
-constexpr Float32 kMinAlpha = 1e-3f;
-
-//! Small denominator guard. Prevents a divide-by-zero when the view and light directions are nearly antiparallel to
-//! the normal, where the BRDF's geometric term is physically undefined.
-constexpr Float32 kEpsilon = 1e-7f;
+// Local spellings kept so the maths below reads naturally. These are aliases of the shared constants, not copies: a
+// literal here could drift from the GLSL generated from the same header, which is what makes CPU/GPU equivalence
+// testable in the first place.
+constexpr Float32 kPi = Pi;
+constexpr Float32 kMinAlpha = MinGgxAlpha;
+constexpr Float32 kEpsilon = Epsilon;
 
 [[nodiscard]] constexpr Float32 Clamp01(Float32 value) noexcept
 {

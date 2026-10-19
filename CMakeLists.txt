@@ -75,6 +75,8 @@ add_subdirectory(engine/Scene)
 # the graphics stack is enabled (see third_party/CMakeLists.txt), so Platform follows that switch. The
 # headless Null backend still works — it just presents nothing — which is what lets windowing be tested on
 # a machine with no display.
+add_subdirectory(engine/Renderer)
+
 if(HP_ENABLE_VULKAN)
     add_subdirectory(engine/Platform)
     add_subdirectory(engine/Graphics)

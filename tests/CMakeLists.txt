@@ -119,3 +119,17 @@ if(TARGET HollowpointCore)
             Core/TestTime.cpp
         LIBS Hollowpoint::Core)
 endif()
+
+# ---------------------------------------------------------------------------
+# Renderer tests.
+#
+# Pure CPU: the shading model is deliberately free of the RHI, so it is tested with no GPU, no Vulkan loader and full
+# leak checking — unlike the Graphics targets above.
+# ---------------------------------------------------------------------------
+
+if(TARGET HollowpointRenderer)
+    hp_add_module_test(PbrShading
+        SOURCES
+            Renderer/TestPbrShading.cpp
+        LIBS Hollowpoint::Renderer)
+endif()

@@ -77,6 +77,7 @@ add_subdirectory(engine/Scene)
 # a machine with no display.
 if(HP_ENABLE_VULKAN)
     add_subdirectory(engine/Platform)
+    add_subdirectory(engine/Graphics)
 endif()
 
 if(HP_ENABLE_SCRIPTING)

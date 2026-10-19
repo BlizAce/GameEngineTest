@@ -44,6 +44,13 @@ if(TARGET HollowpointScene)
         LIBS Hollowpoint::Scene)
 endif()
 
+if(TARGET HollowpointGraphics)
+    hp_add_module_test(Graphics
+        SOURCES
+            Graphics/TestShaderCompiler.cpp
+        LIBS Hollowpoint::Graphics)
+endif()
+
 if(TARGET HollowpointPlatform)
     hp_add_module_test(Platform
         SOURCES

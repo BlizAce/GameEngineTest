@@ -144,6 +144,16 @@ struct SceneLoadReport
     //! True when the scene was created and is usable. Errors here mean parts were dropped.
     bool Loaded = false;
 
+    //! Every entity this load created, in document order. Populated only on success, so a caller can act on exactly
+    //! what arrived (a prefab instance selecting its new entities, a streaming layer tracking a level's worth of
+    //! entities) without diffing the world before and after — which would race anything else creating entities.
+    std::vector<Entity> CreatedEntities;
+
+    //! The subset of CreatedEntities that had no parent in the document. For a prefab this is what an instance attaches
+    //! to a scene node and repositions, so it has to be known rather than inferred by querying parents afterwards
+    //! (which would also report entities attached to a parent *by this load* as roots).
+    std::vector<Entity> RootEntities;
+
     std::vector<Issue> Errors;
     std::vector<Issue> Warnings;
 
@@ -186,6 +196,14 @@ struct SceneLoadOptions
     //! When true the existing contents of `world` are cleared first; otherwise the file's entities are added to it
     //! (used by prefab instantiation and streaming levels in).
     bool ClearWorldFirst = true;
+
+    //! Ignores the identities stored in the document and assigns a fresh Guid to every entity.
+    //!
+    //! Required by prefab instantiation: spawning the same prefab twice must not produce two entities claiming one
+    //! Guid, because cross-file references (script bindings, gameplay links) resolve *by* Guid and would then bind to
+    //! whichever copy the registry happens to reach first. Scene loading keeps stored identities — that is the whole
+    //! point of persisting them — so this is opt-in rather than a property of loading in general.
+    bool AssignFreshIdentities = false;
 
     Serialization::ConversionOptions Conversion;
 };

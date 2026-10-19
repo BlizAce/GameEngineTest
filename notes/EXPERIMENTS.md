@@ -562,3 +562,104 @@ finds these; asserting specific relationships (not counts) prevents them.
 * **510 doctest cases / 502 622 assertions** across 6 executables; green in Debug (GCC) and ASan+UBSan (clang).
 * Next: prefabs (instantiate a saved document into an existing world — the `ClearWorldFirst=false` path is already
   there), then scripting so it can spawn them, then Platform/renderer to make transforms visible.
+
+---
+
+## Session 8 — Prefabs (instantiation), plus two methodology lessons worth keeping
+
+### What was built
+
+`Scene::Prefab` + `InstantiatePrefab`. A prefab is deliberately **just a saved scene document plus a name**, not a
+parallel data structure: everything that makes scenes work (component factory, reflection bridge, hierarchy resolution,
+unknown-component tolerance) applies to prefabs for free and there is one loader to debug rather than two. The
+alternative — a dedicated prefab format — reliably drifts from the scene format within months, and the drift surfaces
+as "prefabs support X but levels don't".
+
+Decisions:
+* **Immutable template, stored by value.** Prefabs are shared assets instantiated many times; if an instance could edit
+  its template, the tenth spawn would differ from the first — a bug that appears only after minutes of runtime and
+  never in a smoke test. There is no non-const accessor to the document.
+* **Fresh identities by default.** Spawning one asset twice must not produce two entities claiming one Guid, since
+  every Guid-based reference would then resolve ambiguously. Keeping stored identities is opt-in (deterministic replay,
+  golden files).
+* **Instantiating never clears the world**, whatever the caller's defaults — it appends. `ClearWorldFirst = false` is
+  forced internally rather than trusted from outside.
+* **Attach after loading, not by patching the document**, so one shared document can be instantiated under a hundred
+  parents.
+
+### The transform bug I would have shipped
+
+The first version composed the spawn offset against the parent's *local* transform **and** attached the instance to
+that parent — double-counting it. Symptom: spawned objects drift progressively further away the deeper they are nested,
+which reads as a bug in the transform system rather than in spawning. Correct behaviour needs no composition at all:
+attaching already gives `world = parentWorld * local`, so setting `local = offset` yields
+`parentWorld * offset * authored`.
+
+Second half of the same function: compose **outside** the authored value
+(`authored.Concatenated(offset)`) rather than replacing it. Replacing flattens a prefab whose root is raised by half its
+height, so every instance lands half-buried; composing the other way applies the author's own transform to the spawn
+position, so moving a rotated instance moves it twice.
+
+Both are pinned by tests that assert resulting *world positions*, not stored locals.
+
+### Lesson 1 — a test that passes for the wrong reason (found again, worse)
+
+`MUT-P5`: hard-code `AssignFreshIdentities = false` (i.e. ignore the option and reuse the asset's guids). **The suite
+passed.** My "instantiating twice creates independent entities with distinct identities" test looks like it covers this
+and cannot: with the mutation, the *first* instance keeps the document's guids and the loader's duplicate-guid guard
+rescues the second instance — so all four entities still end up unique. The assertion was satisfied by a different
+mechanism than the one under test.
+
+Fix: assert **directly against the authored guids** — no instantiated entity may hold them, and the asset's identities
+must remain unclaimed in the world. Mutation now fails exactly that test.
+
+**Rule.** When a safety net (dedup guard, clamp, fallback) sits near the behaviour under test, an assertion about the
+*symptom* can be satisfied by the net. Assert the mechanism itself: name the specific values that must not appear,
+rather than counting how many things are unique.
+
+### Lesson 2 — "100% tests passed" from a failed build (this one produced false evidence)
+
+The ASan gate printed `100% tests passed out of 6` while the **build had failed** (`-Wmismatched-tags`:
+`class SceneLoadReport;` forward-declared where it is defined as a `struct` — caught by clang, invisible to GCC). Ninja
+left the previous binaries, ctest happily ran them, and I nearly recorded "ASan green" for work that had not been built.
+
+This is the same failure mode as the mutation-build trap from session 6, but in the *main* gate rather than an
+experiment, which makes it more dangerous: nobody suspects the routine command.
+
+Fixes adopted:
+1. Never write `cmake --build ... | grep`. A pipeline returns the **last** command's status, so a failed build reports
+   success to anything checking `$?`. Run the build bare (or `set -o pipefail`) and check its exit code explicitly.
+2. Verify the artefact is fresh (`ls -l` timestamp / `ninja: no work to do`) before trusting a test run, and confirm
+   the new test count appears in the sanitised binary — 78 Scene cases there proves it was built from current sources.
+
+### Other findings
+
+* **Use-after-move caught by an existing test.** Recording load results did `report.CreatedEntities = std::move(created)`
+  and then indexed `created` to collect roots. Reading a moved-from vector is legal and silently empty, so every prefab
+  instance would have looked root-less; the SceneIO suite failed immediately. Roots are now collected before the move,
+  with a comment saying the order is load-bearing.
+* **Applying a spawn offset to an entity with no LocalTransform needs the component created.** Such an entity inherits
+  its parent exactly, so writing nowhere would silently leave instances stacked at the parent's origin. Covered by its
+  own test (`MUT-P7`).
+* Spawning into a **dead handle** is refused rather than allowed: otherwise the instance attaches to whatever now
+  occupies that recycled slot — an object appearing welded to unrelated geometry.
+
+### Mutation results (all build-gated)
+
+| Mutation | Result | Caught by |
+| --- | --- | --- |
+| Replace authored transform instead of composing | caught (3) | `the authored root offset is preserved rather than replaced` +2 |
+| Double-count the parent transform | caught | `the spawn offset is relative to the parent, not doubled by it` |
+| Never attach roots to the requested parent | caught (3) | `roots attach to the requested parent` +2 |
+| Allow spawning into a dead parent | caught | `instantiating into a dead parent is refused` |
+| Ignore `AssignFreshIdentities` (reuse asset guids) | **initially missed**, then caught after rewriting the test | `instances do not reuse the asset's own identities` |
+| Instantiating clears the world | caught (6) | `instantiating never clears the world` +5 |
+| Drop the offset when the entity has no transform | caught | `a spawn offset on a prefab without a root LocalTransform still applies` |
+
+### State at end of session 8
+
+* **530 doctest cases / 502 826 assertions** across 6 executables; Debug (GCC) and ASan+UBSan (clang) both built clean
+  from scratch and green (verified fresh, per Lesson 2).
+* Scene module now: LocalTransform, TransformHierarchy, `.hpscene` v1 I/O, ComponentFactory, Prefab + instantiation.
+* Next: scripting (spawn prefabs, create/destroy entities, per-component updates), then Platform/renderer to make the
+  transform work visible, then the comprehensive test scene that ties it together.

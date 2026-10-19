@@ -11,8 +11,10 @@ target_include_directories(HollowpointScene PUBLIC
 
 target_sources(HollowpointScene PRIVATE
     Include/Hollowpoint/Scene/LocalTransform.h
+    Include/Hollowpoint/Scene/Prefab.h
     Include/Hollowpoint/Scene/SceneIO.h
     Include/Hollowpoint/Scene/TransformHierarchy.h
+    Src/Prefab.cpp
     Src/SceneIO.cpp
     Src/TransformHierarchy.cpp)
 

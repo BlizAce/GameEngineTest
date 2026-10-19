@@ -432,7 +432,13 @@ SceneLoadReport LoadDocument(World& world, const JsonValue& document, const Scen
         const ParsedEntity& entityData = parsed[index];
 
         Entity entity;
-        if (!entityData.Identity.IsNil())
+        if (options.AssignFreshIdentities)
+        {
+            // Prefab instantiation: the document's identities belong to the asset, not to this instance. Two copies
+            // sharing one Guid would make every Guid-based reference resolve ambiguously.
+            entity = world.CreateEntity();
+        }
+        else if (!entityData.Identity.IsNil())
         {
             // A duplicate identity in one file is reported and the entity gets a fresh Guid rather than failing the
             // load: the scene is still usable, and the alternative is refusing to open a level someone must fix.
@@ -524,6 +530,20 @@ SceneLoadReport LoadDocument(World& world, const JsonValue& document, const Scen
                  std::string("could not reparent (") + Hierarchy::ReparentResultName(result) + "); left as a root"});
         }
     }
+
+    // Roots are collected *before* the created list is moved out — reading a moved-from vector is not merely legal but
+    // silently empty, which would make every prefab instance look root-less. Order matters here; do not "tidy" it.
+    for (Size index = 0; index < parsed.size(); ++index)
+    {
+        if (!parsed[index].ParentId.has_value())
+        {
+            report.RootEntities.push_back(created[index]);
+        }
+    }
+
+    // Only a fully successful load reports what it created: after a refused load the world is untouched, and handing
+    // back handles to entities that were never made would be worse than handing back nothing.
+    report.CreatedEntities = std::move(created);
 
     report.Loaded = true;
 

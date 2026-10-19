@@ -60,7 +60,8 @@ the shape the rest of the engine is designed to fit into; it is updated whenever
 | **Serialization** | ✅ JSON layer complete | `tests/Serialization/` — 71 cases: document model, strict parser (grammar, UTF-8, surrogates, error positions), deterministic writer, round-trips incl. 20k random doubles |
 | **Scene** | ✅ transforms complete | `tests/Scene/` — 22 cases: world-transform evaluation (parent-before-child order, inheritance through transform-less nodes, staleness, 20k-deep chain) |
 | **Scene I/O** | ✅ `.hpscene` v1 complete | `tests/Scene/` — 36 cases: save/load round-trips, hierarchy + world-transform fidelity, two-phase parenting, version refusal, Guid identity/duplicates, unknown components, byte-stable re-save |
-| Prefabs | in progress | instantiate a saved document into an existing world (`ClearWorldFirst=false`), references by Guid, asset database on top |
+| **Prefabs** | ✅ complete | `tests/Scene/TestPrefab.cpp` — 20 cases: immutable shared templates, fresh identities per instance, parent-relative spawn transforms, multi-root prefabs, dead-parent refusal |
+| Asset database | planned | load prefabs/materials from disk by path + Guid, hot reload |
 | Platform | planned | GLFW window, input, filesystem, threading |
 | Graphics | planned | NVRHI device, swapchain, buffers/textures, shader objects |
 | Asset | planned | glTF import, texture cook, asset database with GUIDs |

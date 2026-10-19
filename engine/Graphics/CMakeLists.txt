@@ -18,9 +18,11 @@ target_sources(HollowpointGraphics PRIVATE
     Include/Hollowpoint/Graphics/GraphicsApi.h
     Include/Hollowpoint/Graphics/GraphicsDevice.h
     Include/Hollowpoint/Graphics/RhiAccess.h
+    Include/Hollowpoint/Graphics/ShaderBindings.h
     Include/Hollowpoint/Graphics/ShaderCompiler.h
     Src/GlslangInclude.h
     Src/GraphicsDevice.cpp
+    Src/ShaderBindings.cpp
     Src/ShaderCompiler.cpp
     Src/VulkanDispatcher.cpp)
 

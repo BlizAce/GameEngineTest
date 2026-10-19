@@ -132,4 +132,9 @@ if(TARGET HollowpointRenderer)
         SOURCES
             Renderer/TestPbrShading.cpp
         LIBS Hollowpoint::Renderer)
+
+    hp_add_module_test(ColorPipeline
+        SOURCES
+            Renderer/TestColorPipeline.cpp
+        LIBS Hollowpoint::Renderer)
 endif()

@@ -11,7 +11,9 @@ target_include_directories(HollowpointRenderer PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/Include")
 
 target_sources(HollowpointRenderer PRIVATE
+    Include/Hollowpoint/Renderer/ColorPipeline.h
     Include/Hollowpoint/Renderer/PbrShading.h
+    Src/ColorPipeline.cpp
     Src/PbrShading.cpp)
 
 # Graphics is not linked yet: the CPU shading reference is pure math, and keeping it free of the RHI means the

@@ -989,3 +989,80 @@ suppression I had added "for safety" — lesson: never add a suppression for a w
 * Next in M11: render-target abstraction, pipeline state creation, and a **draw test** — compile a real vertex/
   fragment pair, draw a triangle into an offscreen target, assert on the pixels. That is the point where "the
   renderer works" stops being an assumption.
+
+## Session 12 — M11c draw test, Renderer CPU references, binding convention
+
+Seven commits, all pushed: `3db40f4` triangle draw → `4c0d649` PBR → `5f92d88` sRGB/ACES → `667f260` camera →
+`774b575` lights → `468b1e7` binding convention → `7c29204` HDR target.
+
+### The pattern that worked: probe first, then convert
+
+The triangle draw was written as a throwaway binary (`/tmp/drawprobe`) before any engine code, and it found three
+things that would have become engine bugs or false comments (see below). Same for the binding question and the HDR
+format. Cheap, fast to iterate, and nothing unverified reaches the repo.
+
+### Findings that changed code
+
+- **`VertexAttributeDesc::elementStride` defaults to 0.** All vertices then read element zero: a degenerate zero-area
+  triangle that rasterises *nothing*, with no error and no warning — the target just stayed the clear colour. Set it
+  explicitly per attribute (NVRHI asserts when attributes in one slot disagree).
+- **NVRHI Vulkan numbers bindings as `<type offset> + slot`** (`VulkanBindingOffsets`: SRV 0, sampler 128, constant
+  buffer 256, UAV 384; push constants share the constant-buffer offset). A GLSL `layout(binding = 0)` uniform therefore
+  reads **all zeros silently** — indistinguishable from black lighting. Now encoded in
+  `Graphics/ShaderBindings.h`, with the GLSL macro prelude *generated* from the C++ constants and `static_assert`s
+  against `nvrhi::VulkanBindingOffsets{}`, so an upgrade that moves a default fails the build instead of zeroing every
+  uniform at runtime (verified: setting it to 0 yields `static assertion failed ... (0 == 256)`).
+- **std140 ≠ C++ layout.** `{vec4; float}` is 32 bytes in std140 and 20 in C++ — only the struct's *total* rounds to
+  base alignment, each member does not. A CPU array of such structs strides wrong and reads neighbour bytes as
+  plausible-but-wrong values. Explicit padding + `static_assert`.
+- **Half-float decoder sign bug (mine).** Sign bit folded into the rebuilt float32 bits *and* applied again afterwards:
+  `-3.75` decoded as `+3.75`, every positive sample fine. Only signed samples catch it.
+
+### Claims of mine that measurement overturned (three, in one session)
+
+1. ACES "lifts dark regions" → wrong; then "darkens everything below 0.375" → **also wrong**. Solving f(x)=x gives
+   crossings at 0.06219 and 0.72794: it *lifts* mid-tones, darkens outside. An S-curve.
+2. The `(1-x^4)^2` falloff window "has zero edge slope because of the ^4" → wrong; the **outer square** does it (slope
+   ~0 at x=1 for n=1,2,4; the *unsquared* (1-x^4) has slope -4). The exponent only reshapes the interior — which is why
+   a `^4 → ^2` mutant survived until an interior-value assertion (w(0.5·range)=0.8789) was added.
+3. Depth midpoint at the *geometric* mean of near/far → it is the **harmonic** mean 2nf/(n+f); sqrt(nf) gives 0.969,
+   not 0.5.
+
+Lesson kept: any qualitative claim about a curve ("lifts", "smooth", "monotonic", "midpoint") gets computed before it
+is written down — and property tests (invertibility, smoothness, monotonicity, endpoints) never pin *shape*; only a
+hand-computed interior value does.
+
+### Environment: no Vulkan validation layer here
+
+`VK_LAYER_KHRONOS_validation` is not installed (`/usr/share/vulkan/explicit_layer.d/` empty). The device detects this
+correctly, but the consequence matters: **API misuse is completely silent**, so "the validator said nothing" is not
+evidence that a command sequence is legal. Debug GPU problems by staged bisection instead — that is what located the
+binding offset (upload-verified → literal-colour draw → uniform draw).
+
+### Mutation testing this session
+
+Suites are now mutation-checked before being trusted. Caught: identity roughness, dropped `(1-metallic)`, missing `/pi`,
+`abs(cosine)` back-face acceptance, Fresnel exponent 4→5, aspect ignored, `V*P` ordering, hierarchy ignored, ortho
+half/full height, degenerate-target nudge, window exponent, distance clamp, spot half-angle, lumens solid angle,
+pushed-constant-style binding, half-decoder bias.
+
+Three process traps hit and now guarded explicitly:
+- A mutation whose patch **did not apply** (anchor text reflowed by clang-format) looks identical to a *surviving*
+  mutation. Grep for the intended text before concluding anything about coverage.
+- A build failure leaves the **previous binary** in place, and ctest happily reports "100% tests passed" from it —
+  observed twice. Gate on the build's exit code (never `cmake --build | grep`, which returns grep's status) *and*
+  compare the test binary's mtime before/after.
+- One surviving mutant was an **equivalent mutant**: `max(1-x^4, 1e-30)` squares to 1e-60, which underflows float32 to
+  exactly 0 — denotationally identical code, uncatchable by design. Check whether a mutation *can* change output before
+  writing an assertion for it.
+
+### State at end of session 12
+
+* **717 doctest cases / 504,736 assertions across 17 executables**; ctest 16/16 green on Debug (GCC) and ASan+UBSan
+  (clang). Format gate clean.
+* New since last session: `tests/Graphics/TestDraw.cpp`, `TestShaderBindings.cpp`, `TestHdrRenderTarget.cpp`; module
+  `engine/Renderer` with `PbrShading`, `ColorPipeline`, `Camera`, `Lights` (all RHI-free by design — CPU references the
+  GPU passes will be validated against, testable with no device and full leak checking).
+* Next: **M13c — first lit GPU pass**, comparing rendered pixels numerically against the CPU PBR + attenuation + ACES
+  reference. All prerequisites are now verified working: binding convention, HDR float target round-trip accuracy,
+  camera matrices, light attenuation.

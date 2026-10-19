@@ -58,6 +58,14 @@ if(TARGET HollowpointGraphics)
             Graphics/TestGraphicsDevice.cpp
         LIBS Hollowpoint::Graphics Hollowpoint::Platform
         NO_LEAK_CHECK)
+
+    # The draw test is separate from the device tests so a rasterisation failure reads as "drawing broke" rather
+    # than taking the device-creation cases down with it.
+    hp_add_module_test(Draw
+        SOURCES
+            Graphics/TestDraw.cpp
+        LIBS Hollowpoint::Graphics Hollowpoint::Platform
+        NO_LEAK_CHECK)
 endif()
 
 if(TARGET HollowpointPlatform)

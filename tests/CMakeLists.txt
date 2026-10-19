@@ -137,4 +137,10 @@ if(TARGET HollowpointRenderer)
         SOURCES
             Renderer/TestColorPipeline.cpp
         LIBS Hollowpoint::Renderer)
+
+    hp_add_module_test(Camera
+        SOURCES
+            Renderer/TestCamera.cpp
+        LIBS Hollowpoint::Renderer)
 endif()
+

@@ -11,8 +11,10 @@ target_include_directories(HollowpointRenderer PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/Include")
 
 target_sources(HollowpointRenderer PRIVATE
+    Include/Hollowpoint/Renderer/Camera.h
     Include/Hollowpoint/Renderer/ColorPipeline.h
     Include/Hollowpoint/Renderer/PbrShading.h
+    Src/Camera.cpp
     Src/ColorPipeline.cpp
     Src/PbrShading.cpp)
 

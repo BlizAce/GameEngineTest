@@ -44,6 +44,13 @@ if(TARGET HollowpointScene)
         LIBS Hollowpoint::Scene)
 endif()
 
+if(TARGET HollowpointScripting)
+    hp_add_module_test(Scripting
+        SOURCES
+            Scripting/TestScripting.cpp
+        LIBS Hollowpoint::Scripting)
+endif()
+
 if(TARGET HollowpointSerialization)
     hp_add_module_test(Serialization
         SOURCES

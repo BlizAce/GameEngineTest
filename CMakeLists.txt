@@ -71,6 +71,10 @@ add_subdirectory(engine/ECS)
 add_subdirectory(engine/MathReflection)
 add_subdirectory(engine/Scene)
 
+if(HP_ENABLE_SCRIPTING)
+    add_subdirectory(engine/Scripting)
+endif()
+
 if(HP_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

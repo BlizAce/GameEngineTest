@@ -663,3 +663,109 @@ Fixes adopted:
 * Scene module now: LocalTransform, TransformHierarchy, `.hpscene` v1 I/O, ComponentFactory, Prefab + instantiation.
 * Next: scripting (spawn prefabs, create/destroy entities, per-component updates), then Platform/renderer to make the
   transform work visible, then the comprehensive test scene that ties it together.
+
+---
+
+## Session 9 — Scripting: Lua VM, sandbox, engine API, dispatch (+ four real bugs)
+
+### Goal and hypothesis
+
+Expose gameplay scripting on top of the ECS/prefab work: a Lua VM that can create/destroy entities, spawn prefabs,
+read/write transforms, and run per-frame hooks. Hypothesis from the earlier de-risking session — *entities as opaque
+integer handles plus plain functions (no C++ usertypes)* — would let scripts mutate the world without any lifetime
+coupling to Lua's garbage collector. That hypothesis held, but only after fixing how the API was registered: the first
+implementation still leaked engine object lifetimes into the collector, in a way no single-VM test could see.
+
+### Design decisions
+
+| Decision | Reason |
+|---|---|
+| Entities cross the boundary as `int64` handles (slot+generation), never userdata/pointers | A destroyed entity cannot be used: a stale handle decodes to "dead" instead of addressing whatever recycled the slot. No pointer means nothing for Lua's GC to keep alive or free. |
+| Handle encoding is `pack(slot, gen) + 1` | Reserves 0 for "no entity" without aliasing. The obvious alternative — encode normally and remap the single colliding value — maps entity (0,0) onto entity (1,0), so a script's reference to the first entity silently addresses the second. |
+| Libraries opened individually (base/coroutine/table/math/string/utf8); `io`, `os`, `load`, `dofile`, `require`, `package`, `debug` absent | Fail-closed: adding a library upstream cannot silently grant file/process/native-loader access. Scripts are content. |
+| No engine state captured in sol2 closures; raw `lua_CFunction` + light-userdata upvalue | See Bug 1. sol2 stores capturing functors as userdata with `__gc`. |
+| Custom allocator enforces a byte budget | A runaway script becomes a Lua error naming itself, not an OOM kill blamed on the engine. |
+| Hook dispatch snapshots entities, then revalidates `IsAlive` per entity | Scripts destroy and spawn entities during update (split-on-death); iterating live storage would skip or revisit freed slots. A spawner must not tick what it spawned in the same frame. |
+| Unbound script names reported **once** | 200 entities using one renamed script produced 400 warnings/second otherwise; and there is deliberately no "no scripts bound → early-out" fast path, because that silences the exact failure worth reporting. |
+
+### Bug 1 — engine objects destroyed by Lua's GC (order-dependent crash)
+
+Symptom: `SIGSEGV` in `_Sp_counted_base::_M_release` with `this = 0x3f8000003f800000` (two `1.0f`s — matrix data
+overwriting a freed control block), during `lua_close` → `callallpendingfinalizers`. Only reproducible under *some*
+doctest orderings; ASan did not report it (different allocation layout).
+
+Root cause: `api.set_function("create_entity", [state]{...})` — sol2 stores the capturing functor as Lua **userdata with
+a `__gc` finalizer**. The captured `shared_ptr<ApiState>` (and transitively the `World` pointer) was therefore owned by
+the collector: freed whenever GC liked, including after the host had destroyed the world.
+
+Fix: register raw `lua_CFunction`s whose context is a **light-userdata upvalue** (no finalizer at all; unreachable from
+script code because `debug` is never opened), and have `ScriptVM` own that context through an explicit deleter, running
+it deterministically *before* `lua_close`. Move operations were written out rather than defaulted so the moved-from VM
+cannot double-destroy it.
+
+Lesson: *"no C++ usertypes" is not enough — any captured state in a bound closure is userdata state.* Tests that each
+create one VM pass; the bug needs many VMs in one process, which is now an explicit test case.
+
+### Bug 2 — allocator accounting was wrong, silently disabling the memory cap
+
+Two compounding errors against Lua's real contract (`block == NULL` ⇒ `oldSize` is a **type tag**, `LUA_TTHREAD`, not a
+size; `luaM_realloc_` returns NULL on failure *without* updating `GCdebt`):
+
+1. Subtracting `oldSize` on fresh allocations under-counted every VM.
+2. A "defensive" `min(oldSize, LiveBytes)` clamp swallowed the resulting mismatch — driving `LiveBytes` to **0**, which
+   means the cap stopped applying entirely, with no error anywhere. Measured: 16+ clamp events per run, usage reported
+   as 0 while the VM was alive.
+
+Fix: compute `released = block ? oldSize : 0` once and use it for both the cap test and the accounting, so they cannot
+disagree. Rejecting *grows* is correct (not leaky) precisely because Lua leaves the old block counted on failure — and
+grows must be capped, since `t[#t+1] = ...` in a loop **is** the runaway pattern.
+
+Measured after the fix: our counter equals Lua's own `LUA_GCCOUNT`/`LUA_GCCOUNTB` byte count exactly at every stage;
+zero drift across 12 VM create/destroy cycles; cap fires and usage stays under the limit (67 108 606 ≤ 67 108 864).
+
+Lesson: *a guard that clamps instead of trusting its contract fails invisibly.* And `collectgarbage("count")` returns
+float kilobytes — use the C API counters for an equality assertion (the float version failed spuriously under ASan).
+
+### Bug 3 — printf format specifiers into an fmt-style logger
+
+Every `HP_LOG_*("...", "%.*s", n, s)` in the new module compiled and logged the literal text `%.*s`, discarding all
+arguments (`%` is not special to `std::format`). Caught only because one test was strengthened from a count assertion to
+`AnyMessageContains(...)`; count-only assertions elsewhere would have passed against garbage. Fixed across the module and
+noted in AGENTS.md with the rule that log assertions assert content.
+
+### Bug 4 — handle-encoding aliasing (caught by tests, not review)
+
+The original `EncodeEntity` remapped its one colliding encoding to `1`, which is exactly entity `(slot 1, gen 0)`'s
+handle. A test asserting "no two distinct entities share a handle" catches it; the exhaustive slot×generation round-trip
+test would not have.
+
+### Methodology notes (process failures, worth keeping)
+
+* **`assert`-driven Python patch scripts silently skipped edits and once mangled a function** (a grow branch lost its
+  `realloc` and inherited a `malloc`, producing a crash that looked like an engine bug). Several "fixes" appeared not to
+  work because the file was never actually changed, or a stale binary was run. From now on: after any scripted edit,
+  `grep` for the intended text before building, and never trust a build/test result whose edit was not verified present.
+* **`git checkout` cannot restore untracked files.** A mutation left in place after a failed restore; mutations must be
+  reverted by re-writing from an explicit `/tmp` copy and confirmed with `grep -c MUTANT`.
+* Mutation results are only meaningful when the build succeeded (build-gated), and M3 (`released = 0`) was rejected by
+  `-Werror` rather than a test — that is *not* evidence of coverage.
+
+### Mutation testing (build-gated, each reverted and re-verified)
+
+| Mutation | Result |
+|---|---|
+| `oldSize` treated as size when `block == nullptr` (the original bug) | caught — 4 assertions incl. the exact-count invariant |
+| Memory cap disabled entirely | caught — runaway + post-churn cap tests |
+| Sandbox removed (`luaL_openlibs`, `load`/`require` restored) | caught — forbidden-globals test, 5 hits |
+| Hook calls unprotected (`lua_call` instead of `lua_pcall`) | caught — process aborts, suite fails |
+
+### State at end of session 9
+
+* **581 doctest cases / 503 444 assertions** across 7 executables; Debug (GCC) and ASan+UBSan (clang, built from
+  scratch after `rm -rf build/asan`, leak detection on) both green; clang-format clean. Scripting: 49 cases covering handle encoding, sandbox policy, error containment, memory budget and
+  accounting exactness, engine API semantics (including recycled-slot safety), and dispatch (mid-frame destroy, spawn
+  during update, hot rebinding, lifecycle ordering, subtree destruction semantics).
+* Scripting module: `ScriptVM`, `EntityHandle`, `EngineAPI` (create/destroy/is_alive/parent/child/sibling/set_parent/
+  get_position/set_position/spawn_prefab[_at]/time/log_*), `ScriptSystem` (bind + on_update/on_create/on_destroy).
+* Next: drive scripts from a frame loop with a real `.hpscene` + prefab asset set, then Platform/renderer so any of this
+  is visible, then the comprehensive test scene.

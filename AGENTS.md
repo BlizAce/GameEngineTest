@@ -107,7 +107,21 @@ Module → CMake target → directory:
 | Renderer       | `Hollowpoint::Renderer`   | `engine/Renderer`     | Graphics, Asset       |
 | Physics        | `Hollowpoint::Physics`    | `engine/Physics`      | Core, Math, ECS (Jolt)|
 | Audio          | `Hollowpoint::Audio`      | `engine/Audio`        | Core, Math (miniaudio)|
-| Scripting      | `Hollowpoint::Scripting`  | `engine/Scripting`    | Core, Math, ECS, Reflection (Lua) |
+| Scripting      | `Hollowpoint::Scripting`  | `engine/Scripting`    | Core, Math, ECS, Scene (Lua, sol2) |
+
+> **Scripting** deliberately depends on Scene and not on Renderer/Platform: scripts must run in headless tools
+> (asset builders, the editor's preview world, the test suite) that have no window and no GPU. Its safety policy —
+> protected calls, a memory budget, a closed set of Lua libraries, and entities passed as opaque integer handles
+> rather than C++ usertypes — is documented in `ScriptVM.h`, and each part of it is covered by a test. Two rules
+> follow from bugs actually hit while building it:
+>
+>   * **No engine state may be captured in a sol2 closure.** sol2 stores capturing functors as Lua userdata with a
+>     `__gc` finalizer, so anything they capture is destroyed whenever the collector decides — including during
+>     `lua_close`, after the `World` they point at is gone. Engine context is registered through raw `lua_CFunction`s
+>     with a light-userdata upvalue and destroyed by `ScriptVM` before it closes the state.
+>   * **Lua's C headers are included only via `Hollowpoint/Scripting/LuaInclude.h`.** Included directly they break a
+>     clang `-Werror` build (Lua is C89-flavoured; `lauxlib.h` uses old-style casts), which fails only the sanitiser
+>     preset and not the GCC one — a surprising place to discover it.
 
 Rules that keep this graph honest:
 
@@ -127,7 +141,10 @@ Rules that keep this graph honest:
   array index, in anything serialized or cross-thread.
 - **Logging**: `HP_LOG_INFO("CHANNEL", "text {}", value)`. Channels are short upper-case tags
   (`CORE`, `ECS`, `RENDER`, `PHYSICS`, `AUDIO`, `SCRIPT`, `ASSET`, `PLATFORM`). Never `printf`/
-  `std::cout` in engine code.
+  `std::cout` in engine code. **The format is `std::format`, not printf** — `%s`/`%.*s` compiles fine (a `%` is not
+  special to `std::format`) and then logs the specifier literally while silently dropping every argument. Log
+  assertions in tests must therefore check *message content* (`AnyMessageContains`), not just a line count, or they
+  pass against garbage.
 - **Assertions**: `HP_ASSERT(cond)` for invariants, `HP_ASSERT_ARGUMENT(cond, "msg")` for public API
   preconditions, `HP_VERIFY` when the expression has side effects. Assertions fire in **all** build
   configurations (a corrupted scene must not silently produce garbage); they can be redirected via

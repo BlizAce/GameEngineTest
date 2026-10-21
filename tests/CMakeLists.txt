@@ -157,5 +157,11 @@ if(TARGET HollowpointRenderer)
         SOURCES
             Renderer/TestLights.cpp
         LIBS Hollowpoint::Renderer)
+
+    # CPU-only like the other shading references: no RHI, no GPU, full leak checking.
+    hp_add_module_test(ImageBasedLighting
+        SOURCES
+            Renderer/TestImageBasedLighting.cpp
+        LIBS Hollowpoint::Renderer)
 endif()
 

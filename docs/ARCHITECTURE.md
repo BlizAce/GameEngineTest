@@ -1,8 +1,10 @@
 # Hollowpoint — Architecture
 
-Status: **foundation complete; runtime layers landing** (Core, Math, Reflection, Serialization,
-ECS and Scene transforms are implemented and tested). This document describes what exists and
-the shape the rest of the engine is designed to fit into; it is updated whenever a module lands.
+Status: **foundation complete; runtime layers landing** (Core, Math, Reflection, Serialization, ECS,
+Scene, Platform windowing/input, Scripting and the Graphics device layer are implemented and tested;
+the Graphics resource layer and the Renderer's GPU passes are in flight). This document describes
+what exists and the shape the rest of the engine is designed to fit into; it is updated whenever a
+module lands.
 
 ## Design decisions worth knowing
 
@@ -61,13 +63,14 @@ the shape the rest of the engine is designed to fit into; it is updated whenever
 | **Scene** | ✅ transforms complete | `tests/Scene/` — 22 cases: world-transform evaluation (parent-before-child order, inheritance through transform-less nodes, staleness, 20k-deep chain) |
 | **Scene I/O** | ✅ `.hpscene` v1 complete | `tests/Scene/` — 36 cases: save/load round-trips, hierarchy + world-transform fidelity, two-phase parenting, version refusal, Guid identity/duplicates, unknown components, byte-stable re-save |
 | **Prefabs** | ✅ complete | `tests/Scene/TestPrefab.cpp` — 20 cases: immutable shared templates, fresh identities per instance, parent-relative spawn transforms, multi-root prefabs, dead-parent refusal |
-| Asset database | planned | load prefabs/materials from disk by path + Guid, hot reload |
-| Platform | planned | GLFW window, input, filesystem, threading |
-| Graphics | planned | NVRHI device, swapchain, buffers/textures, shader objects |
-| Asset | planned | glTF import, texture cook, asset database with GUIDs |
-| Renderer | planned | HDR forward+, PBR, shadows, IBL, SSAO, tonemap |
-| Physics / Audio / Scripting | planned | thin engine-facing wrappers over the vendored libraries |
-| Editor / Runtime | planned | editor embeddable in the runtime; both scriptable |
+| **Platform** | ✅ windowing + input complete | `tests/Platform/` — 36 cases: GLFW lifecycle over the Null backend (DPI, close, clipboard, cursor modes), full input event queue with keycode/modifier mapping, Vulkan surface creation behind an opt-in GPU test |
+| **Scripting** | ✅ VM + sandbox + engine API complete | `tests/Scripting/` — 51 cases: protected calls, memory budget, closed library set, opaque entity handles, hook dispatch with per-script error isolation, prefab spawn through host resolvers |
+| **Graphics** | 🟡 device layer complete; resource layer landing | `tests/Graphics/` + `tests/ShaderCompiler/` — 30 cases: adapter enumeration with VRAM-filter cross-checks, Vulkan 1.2 device creation, validation-layer detection, GLSL→SPIR-V compile (incl. error paths), HDR RGBA16F target round-trip, triangle draw asserted on readback pixels, NVRHI binding-offset contract pinned by `static_assert` |
+| **Renderer** | 🟡 CPU shading reference complete; GPU passes landing | `tests/Renderer/` — 73 cases: PBR BRDF terms vs closed forms, light attenuation/unit conversions, camera projections and frusta, ACES+sRGB with invertibility properties, generated-GLSL-from-same-constants contract, **GPU-vs-CPU numeric equivalence** (`ShadingEquivalenceTests`, real draws compared to the CPU reference), IBL convolutions vs independent quadrature |
+| Asset database | planned | load prefabs/materials from disk by path + Guid, hot reload; glTF import (cgltf fetched), texture cook (stb fetched) |
+| Physics | planned | Jolt is fetched and builds (`HP_ENABLE_PHYSICS`); no engine-facing module yet |
+| Audio | planned | miniaudio is fetched and builds (`HP_ENABLE_AUDIO`); no engine-facing module yet |
+| Editor / Runtime | planned | editor embeddable in the runtime; both scriptable. `HP_BUILD_EDITOR`/`HP_BUILD_RUNTIME` are accepted but currently build nothing — targets land with the modules themselves |
 
 ## Core (implemented)
 

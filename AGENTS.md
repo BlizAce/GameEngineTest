@@ -93,12 +93,6 @@ Module → CMake target → directory:
 | ECS            | `Hollowpoint::ECS`        | `engine/ECS`          | Core, Math            |
 | Reflection     | `Hollowpoint::Reflection` | `engine/Reflection`   | Core, Math            |
 | Serialization  | `Hollowpoint::Serialization` | `engine/Serialization` | Core (JSON layer); +Math, +Reflection for the value bridge |
-
-> The JSON layer (`Hollowpoint::Serialization`: `JsonValue`, parser, writer) depends on Core alone and must
-> stay that way — it is a leaf every module may include. The reflection-driven encode/decode bridge is a
-> **separate target** (`Hollowpoint::SerializationReflection`) because it needs Reflection; merging them would
-> make linking JSON drag Reflection along, and the layering rule would then rot quietly instead of failing a
-> build.
 | Scene          | `Hollowpoint::Scene`      | `engine/Scene`        | Core, Math, ECS, Reflection, Serialization(+Reflection), MathReflection |
 | MathReflection | `Hollowpoint::MathReflection` | `engine/MathReflection` | Core, Math, Reflection |
 | Asset          | `Hollowpoint::Asset`      | `engine/Asset`        | Core, Math, Serialization |
@@ -109,6 +103,12 @@ Module → CMake target → directory:
 | Audio          | `Hollowpoint::Audio`      | `engine/Audio`        | Core, Math (miniaudio)|
 | Scripting      | `Hollowpoint::Scripting`  | `engine/Scripting`    | Core, Math, ECS, Scene (Lua, sol2) |
 
+> The JSON layer (`Hollowpoint::Serialization`: `JsonValue`, parser, writer) depends on Core alone and must
+> stay that way — it is a leaf every module may include. The reflection-driven encode/decode bridge is a
+> **separate target** (`Hollowpoint::SerializationReflection`) because it needs Reflection; merging them would
+> make linking JSON drag Reflection along, and the layering rule would then rot quietly instead of failing a
+> build.
+>
 > **Scripting** deliberately depends on Scene and not on Renderer/Platform: scripts must run in headless tools
 > (asset builders, the editor's preview world, the test suite) that have no window and no GPU. Its safety policy —
 > protected calls, a memory budget, a closed set of Lua libraries, and entities passed as opaque integer handles
@@ -204,8 +204,11 @@ scripts/run_tests.sh                                        # full gate: format 
 - Engine options: `HP_BUILD_TESTS`, `HP_BUILD_EDITOR`, `HP_BUILD_RUNTIME`, `HP_ENABLE_VULKAN`,
   `HP_ENABLE_PHYSICS`, `HP_ENABLE_AUDIO`, `HP_ENABLE_SCRIPTING`, `HP_WARNINGS_AS_ERRORS`,
   `HP_TRACK_ALLOCATIONS`, `HP_ENABLE_TRACE_LOGS`, `HP_SHADER_PROFILE` (`GLSL`|`HLSL`).
-- Shader sources live in `assets/shaders/**.glsl` / `**.hlsl` and are compiled to SPIR-V at build time
-  by the `HollowpointShaderC` tool; generated files land in the build tree and are never committed.
+- Shader authoring is **in-process**: engine code compiles GLSL (or HLSL under `HP_SHADER_PROFILE=HLSL`) source text
+  to SPIR-V through `Graphics/ShaderCompiler.h` (glslang + SPIRV-Tools), so a failing shader is a runtime error the
+  editor can display and recover from rather than a build failure. Generated SPIR-V is never committed. An offline
+  bake tool (`HollowpointShaderC`) that pre-compiles `assets/shaders/**` at build time is planned with the asset
+  system; until it exists, shader sources live in engine code or are loaded by the asset pipeline.
 
 ---
 
@@ -241,5 +244,7 @@ scripts/run_tests.sh                                        # full gate: format 
 - Long builds: run in the background and poll; never let a timeout kill a build or a test suite.
 - GPU tests must degrade gracefully on machines without a Vulkan device: skip with a clear message, do
   not fail. Detect once, cache the result.
-- The editor is designed to be driven by agents: every editor action has a scripting/console command
-  equivalent (see `docs/EDITOR_SCRIPTING.md`). Prefer the scripted path when automating scene work.
+- The editor is designed to be driven by agents: every editor action will have a scripting/console command
+  equivalent. `docs/EDITOR_SCRIPTING.md` is written when the editor lands; until then, the scripting API in
+  `engine/Scripting/Include/Hollowpoint/Scripting/EngineAPI.h` documents what scripts can do, and prefer that
+  scripted path when automating scene work.

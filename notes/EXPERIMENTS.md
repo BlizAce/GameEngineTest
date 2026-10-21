@@ -1066,3 +1066,80 @@ Three process traps hit and now guarded explicitly:
 * Next: **M13c — first lit GPU pass**, comparing rendered pixels numerically against the CPU PBR + attenuation + ACES
   reference. All prerequisites are now verified working: binding convention, HDR float target round-trip accuracy,
   camera matrices, light attenuation.
+
+## Session 13 — M0: the in-flight IBL unit, finished honestly; doc reconciliation
+
+### What was built
+
+`ImageBasedLighting.{h,cpp}` existed in the tree **untracked, unbuildable and untested**: absent from
+`target_sources`, failing to compile (`Math::Lerp` lives in `MathFunctions.h`, not `MathCore.h`), and its header
+promised a test suite that did not exist. It is now wired into CMake, compiles clean under `-Werror`, ships
+`tests/Renderer/TestImageBasedLighting.cpp` (14 cases / 106 assertions), and passes Debug + ASan/UBSan.
+
+### Two real defects found before the unit ever shipped — both silent, both caught by measurement
+
+1. **The 2D sampler's second coordinate was identically zero.** Both random dimensions came from one golden-ratio
+   sequence at different index offsets (`GoldenRatioSample(index + 0x9E3779B9u)`). In Float32 the ULP at 2.6e9 is ~256,
+   so every index in that range casts to the *same float* — `randomB` returned exactly 0.0 for all 1024 samples
+   (measured: 1 distinct value over 1024). Even in exact arithmetic a shifted copy of one lattice is perfectly
+   correlated with itself. Consequence: cosine-weighted hemisphere sampling collapsed onto a single meridian, biasing
+   `IntegrateIrradiance` by **+100%** for axis=(x+z)/√2 while staying within 0.1% for axes lying in that meridian's
+   plane — the error vanished precisely for the symmetric test cases one would naturally write. Split-sum A was off
+   +28% at roughness 0.25 / n·v = 0.1. Fixed with Roberts' R2 (two *different* irrational multipliers, double
+   intermediate arithmetic — Float32 loses `index × α` fractional precision past ~2^24/α anyway), Cranley-Patterson
+   rotated by the previously-decorative `Seed` field. Verified: 8×8 bucket occupancy 14–18 per cell (ideal 16) at
+   N=1024, all cells filled, seeds decorrelated, convergence vs quadrature 9.8e-3 → 2.8e-4 over N = 256 → 8192.
+2. **A wrong closed form documented as the test anchor.** The comment claimed ramp irradiance `= π·(n·axis)`. Dense
+   quadrature: aligned gives 2π/3 (not π); at 54.7° the ratio is 0.686; where the ramp's zero half-sphere clips the
+   horizon the formula even changes sign relative to truth. There is no simple closed form for oblique ramps — only
+   axis-parallel does (`2π/3 · scale`, from `∫cos²θ sinθ dθ dφ`). The tests therefore use quadrature computed inside
+   the test file (own frame construction, own grid, double precision), with the one analytic case as a self-check of
+   the helper itself.
+
+The general shape of defect 1 is worth keeping: **a "2D" random pair drawn from two offsets of one 1-D sequence is
+one number wearing a trenchcoat.** Symmetric ground truths hide it; only oblique/asymmetric cases expose it, and they
+must be checked against something computed independently of the estimator.
+
+### Claims I measured rather than trusted (the ones that survived)
+
+- Estimator normalisation `L·π/N` is correct: constant environment returns π·L to ~1e-6 at every N from 1 to 8192,
+  any normal — zero variance as advertised.
+- Prefilter radiance normalisation is correct: constant environment returns the constant for all roughness/view combos
+  (≤ 4e-6), which is the property that stops "rough surfaces leak energy".
+- Split-sum's `A + B == 1` identity holds at ≤ 1e-5 across the (cos, roughness) grid — the two convolutions agree.
+- The mirror-limit anchor **A → 1−(1−n·v)⁵ as roughness→0** agrees to ≤ 2e-5 for n·v ≥ 0.1 and is *the* load-bearing
+  test: it caught the collapsed sampler at +4% where everything else stayed green. n·v = 0 excluded (truncated
+  estimator has no closed-form limit there).
+
+### Process notes
+
+- My first brute-force split-sum "ground truth" produced A ≈ 1.5e5 — a fine-α GGX lobe aliases brutally on uniform
+  grids (peak D ~ 1/πα²). Lesson: before trusting a numeric reference, check it against the analytic limits the
+  quantity must satisfy; an unconverged quadrature is worse than none because it looks authoritative.
+- Mutation-tested the new suite: collapsing Y onto X at all three call sites fails exactly the mirror-limit test
+  (5 assertions). Two mutation attempts died on `-Werror=unused-variable` first — and both times ctest re-ran the
+  **stale binary** from before the failed build. Third time's the rule, recorded again: gate on the build exit code,
+  never conclude "surviving mutant" without checking it compiled.
+- `doctest::Approx` has no `.margin()` (that is gtest); absolute-tolerance comparisons need a local helper. The repo
+  uses `CHECK(a == Approx(b))`, not `CHECK_THAT`.
+
+### Doc reconciliation (the other half of M0)
+
+`docs/ARCHITECTURE.md` still listed Platform/Graphics/Renderer/Asset/Physics/Audio/Scripting as "planned" — five of
+six now exist; status table rewritten with **measured** case counts (my first draft used `--list-test-cases | wc -l`,
+which over-counts separator noise: 44 vs the true 36 for Platform; corrected by parsing each binary's summary). The
+AGENTS.md module table was spliced in two by a blockquote inserted mid-table — restructured. Dangling references to
+files that never existed (`docs/EDITOR_SCRIPTING.md`, `scripts/check_dependency_pins.py`,
+`tests/Support/leak-suppressions.txt`, the `HollowpointShaderC` build-time story) rewritten to describe reality: the
+shader compiler is in-process by design; leak policy is a per-target switch. Added the missing root README.md.
+
+### State at end of session 13
+
+* **720 doctest cases / 504,899 assertions across 18 executables** (authoritative count: parse each registered
+  binary's summary; stale binaries in `output/` inflate anything glob-based). Debug (GCC) and ASan+UBSan (clang)
+  green; format gate clean.
+* Repo hygiene findings for later milestones: `HP_BUILD_EDITOR`/`HP_BUILD_RUNTIME` are ON but build nothing;
+  `nlohmann_json` is fetched and used by nobody (own JSON layer exists); `[gpu]` test labels mandated by AGENTS §5
+  appear in zero tests; ComponentFactory registers exactly one component (`LocalTransform`).
+* Next: **M1 — Graphics resource layer** (`Buffer`/`Texture`/`RenderTarget`/pipeline cache extracted from what the
+  draw tests proved, swapchain + present + frame ring), per the renderer-first order.

@@ -46,8 +46,9 @@ endif()
 
 if(TARGET HollowpointGraphics)
     # Separate executables on purpose. TestGraphicsDevice initialises Vulkan, and the driver retains D-Bus/loader
-    # state for the process lifetime (see tests/Support/leak-suppressions.txt); keeping the pure CPU shader-compiler
-    # suite in its own binary leaves that suite with fully unsuppressed leak checking.
+    # state for the process lifetime (see NO_LEAK_CHECK in cmake/HollowpointTestHelpers.cmake for why this is a
+    # per-target switch rather than pattern suppression); keeping the pure CPU shader-compiler suite in its own
+    # binary leaves that suite with fully unsuppressed leak checking.
     hp_add_module_test(ShaderCompiler
         SOURCES
             Graphics/TestShaderCompiler.cpp

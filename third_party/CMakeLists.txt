@@ -145,8 +145,8 @@ endif()
 # glslang expects its dependencies to be submodules inside its own source tree, which FetchContent
 # does not populate recursively. Instead we declare spirv-headers and spirv-tools ourselves, in the
 # order their CMake scripts require, and hand the resulting targets to glslang. The pinned SPIRV
-# commits are the ones listed in glslang's known_good.json — verified with
-# scripts/check_dependency_pins.py.
+# commits are the ones listed in glslang's known_good.json for this release — checked by hand when
+# the pin is bumped (glslang's repo ships that file; reading it is the check).
 # ---------------------------------------------------------------------------
 if(HP_ENABLE_VULKAN)
     set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)

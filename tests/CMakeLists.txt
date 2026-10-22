@@ -155,6 +155,14 @@ if(TARGET HollowpointRenderer)
             Renderer/TestCamera.cpp
         LIBS Hollowpoint::Renderer)
 
+    # CPU-only like the other references: geometry correctness is winding/normals/indices, checked independently of
+    # any device. The winding test in particular catches a face flipped in the static table, which renders as an
+    # inside-out cube only once culling exists - before that nothing else would ever notice.
+    hp_add_module_test(Geometry
+        SOURCES
+            Renderer/TestGeometry.cpp
+        LIBS Hollowpoint::Renderer)
+
     # Shading equivalence needs the RHI (it renders), so unlike the other Renderer tests it links Graphics and skips
     # leak checking for the same reason the GPU targets above do.
     hp_add_module_test(ShadingEquivalence

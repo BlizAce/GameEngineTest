@@ -69,6 +69,15 @@ if(TARGET HollowpointGraphics)
             Graphics/TestHdrRenderTarget.cpp
         LIBS Hollowpoint::Graphics Hollowpoint::Platform
         NO_LEAK_CHECK)
+
+    # The engine-level resource wrappers (Buffer/Texture/RenderTarget/Pipeline), drawn through end to end: proves the
+    # flag and state choices those wrappers make internally are correct. Own binary because it initialises Vulkan, so
+    # leak checking follows the GPU-target policy.
+    hp_add_module_test(Resources
+        SOURCES
+            Graphics/TestResources.cpp
+        LIBS Hollowpoint::Graphics Hollowpoint::Platform
+        NO_LEAK_CHECK)
 endif()
 
 if(TARGET HollowpointPlatform)

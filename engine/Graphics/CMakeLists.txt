@@ -15,15 +15,26 @@ target_include_directories(HollowpointGraphics PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/Include")
 
 target_sources(HollowpointGraphics PRIVATE
+    Include/Hollowpoint/Graphics/Buffer.h
     Include/Hollowpoint/Graphics/GraphicsApi.h
     Include/Hollowpoint/Graphics/GraphicsDevice.h
+    Include/Hollowpoint/Graphics/GraphicsTypes.h
+    Include/Hollowpoint/Graphics/Pipeline.h
+    Include/Hollowpoint/Graphics/RenderTarget.h
     Include/Hollowpoint/Graphics/RhiAccess.h
     Include/Hollowpoint/Graphics/ShaderBindings.h
     Include/Hollowpoint/Graphics/ShaderCompiler.h
+    Include/Hollowpoint/Graphics/Texture.h
     Src/GlslangInclude.h
+    Src/Buffer.cpp
     Src/GraphicsDevice.cpp
+    Src/Pipeline.cpp
+    Src/RhiConversions.h
+    Src/RhiConversions.cpp
+    Src/RenderTarget.cpp
     Src/ShaderBindings.cpp
     Src/ShaderCompiler.cpp
+    Src/Texture.cpp
     Src/VulkanDispatcher.cpp)
 
 # glslang is linked for offline GLSL -> SPIR-V compilation. Its own headers are exposed as SYSTEM includes so its

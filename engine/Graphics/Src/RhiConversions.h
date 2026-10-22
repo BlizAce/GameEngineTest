@@ -55,6 +55,7 @@ class PipelineImpl
 public:
     nvrhi::GraphicsPipelineHandle Pipeline;
     nvrhi::InputLayoutHandle InputLayout;
+    nvrhi::BindingLayoutHandle BindingLayout;  // null for shaders that bind nothing
     nvrhi::ShaderHandle VertexShaderModule;
     nvrhi::ShaderHandle PixelShaderModule;
 };

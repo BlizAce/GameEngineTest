@@ -70,9 +70,18 @@ if(TARGET HollowpointGraphics)
         LIBS Hollowpoint::Graphics Hollowpoint::Platform
         NO_LEAK_CHECK)
 
-    # The engine-level resource wrappers (Buffer/Texture/RenderTarget/Pipeline), drawn through end to end: proves the
-    # flag and state choices those wrappers make internally are correct. Own binary because it initialises Vulkan, so
-    # leak checking follows the GPU-target policy.
+    # The engine-level resource wrappers (Buffer/Texture/RenderTarget/Pipeline), drawn through end to end. Own
+    # binary for the same reason as above: it initialises Vulkan, so leak checking follows the GPU-target policy.
+    # Probes for assumptions every other GPU test leans on but cannot see: that constant-buffer slots actually
+    # reach the fragment stage through Pipeline's generated layout, and which way framebuffer Y runs on this driver.
+    # Both were written to debug a real failure (zero-lit pixels from an unflipped texel mapping) and kept because
+    # each pins behaviour that would otherwise fail somewhere far more confusing.
+    hp_add_module_test(PipelineBindingProbe
+        SOURCES
+            Graphics/TestPipelineBindingProbe.cpp
+        LIBS Hollowpoint::Graphics Hollowpoint::Renderer Hollowpoint::Platform
+        NO_LEAK_CHECK)
+
     hp_add_module_test(Resources
         SOURCES
             Graphics/TestResources.cpp
@@ -157,17 +166,32 @@ if(TARGET HollowpointRenderer)
 
     # CPU-only like the other references: geometry correctness is winding/normals/indices, checked independently of
     # any device. The winding test in particular catches a face flipped in the static table, which renders as an
-    # inside-out cube only once culling exists - before that nothing else would ever notice.
+    # inside-out cube only once culling exists — earlier than that it hides.
     hp_add_module_test(Geometry
         SOURCES
             Renderer/TestGeometry.cpp
         LIBS Hollowpoint::Renderer)
+
+    # The forward pass's CPU reference and shader generation. Links Graphics for glslang (the shaders must actually
+    # compile) but creates no device, so unlike the GPU suites it keeps full leak checking.
+    hp_add_module_test(ForwardRender
+        SOURCES
+            Renderer/TestForwardRender.cpp
+        LIBS Hollowpoint::Renderer Hollowpoint::Graphics)
 
     # Shading equivalence needs the RHI (it renders), so unlike the other Renderer tests it links Graphics and skips
     # leak checking for the same reason the GPU targets above do.
     hp_add_module_test(ShadingEquivalence
         SOURCES
             Renderer/TestShadingEquivalence.cpp
+        LIBS Hollowpoint::Renderer Hollowpoint::Graphics Hollowpoint::Platform
+        NO_LEAK_CHECK)
+
+    # The forward pass rendered and compared numerically against the CPU reference (M3's acceptance test). Renders,
+    # so: Graphics + Platform for the device, leak checking off per the GPU-target policy.
+    hp_add_module_test(ForwardRenderGpu
+        SOURCES
+            Renderer/TestForwardRenderGpu.cpp
         LIBS Hollowpoint::Renderer Hollowpoint::Graphics Hollowpoint::Platform
         NO_LEAK_CHECK)
 

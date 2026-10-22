@@ -1143,3 +1143,110 @@ shader compiler is in-process by design; leak policy is a per-target switch. Add
   appear in zero tests; ComponentFactory registers exactly one component (`LocalTransform`).
 * Next: **M1 — Graphics resource layer** (`Buffer`/`Texture`/`RenderTarget`/pipeline cache extracted from what the
   draw tests proved, swapchain + present + frame ring), per the renderer-first order.
+
+## Session 13 (cont.) — M1 design: presentation is ours, NVRHI has no swapchain
+
+### The finding that shapes M1
+
+The pinned NVRHI revision (`6b96fb0`, Oct 2026) contains **zero** swapchain/present API surface
+(`grep -c Swapchain include/nvrhi/nvrhi.h` → 0; no `ISwapchain`, no `createSwapchain`). This is by design, not a
+regression: NVRHI's Tutorial explicitly puts swapchain ownership on the application and shows the supported route —
+create `VkSwapchainKHR` yourself, then adopt each image with
+`IDevice::createHandleForNativeTexture(ObjectTypes::VK_Image, image, desc)` (`include/nvrhi/common/resource.h`,
+impl `src/vulkan/vulkan-texture.cpp:729`). Donut's `DeviceManager_VK` is the reference implementation of that pattern.
+
+Consequences for the engine:
+* `GraphicsDevice` already owns VkInstance/VkDevice/graphics queue/surface, so presentation belongs in exactly that
+  place — a new `Graphics::Swapchain` doing raw Vulkan through the same dispatcher the device uses, plus NVRHI
+  handles for the images so everything above (framebuffers, pipelines, barriers) stays RHI-portable.
+* Engine code above Graphics never sees swapchain details: acquire/present live behind a `Renderer`-facing frame
+  loop API. The D3D12 path later replaces exactly this file, nothing else.
+* Sync: image-available + per-image render-finished semaphores are ours (NVRHI exposes
+  `vulkan::IDevice::getQueueSemaphore`/`queueWaitForSemaphore` for crossing between native sync and its queue).
+
+### M1 sequencing decision (revised mid-milestone, deliberately)
+
+Swapchain + present is the riskiest slice in M1 and the least testable on this host: raw `VkSwapchainKHR` with
+empty-submit semaphore choreography around NVRHI's queue (the sanctioned pattern per NVRHI's Tutorial, since NVRHI
+exposes no swapchain API), with **no validation layer to catch a sync mistake** — a wrong wait stage here shows up
+as flicker or a TDR on someone's compositor, not as a failing test. Meanwhile every other M1/M3 deliverable (buffers,
+textures, framebuffers, pipelines, the forward PBR pass) is fully verifiable by pixel readback into an HDR target,
+which is exactly how sessions 12–13 validated everything else.
+
+Order within M1 therefore becomes: resource wrappers first (`Buffer`, `Texture`, `Framebuffer`, `Pipeline` + cache),
+then the lit-cube render pass against the CPU reference (M3's substance), and swapchain/present as the final thin
+slice on top — with its own opt-in visible-window test. Same end state, risk moved to last, every intermediate step
+green in CI. This is a sequencing choice, not a scope cut.
+
+## Session 14 — M1 resource layer + M3's forward pass, verified numerically
+
+### What landed
+
+Four commits, each green on debug and ASan before the next started:
+
+1. **Graphics resource layer** (`Buffer`, `Texture`, `RenderTarget`, `Pipeline`) — engine-level wrappers whose
+   *creation* enforces the rules the session-12 draw tests proved by hand. Recording stays NVRHI's through the
+   documented escape hatch; no vocabulary leaked into public headers (each wrapper is pimpl, matching GraphicsDevice).
+2. **Procedural geometry** (`MakeCube`, `MakePlane`) with winding/normal/index validation — meshes before any importer,
+   so "the pipeline works" is testable independently of "the asset pipeline works".
+3. **Forward render pass**: `ForwardDrawItem`/`ForwardPassParams`/`ForwardLight`, generated vertex+fragment GLSL built
+   entirely from `BuildShadingModelGlsl()` calls (no lighting formula written twice), and `ComputeForwardShadingCpu` —
+   the CPU reference the GPU is compared against.
+4. **Probes kept as tests**: constant-buffer delivery through Pipeline's generated layout, and measured framebuffer Y
+   orientation.
+
+### Findings worth not forgetting
+
+* **`Math::Vec3` is `alignas(16)`** (size 16, not 12). A vertex struct of three math types therefore pads to 48 bytes
+  with silent holes — caught by the layout `static_assert`s before anything shipped. `GeometryVertex` stores plain
+  float arrays (32 bytes, offsets 0/12/24) with converting accessors; the wire format and the API type are deliberately
+  different things.
+* **NVRHI naming traps**, all mapped in one file (`Src/RhiConversions.cpp`) so each is paid once: `D32` not
+  `D32_FLOAT`; `ComparisonFunc::LessOrEqual` (not `CompareFunction::LessEqual`); `setDepthAttachment` (not
+  `attachDepthStencil`); `TextureDesc` has **no** `cpuAccess` field (CPU-visible textures are a separate object type,
+  `createStagingTexture`); there is no `GenericRead` state. There is also no `Ref`-adopt semantics to lean on:
+  `Ref<T>`'s pointer constructor does **not** AddRef, so descs hold `Ref<Texture>` rather than borrowed pointers.
+* **A pipeline with no binding layout SIGSEGVs.** Not a validation error, not a warning: `bindDescriptorSets`
+  dereferences the pipeline's null layout inside libnvidia. Passing `nullptr` to `createBindingSet` crashes in the same
+  way (it does *not* mean "infer one" — I guessed that and was wrong; checked the backend source after crashing).
+  Hence `PipelineDesc::Bindings` + `Pipeline::GetBindingLayout()`.
+* **Undefined depth contents + `LessOrEqual` = driver luck.** Attachment memory is undefined at creation; testing
+  against it passes or fails per run. Every depth-attached test now clears to far first.
+* **Culling off without a depth buffer draws the wrong face silently.** The forward test initially produced *exact
+  zero* pixels: with culling disabled (to stay independent of the framebuffer-Y winding question) whichever triangle
+  rasterises last wins, and for that cube it was the −Z face whose normal faces away from every light. Zero is what a
+  correct shader produces for a back-facing surface — so "the shader is broken" was the wrong conclusion, twice.
+* **Framebuffer orientation, measured**: NDC +Y lands on the **first** readback rows (Vulkan top-left origin). The test
+  had omitted the y flip; its centre sample passed by symmetry and only off-centre samples drifted (~8%, exactly the
+  kind of error that reads as a shading-model disagreement). Now pinned by a probe that fails loudly if orientation
+  ever changes.
+* **Sample from texel centres, not at chosen world points.** Rounding a hand-picked world position to a texel means
+  the GPU shaded the texel *centre* — a different point on a curved lighting field (spot cone edge, inverse-square).
+  Deriving the CPU sample point from the texel centre makes both sides evaluate identical positions, so remaining
+  disagreement is genuinely a shading difference. This changed the test from "6 hand-picked points, 9 failures" to
+  "~50 texels, all passing".
+* **Clang catches what GCC does not**: `-Wdocumentation` rejected an `@param` on a comment attached to the wrong
+  declaration — clean under GCC's build, an error under the ASan (clang) preset. Both presets must be built before a
+  change is called green; this session hit that twice via stale binaries.
+
+### Verification
+
+* Debug: **23/23 executables**, 747 doctest cases / 505,201 assertions (authoritative per-binary parse). ASan+UBSan:
+  **23/23**. Format gate clean.
+* **Mutation-tested both directions**: dropping the radiance scale from the CPU reference fails the GPU comparison;
+  disabling the spot-cone test in the generated shader fails *both* the numeric comparison and the dedicated
+  "no light leaks outside the cone" check. The equivalence test is load-bearing, not decorative.
+* Non-vacuity of the new GPU tests confirmed by inspection of run output (real device path taken; NaN clear survives
+  to readback so an unwritten texel cannot masquerade as black).
+
+### State at end of session 14
+
+* M1 is **partly** done: resource wrappers + pipeline exist and are tested; **swapchain/present/frame ring remain**
+  (deliberately last — see session 13's sequencing note; raw `VkSwapchainKHR` with no validation layer on this host).
+* M3's substance is done for flat-lit opaque geometry: forward PBR pass numerically equal to the CPU reference. Not yet
+  in M3: tone-mapped blit to a presented image (needs the swapchain), per-vertex normal interpolation for curved
+  surfaces, and any culling.
+* Next options, in the order that keeps everything green: (a) tonemap-blit pass verified against `ColorPipeline`'s CPU
+  reference into an HDR target (no swapchain needed — same readback trick), then (b) swapchain + present as the thin
+  final slice, or (c) jump to M2 scene components (Camera/Light/Script registration, MeshRenderer, scene v1 schema) to
+  get content flowing before more renderer polish. Recommend (a) then (c).

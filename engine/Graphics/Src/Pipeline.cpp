@@ -146,6 +146,53 @@ Core::Ref<Pipeline> Pipeline::Create(GraphicsDevice& device, const PipelineDesc&
         return nullptr;
     }
 
+    // --- Binding layout -------------------------------------------------------
+    // Built from the engine-level slot descriptions and attached to the pipeline. A shader that declares uniform
+    // blocks with no layout on the pipeline crashes at bindDescriptorSets time (null dereference inside the driver,
+    // SIGSEGV with nothing naming the cause) — see PipelineDesc::Bindings for the full note. An empty Bindings list
+    // is legal only for shaders that bind nothing (the triangle tests), which is why this is conditional rather than
+    // always creating a layout: an empty-but-attached layout works too, but attaching one the shader does not declare
+    // invites validation complaints about unused sets on some drivers.
+    nvrhi::BindingLayoutHandle bindingLayout;
+    if (!desc.Bindings.empty())
+    {
+        nvrhi::ShaderType visibility = nvrhi::ShaderType::None;
+        if (desc.BindingsVisibleToVertex)
+        {
+            visibility = visibility | nvrhi::ShaderType::Vertex;
+        }
+        if (desc.BindingsVisibleToPixel)
+        {
+            visibility = visibility | nvrhi::ShaderType::Pixel;
+        }
+
+        nvrhi::BindingLayoutDesc layoutDesc;
+        layoutDesc.visibility = visibility;
+
+        for (const BindingSlotDesc& slot : desc.Bindings)
+        {
+            switch (slot.Type)
+            {
+                case BindingSlotDesc::Kind::ConstantBuffer:
+                    layoutDesc.addItem(nvrhi::BindingLayoutItem::ConstantBuffer(slot.Slot));
+                    break;
+                case BindingSlotDesc::Kind::SampledTexture:
+                    layoutDesc.addItem(nvrhi::BindingLayoutItem::Texture_SRV(slot.Slot));
+                    break;
+                case BindingSlotDesc::Kind::Sampler:
+                    layoutDesc.addItem(nvrhi::BindingLayoutItem::Sampler(slot.Slot));
+                    break;
+            }
+        }
+
+        bindingLayout = rhi->createBindingLayout(layoutDesc);
+        if (!static_cast<bool>(bindingLayout))
+        {
+            HP_LOG_ERROR("GRAPHICS", "createBindingLayout failed for pipeline \"{}\"", desc.Name);
+            return nullptr;
+        }
+    }
+
     // --- Pipeline state -----------------------------------------------------
     nvrhi::GraphicsPipelineDesc pipelineDesc;
     pipelineDesc.setPrimType(ToNvrhi(desc.Topology))
@@ -153,6 +200,10 @@ Core::Ref<Pipeline> Pipeline::Create(GraphicsDevice& device, const PipelineDesc&
         .setVertexShader(vertexModule)
         .setPixelShader(pixelModule);
 
+    if (static_cast<bool>(bindingLayout))
+    {
+        pipelineDesc.addBindingLayout(bindingLayout);
+    }
 
     nvrhi::RasterState raster;
     raster.cullMode = ToNvrhi(desc.TriangleCulling);
@@ -179,6 +230,7 @@ Core::Ref<Pipeline> Pipeline::Create(GraphicsDevice& device, const PipelineDesc&
     auto* impl = new PipelineImpl();
     impl->Pipeline = std::move(nativePipeline);
     impl->InputLayout = std::move(inputLayout);
+    impl->BindingLayout = std::move(bindingLayout);
     impl->VertexShaderModule = std::move(vertexModule);
     impl->PixelShaderModule = std::move(pixelModule);
 
@@ -201,6 +253,11 @@ bool Pipeline::IsValid() const noexcept
 nvrhi::IGraphicsPipeline* Pipeline::GetNativePipeline() const noexcept
 {
     return m_Impl != nullptr ? m_Impl->Pipeline : nullptr;
+}
+
+nvrhi::IBindingLayout* Pipeline::GetBindingLayout() const noexcept
+{
+    return m_Impl != nullptr ? m_Impl->BindingLayout : nullptr;
 }
 
 }  // namespace Hollowpoint::Graphics

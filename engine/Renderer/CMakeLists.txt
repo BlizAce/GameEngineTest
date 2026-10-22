@@ -13,6 +13,7 @@ target_include_directories(HollowpointRenderer PUBLIC
 target_sources(HollowpointRenderer PRIVATE
     Include/Hollowpoint/Renderer/Camera.h
     Include/Hollowpoint/Renderer/ColorPipeline.h
+    Include/Hollowpoint/Renderer/ForwardRender.h
     Include/Hollowpoint/Renderer/Geometry.h
     Include/Hollowpoint/Renderer/ImageBasedLighting.h
     Include/Hollowpoint/Renderer/Lights.h
@@ -21,6 +22,7 @@ target_sources(HollowpointRenderer PRIVATE
     Include/Hollowpoint/Renderer/ShadingModelGlsl.h
     Src/Camera.cpp
     Src/ColorPipeline.cpp
+    Src/ForwardRender.cpp
     Src/Geometry.cpp
     Src/ImageBasedLighting.cpp
     Src/Lights.cpp

@@ -120,4 +120,27 @@ struct VertexAttribute
     UInt32 ElementStrideBytes = 0;
 };
 
+//! One descriptor slot in a pipeline's binding layout, described without RHI types.
+//!
+//! The engine declares what a shader binds (a constant buffer at slot N, a sampled texture at M) and Pipeline::Create
+//  turns these into the RHI's layout object. That indirection exists because public headers stay free of Vulkan/NVRHI
+//  (GraphicsApi.h), and because it gives every pipeline one place to state its interface — which is what makes a
+//  "shader expects slot X but C++ bound Y" mismatch reviewable instead of invisible.
+struct BindingSlotDesc
+{
+    enum class Kind : UInt8
+    {
+        ConstantBuffer,
+        SampledTexture,
+        Sampler,
+    };
+
+    Kind Type = Kind::ConstantBuffer;
+
+    //! Slot index within the layout — the same number passed to HP_BINDING_CONSTANT_BUFFER / TEXTURE / SAMPLER in
+    //  GLSL. The Vulkan binding *number* differs per type (see ShaderBindings.h: offsets 0/128/256/384); NVRHI adds
+    //  those, so callers use this slot number on both sides and never compute an offset themselves.
+    UInt32 Slot = 0;
+};
+
 }  // namespace Hollowpoint::Graphics

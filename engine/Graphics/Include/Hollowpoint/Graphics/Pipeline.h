@@ -11,6 +11,7 @@
 namespace nvrhi
 {
 class IGraphicsPipeline;
+class IBindingLayout;
 }  // namespace nvrhi
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,23 @@ struct PipelineDesc
     bool IsDepthEnabled = true;
     CompareFunction DepthFunction = CompareFunction::LessEqual;
     bool IsDepthWriteEnabled = true;
+
+    //! Descriptor slots this pipeline's shaders bind to, described in engine terms (no NVRHI types in public
+    //  headers — see GraphicsApi.h). Create() builds a single binding layout from these at set 0 and attaches it.
+    //!
+    //! A shader that declares any uniform block or sampled texture REQUIRES its slots listed here. The Vulkan
+    //  pipeline is built against the layout, and at draw time bindDescriptorSets dereferences it — with none attached
+    //  that is a null-handle dereference and an immediate SIGSEGV inside the driver (measured in this suite's first
+    //  run: the crash lands deep in libnvidia, with nothing naming the missing layout). Listing slots is therefore
+    //  not optional bookkeeping; it is what makes drawing possible at all.
+    std::vector<BindingSlotDesc> Bindings;
+
+    //! Which stages may read the bindings above. Both stages must be listed if both declare the blocks — a slot
+    //  invisible to a stage reads as zeros there, which is the same silent-uniform failure this header's binding
+    //  convention exists to prevent. Two bools rather than a mask: this engine has exactly two raster stages today,
+    //  and inventing a flag type for two users is speculation (compute arrival will add its own field with tests).
+    bool BindingsVisibleToVertex = false;
+    bool BindingsVisibleToPixel = true;
 };
 
 //! An immutable graphics pipeline. Thread-safe for concurrent use from recording threads (immutable after create).
@@ -85,6 +103,15 @@ public:
     //! The NVRHI pipeline for GraphicsState::setPipeline. Never null on an instance that exists.
     [[nodiscard]] nvrhi::IGraphicsPipeline* GetNativePipeline() const noexcept;
 
+    //! The binding layout built from PipelineDesc::Bindings, required by createBindingSet — which dereferences its
+    //  layout argument immediately (passing nullptr segfaults inside the Vulkan backend rather than requesting an
+    //  inferred layout; verified against nvrhi-resource-bindings.cpp and by crashing on it).
+    //
+    //  Only the layout is exposed, not the set: a binding set holds per-draw resource handles that change every
+    //  frame, while this layout is immutable pipeline state. Wrapping something that churns more than it is read
+    //  buys nothing — the same reasoning behind leaving command recording to the documented escape hatch.
+    //  Null for pipelines whose shaders bind nothing (Bindings empty).
+    [[nodiscard]] nvrhi::IBindingLayout* GetBindingLayout() const noexcept;
 
 protected:
     ~Pipeline() override;

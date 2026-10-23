@@ -1287,3 +1287,69 @@ placements are indistinguishable, so an axis-aligned-only test would have passed
 PCH (`cmake_pch.hxx has been modified since the precompiled header was built`, for every Jolt TU). Fix is reconfiguring
 the target preset. Relatedly — and this bit three times before I enforced it — **a failed build leaves stale binaries and
 ctest still reports 100% pass**. Check the build's exit code, always; "100% tests passed" after `BUILD=1` means nothing.
+
+### Session 14 (cont. 2) — texture upload, a tonemap pass, and closing two GPU coverage gaps
+
+**M1 gap found by trying to use the layer:** `Graphics::Texture` could read pixels *out* (ReadBack) but had no way to
+get them *in*. Nothing noticed because nothing sampled a texture yet. Implemented `Update()` on staging + `copyTexture`
+rather than NVRHI's `writeTexture`, for two reasons recorded at the call site: `writeTexture` requires rows packed to
+Vulkan's 4-byte row-alignment rule (it memcpy's `min(deviceRowPitch, rowPitch)` per row and trusts the rest — a 3-wide
+RGB8 source is misread), and it needs a live command list, so loaders with no queue can't use it. Staging costs one
+extra copy at load time and handles arbitrary pitches. Only the *destination* gets an explicit state transition:
+`IStagingTexture` derives from `IResource`, not `ITexture`, so it cannot be transitioned at all. Short buffers, sub-row
+pitches and null pixels are rejected with logged reasons — a short buffer copied anyway reads past the caller's
+allocation, which surfaces as a half-uploaded texture far from here.
+
+**Tonemap blit.** Exposure → ACES → sRGB as its own pass, with `ComputeDisplayColourCpu` delegating to
+`ColorPipeline::LinearToDisplay`, so CPU reference, shared GLSL generator and this pass are three consumers of one
+definition instead of three implementations that drift. The GPU test renders a known HDR ramp through engine wrappers
+only and compares every texel at 2e-3.
+
+**Four API facts that compiled or looked right while being wrong** (all now in the `nvrhi-glsl-gotchas` skill):
+NVRHI's Vulkan backend has no combined-image-sampler path at all (`texture2D` + `sampler`, never `sampler2D`); sampler
+filters are **bools** (`true` = lerp), not an enum; a uniform block without an instance name injects members globally so
+`Block.Member` is invalid — and glslang reports *"cannot be used (maybe an instance name is needed)"* instead of naming
+the mistake; Vulkan GLSL says `gl_VertexIndex`, not `gl_VertexID`.
+
+**Wrong diagnosis, corrected by arithmetic.** The blit test failed and I twice wrote an explanation blaming half-float
+rounding — impossible, the texture was RGBA32_FLOAT and the copy is verbatim. The GPU value at row 0 equalled
+`LinearToDisplay(sourceAt(0, 15))` exactly: a vertical flip from UVs mapped OpenGL-style against Vulkan's top-left
+framebuffer origin (the orientation `TestForwardRenderGpu` already pins). Lesson kept as a rule: when GPU and CPU
+disagree, *compute what the GPU value would be for neighbouring texel coordinates* before reaching for "precision". A
+rounding story explains small errors; an exact match to a neighbour's expected value is a mapping bug. Comments now
+record what actually happened, including that `x*255` is **not** binary16-exact — so nobody re-adds the same false
+rationale.
+
+**Two GPU coverage gaps closed at once.** The file had recorded that (1) no non-identity normal matrix and (2) no
+interpolated normals were ever exercised on the GPU, both structurally unreachable in the cube scene (`MakeCube` gives
+one constant normal per face; identity model matrix). Closed with **one triangle** carrying three distinct per-vertex
+normals under the orthographic camera: one primitive means every texel's barycentrics follow from screen position alone
+— no projected-polygon hit testing, which is exactly what made a rotated cube unusable. Orthographic keeps clip `w` at
+exactly 1 (neither `OrthographicRH` nor `LookAtRH` writes column 3 — verified), so perspective-correct interpolation
+degenerates to screen-linear and the CPU can compute what the GPU interpolated rather than approximate it. Anisotropic
+scale makes the normal matrix genuinely differ from the model basis; rotation alone would leave them nearly
+interchangeable and quietly weaken the comparison.
+
+**The strongest mutation result of the project so far:** normalising vertex normals *before* interpolation fails at
+**0.21 relative error — 100× the tolerance**. That empirically confirms the GPU interpolates the un-normalised value
+instead of my having assumed it, and quantifies a mistake whose entire justification until now was a comment. Also
+caught: `ModelMatrix` used instead of `NormalMatrix` in the vertex shader (the classic shortcut), and a flipped
+barycentric edge sign.
+
+**A test of mine was too strict, and the distinction is worth keeping.** I wrote `== fromUnit` for a scaled-then-
+normalised input. Bit-exactness is right when two code paths must produce identical output (I use it for exactly that in
+the sibling test), but wrong for values mathematically equal yet differently rounded — `(v * 0.37).Normalized()` differs
+from `v.Normalized()` by ~3e-8 in float32. The correct bar is set by the bug being excluded: skipping normalisation costs
+~1e-1, so 1e-5 sits three orders above noise and four below failure. **Equivalence under re-rounding is a different
+property from path identity and needs its own bar.**
+
+**Stale-doc sweep:** `Texture.h` claimed ReadBack returns "4 bytes per channel regardless of GPU texel size" while the
+same file's header recorded the measured opposite (RGBA16_FLOAT maps as 4 × uint16, verbatim) — the wrong line was the
+one a caller would code against. The cube test's "this gap stays open" paragraph now cross-references the case that
+closed it. Architecture table counts re-measured from the binaries' own `--list-test-cases` tallies rather than estimated
+(Graphics 38, Renderer 101; untouched modules verified unchanged).
+
+**Environment trap, burned again and now structurally avoided:** reading `$?` after piping a build to grep/head captures
+the *pipe's* status. A failed build leaves stale binaries and ctest still reports 100% pass — this caught me mid-
+mutation-test (a mutation "passed" only because its binary never rebuilt). Every build from here redirects to a log,
+echoes `$?`, then greps.

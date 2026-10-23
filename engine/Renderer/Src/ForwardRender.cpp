@@ -8,31 +8,181 @@
 namespace Hollowpoint::Renderer
 {
 
-Vec3 ComputeWorldNormal(const Mat4& modelMatrix, const Vec3& localGeometricNormal)
+namespace
 {
-    // Inverse transpose of the upper-left 3x3. Using the model matrix directly would be correct only for uniform
-    // scale — and since every transform the engine generates today *is* uniform-scaled, that bug would sit dormant
-    // until someone stretched a box, where it reads as "lighting looks wrong on scaled objects" instead of naming
-    // this line. Doing it generally costs one matrix inverse.
-    const Mat3 upperLeft = modelMatrix.GetUpperLeft3();
 
-    // Mat3::Inverse asserts and returns identity for a singular matrix (documented). Asserting the determinant here
-    // too makes the caller's mistake explicit: a zero-scale axis means there is no surface to light, and silently
-    // shading with an identity normal would draw plausible-looking garbage.
-    const Float32 determinant = upperLeft.Determinant();
-    if (std::abs(determinant) <= 1.0e-8f)
+//! Product of the three basis-column lengths of a 3x3 matrix.
+///
+/// For a pure-scale matrix this equals |determinant| exactly, which is what makes their ratio a scale-free measure of
+/// how well-formed the basis is: 1 for any uniform or anisotropic scale, falling toward 0 only as axes collapse or
+/// become parallel. Used instead of a bare determinant so singularity detection carries no unit assumption.
+[[nodiscard]] Float32 BasisColumnLengthProduct(const Mat3& matrix)
+{
+    const Vec3 columnX(matrix[0][0], matrix[0][1], matrix[0][2]);
+    const Vec3 columnY(matrix[1][0], matrix[1][1], matrix[1][2]);
+    const Vec3 columnZ(matrix[2][0], matrix[2][1], matrix[2][2]);
+
+    return columnX.Length() * columnY.Length() * columnZ.Length();
+}
+
+//! Below this ratio of |determinant| to the basis-column product, the basis spans a plane rather than a volume: the
+///  normal transform is meaningless and its entries would be dominated by float noise. One part per million of
+///  well-formedness is far tighter than any real geometry needs and far looser than genuine collapse.
+constexpr Float32 kDegenerateBasisRatio = 1.0e-6f;
+
+//! The cofactor matrix of a column-major 3x3.
+/**
+ * Why the cofactor rather than inverse-transpose: they differ only by a scalar,
+ *
+ *     (M⁻¹)ᵀ = cofactor(M) / det(M),
+ *
+ * and this function's result is normalised before use — so the division by det can be skipped entirely. That is not
+ * a micro-optimisation, it removes two scale traps an explicit inverse cannot avoid:
+ *   - Mat3::Inverse rejects |det| <= kDefaultAbsoluteEpsilon, an absolute test on a quantity that grows as scale³, so
+ *     legitimate small objects (scale 0.002 → det 8e-9) assert inside core math; and
+ *   - forming 1/det then multiplying loses accuracy at extreme scales (measured: a 1e6-uniform transform came back
+ *     with a wrong normal through the inverse path).
+ * Cofactor entries are products of two basis components — O(scale²) — which stays comfortably in float range for any
+ * scale an engine sees, and the final normalisation makes the remaining magnitude irrelevant.
+ *
+ * Construction: with M's columns c0,c1,c2, the three cross products r0 = c1×c2, r1 = c2×c0, r2 = c0×c1 satisfy
+ * R·M = det(M)·I when placed as ROWS (each r is orthogonal to the two columns it excludes and its dot with the
+ * remaining one is det). Hence M⁻¹ = R/det and (M⁻¹)ᵀ = Rᵀ/det. In column-major storage, Rᵀ's column c is the vector
+ * r_c — so each cross product goes into one storage column unchanged.
+ *
+ * Worth stating because it defeats casual verification: on any symmetric basis (identity, axis-aligned scale) the
+ * transposed placement of these rows produces the same matrix, so testing with unrotated geometry cannot tell the two
+ * apart. The equivalence test therefore covers rotations and shear; re-transposing this assignment was tried as a
+ * mutation and fails exactly that test.
+ */
+[[nodiscard]] Mat3 CofactorMatrix(const Mat3& m)
+{
+    const Vec3 c0(m[0][0], m[0][1], m[0][2]);
+    const Vec3 c1(m[1][0], m[1][1], m[1][2]);
+    const Vec3 c2(m[2][0], m[2][1], m[2][2]);
+
+    const Vec3 r0 = c1.Cross(c2);
+    const Vec3 r1 = c2.Cross(c0);
+    const Vec3 r2 = c0.Cross(c1);
+
+    Mat3 cofactor;
+    cofactor[0][0] = r0.X;
+    cofactor[0][1] = r0.Y;
+    cofactor[0][2] = r0.Z;
+    cofactor[1][0] = r1.X;
+    cofactor[1][1] = r1.Y;
+    cofactor[1][2] = r1.Z;
+    cofactor[2][0] = r2.X;
+    cofactor[2][1] = r2.Y;
+    cofactor[2][2] = r2.Z;
+
+    return cofactor;
+}
+
+//! Largest absolute entry, used to bring the cofactor matrix to O(1) before applying it.
+[[nodiscard]] Float32 MaxAbsEntry(const Mat3& m)
+{
+    Float32 largest = 0.0f;
+    for (int column = 0; column < 3; ++column)
     {
-        // Asserted, then handled: an assertion is a report, never a guard (AGENTS.md §4). The transform has no
-        // invertible orientation — usually an author zeroed a scale axis, which deletes the surface. Transforming
-        // the normal by the matrix directly keeps its direction (lighting that face as if unscaled) instead of
-        // Mat3::Inverse's identity fallback or a NaN, both of which read as "shading is broken" rather than naming
-        // the zero scale.
-        HP_ASSERT_ARGUMENT(std::abs(determinant) > 1.0e-8f,
-                           "model matrix has no invertible surface orientation (zero scale axis?)");
-        return (upperLeft * localGeometricNormal).Normalized();
+        for (int row = 0; row < 3; ++row)
+        {
+            largest = std::max(largest, std::abs(m[column][row]));
+        }
+    }
+    return largest;
+}
+
+//! Whether a 3x3 basis has a usable orientation to transform normals with.
+/**
+ * Judged SCALE-INVARIENTLY. An absolute epsilon on the determinant is wrong by construction: uniform scale s gives
+ * det = s³, so a test like |det| <= 1e-8 asserts on any object below ~0.2 units — pebbles, screws and particles in a
+ * metric-scale scene — while still missing collapsed geometry that merely happens to be large. The ratio used here is
+ * exactly 1 for any scale matrix whatever its magnitude and drops only as axes collapse or turn parallel: orientation
+ * quality, which is what normal transforms depend on, with no unit baked in.
+ *
+ * Comparisons are written so NaN reports as unusable (every comparison with NaN is false) — a NaN transform is a bug
+ * upstream, and callers handle that explicitly rather than propagating NaN into shading. Same idiom Lights.cpp uses
+ * for non-finite ranges.
+ */
+[[nodiscard]] bool HasUsableOrientation(const Mat3& basis)
+{
+    const Float32 columnProduct = BasisColumnLengthProduct(basis);
+    const Float32 degeneracyRatio = columnProduct > 0.0f ? std::abs(basis.Determinant()) / columnProduct : 0.0f;
+
+    return degeneracyRatio > kDegenerateBasisRatio;
+}
+
+}  // namespace
+
+Mat3 ComputeNormalMatrix(const Mat3& modelBasis)
+{
+    if (!HasUsableOrientation(modelBasis))
+    {
+        HP_ASSERT_ARGUMENT(false, "model basis has no usable orientation (zero scale axis, collapsed basis, or NaN)");
+
+        // Identity rather than an approximation: this function returns a matrix, so there is no partial direction to
+        // salvage into one. Callers holding a normal should use ComputeWorldNormal, whose fallback keeps whatever
+        // direction survives the collapse; an identity normal matrix at least lights geometry as untransformed
+        // instead of producing NaN that spreads through every downstream dot product.
+        return Mat3::Identity();
     }
 
-    return upperLeft.Inverse().Transposed() * localGeometricNormal;
+    Mat3 normalMatrix = CofactorMatrix(modelBasis);
+
+    // Bring to O(1) before use: cofactor entries are O(scale²), and a shader that normalises the varying (all of them
+    // do — `normalize(InWorldNormal)`) would underflow for a very small object whose cofactor entries reach 1e-8.
+    // Dividing by the largest entry is a positive scalar, so it cannot change any direction; it makes the whole path
+    // magnitude-independent, which is the point of this function.
+    const Float32 scale = MaxAbsEntry(normalMatrix);
+    if (scale > 0.0f)
+    {
+        for (int column = 0; column < 3; ++column)
+        {
+            for (int row = 0; row < 3; ++row)
+            {
+                normalMatrix[column][row] /= scale;
+            }
+        }
+    }
+
+    return normalMatrix;
+}
+
+Vec3 ComputeWorldNormal(const Mat4& modelMatrix, const Vec3& localGeometricNormal)
+{
+    // Normal matrix = inverse transpose of the upper-left 3x3. Using the model matrix directly would be correct only
+    // for uniform scale — and since every transform the engine generates today *is* uniformly scaled, that shortcut
+    // would sit dormant until someone stretched a box, where it reads as "lighting looks wrong on scaled objects"
+    // instead of naming this line. Doing it generally costs nine multiplications.
+    const Mat3 upperLeft = modelMatrix.GetUpperLeft3();
+
+    if (!HasUsableOrientation(upperLeft))
+    {
+        HP_ASSERT_ARGUMENT(false, "model matrix has no usable orientation (zero scale axis, collapsed basis, or NaN)");
+
+        // Asserted, then handled: an assertion is a report, never a guard (AGENTS.md §4). A zero or near-coplanar basis
+        // means the transform deleted a dimension — usually an author zeroed a scale axis. Rather than lose the
+        // orientation entirely (what ComputeNormalMatrix must do), multiply by the basis and keep whatever direction
+        // survives: for a collapsed-but-real surface that is still the right normal in the axes that did not collapse.
+        //
+        // The explicit finiteness test is load-bearing, not defensive noise: Vec3::Normalized's comment claims "never
+        // NaN", but it computes length-squared and its guard only catches underflow — a NaN input gives length² = NaN,
+        // which passes the `factor == 0` check and multiplies straight through (measured). Without this test a NaN
+        // transform propagates into shading and tone mapping as a black screen that names nothing; returning zero here
+        // means "unlit", a defined pixel with a diagnosable cause.
+        const Vec3 salvaged = (upperLeft * localGeometricNormal).Normalized();
+
+        if (!(std::isfinite(salvaged.X) && std::isfinite(salvaged.Y) && std::isfinite(salvaged.Z)))
+        {
+            return Vec3::Zero();
+        }
+        return salvaged;
+    }
+
+    // Result is normalised: the caller asked for a normal, and ComputeNormalMatrix's magnitude correction (a positive
+    // scalar) would otherwise leave a non-unit vector here.
+    return (ComputeNormalMatrix(upperLeft) * localGeometricNormal).Normalized();
 }
 
 Vec3 ComputeForwardShadingCpu(const ForwardPassParams& params, const ForwardDrawItem& draw, const Vec3& worldPosition,

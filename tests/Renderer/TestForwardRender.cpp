@@ -11,6 +11,7 @@
 #include "TestSupport.h"
 
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -242,6 +243,119 @@ TEST_SUITE("Renderer/ForwardRender")
             Test::ScopedAssertCapture asserts;
             const Vec3 degenerate = ComputeWorldNormal(Mat4::Scale(Vec3(0.0f, 1.0f, 1.0f)), localNormal);
             CHECK_FALSE(std::isnan(degenerate.X));
+            CHECK(asserts.GetCaptureCount() >= 1);
+        }
+    }
+
+    TEST_CASE("the cofactor normal path agrees with an explicit inverse transpose")
+    {
+        // ComputeWorldNormal derives its normal matrix from cofactors (no division by det) rather than inverting.
+        // That equivalence is asserted here, not in a comment: for every well-formed basis below, both routes must
+        // produce the same direction. A wrong transpose/conjugate in the cofactor construction would show up as one
+        // axis disagreeing — exactly the kind of error that renders "almost right" lighting for weeks.
+        const std::pair<const char*, Math::Mat4> cases[] = {
+            {"identity", Math::Mat4::Identity()},
+            {"uniform scale", Mat4::Scale(Vec3(3.0f))},
+            {"anisotropic scale", Mat4::Scale(Vec3(2.0f, 0.25f, 1.5f))},
+            {"rotation about Y", Mat4::Rotate(Vec3(0.0f, 1.0f, 0.0f), 0.9f)},
+            {"rotation about an arbitrary axis", Mat4::Rotate(Vec3(1.0f, 2.0f, -0.5f).Normalized(), 1.3f)},
+            {"scale then rotate", Mat4::Rotate(Vec3(1.0f, 0.0f, 0.0f), 0.7) * Mat4::Scale(Vec3(4.0f, 1.0f, 0.5f))},
+        };
+
+        const std::array<Vec3, 4> directions = {
+            Vec3(1.0f, 0.0f, 0.0f),
+            Vec3(0.0f, 1.0f, 0.0f),
+            Vec3(0.57735f, 0.57735f, 0.57735f),
+            Vec3(-0.3f, 0.6f, -0.74f),
+        };
+
+        for (const auto& [label, transform] : cases)
+        {
+            const Math::Mat3 upperLeft = transform.GetUpperLeft3();
+            const Math::Mat3 reference = upperLeft.Inverse().Transposed();
+
+            for (const Vec3& direction : directions)
+            {
+                INFO(label << " direction " << direction.X << "," << direction.Y << "," << direction.Z);
+
+                const Vec3 expected = (reference * direction).Normalized();
+                const Vec3 actual = ComputeWorldNormal(transform, direction).Normalized();
+
+                // Direction agreement is the contract (magnitude is normalised away by design), so compare via the
+                // dot product being exactly +1 rather than component equality — that also catches a sign flip.
+                CHECK(expected.Dot(actual) == doctest::Approx(1.0f).epsilon(1e-3));
+            }
+        }
+    }
+
+    TEST_CASE("tiny and enormous uniform scales are not mistaken for degeneracy")
+    {
+        // Regression: the first version of ComputeWorldNormal tested |determinant| > 1e-8, and determinant grows as
+        // scale cubed — so a 2 mm object (scale 0.002 in metric units) gave det = 8e-9 and asserted loudly on
+        // perfectly legal geometry, while a collapsed basis at large scale slipped through. Degeneracy is now judged
+        // by how well-formed the basis is rather than by its magnitude; this pins both ends of that range.
+        const Vec3 diagonalNormal(0.57735f, 0.57735f, 0.57735f);
+
+        for (const Float32 scale : {1.0e-4f, 0.002f, 1.0f, 1.0e3f, 1.0e6f})
+        {
+            INFO("scale " << scale);
+            Test::ScopedAssertCapture asserts;
+            const Vec3 normal = ComputeWorldNormal(Mat4::Scale(Vec3(scale)), diagonalNormal).Normalized();
+
+            // Uniform scale never changes a normal's direction, at any magnitude.
+            CHECK(normal.X == doctest::Approx(diagonalNormal.X).epsilon(1e-2));
+            CHECK(asserts.GetCaptureCount() == 0);
+        }
+
+        // Anisotropic scale stays fine too (well-formed basis, just stretched)...
+        {
+            Test::ScopedAssertCapture asserts;
+            const Vec3 stretched = ComputeWorldNormal(Mat4::Scale(Vec3(1.0f, 0.001f, 1.0f)), diagonalNormal);
+            CHECK_FALSE(std::isnan(stretched.X));
+            CHECK(asserts.GetCaptureCount() == 0);
+        }
+
+        // ...and a genuinely collapsed basis at a LARGE scale still reports. This is the half the old epsilon got
+        // backwards: big numbers hid real degeneracy.
+        {
+            Test::ScopedAssertCapture asserts;
+            const Vec3 collapsed = ComputeWorldNormal(Mat4::Scale(Vec3(1000.0f, 0.0f, 1000.0f)), diagonalNormal);
+            CHECK_FALSE(std::isnan(collapsed.X));
+            CHECK(asserts.GetCaptureCount() >= 1);
+        }
+
+        // Coplanar basis (two identical axes): determinant zero while every column is unit length — the case a bare
+        // magnitude test cannot see at all.
+        {
+            // Two identical basis columns: determinant exactly zero while every column is unit length — the case a
+            // magnitude-based test cannot see at all. Built through Mat3's twelve-argument constructor (c0r0..c2r2,
+            // i.e. column-major) because assigning via operator[] needs care: [column][row], and an earlier draft of
+            // this line wrote [1][0] intending "column 1" while row 0 was already 1 from the default — a silent no-op
+            // that made the matrix invertible and the test meaningless. The constructor takes explicit values for all
+            // nine entries, so there is nothing left to inherit by accident.
+            const Math::Mat3 coplanarBasis(
+                /* c0r0 */ 1.0f, /* c0r1 */ 0.0f, /* c0r2 */ 0.0f,
+                /* c1r0 */ 1.0f, /* c1r1 */ 0.0f, /* c1r2 */ 0.0f,  // identical to column 0: no volume
+                /* c2r0 */ 0.0f, /* c2r1 */ 0.0f, /* c2r2 */ 1.0f);
+
+            const Math::Mat4 coplanar(coplanarBasis);
+            Test::ScopedAssertCapture asserts;
+            const Vec3 result = ComputeWorldNormal(coplanar, diagonalNormal);
+            CHECK_FALSE(std::isnan(result.X));
+            CHECK(asserts.GetCaptureCount() >= 1);
+        }
+
+        // A NaN transform is a bug upstream; shading it unlit beats propagating NaN to a black screen.
+        {
+            // Any non-finite entry must be treated as an unusable orientation. Index [1][2] (row 1, column 2) rather
+            // than a diagonal element so the NaN cannot cancel out of the determinant by luck of position — the point
+            // is that garbage anywhere yields a defined, finite answer, not that one specific slot does.
+            Math::Mat4 poisoned = Math::Mat4::Identity();
+            poisoned[1][2] = std::numeric_limits<Float32>::quiet_NaN();
+
+            Test::ScopedAssertCapture asserts;
+            const Vec3 result = ComputeWorldNormal(poisoned, diagonalNormal);
+            CHECK_FALSE(std::isnan(result.X));
             CHECK(asserts.GetCaptureCount() >= 1);
         }
     }

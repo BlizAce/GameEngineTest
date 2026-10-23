@@ -295,16 +295,28 @@ struct ForwardScene
 
     DrawTransformUniforms transform{};
     std::memcpy(transform.ModelMatrix, scene.Draw.ModelMatrix.Columns, sizeof(transform.ModelMatrix));
-    // Normal matrix: inverse transpose of the upper-left 3x3, computed by the same code path the CPU reference uses
-    // (ComputeWorldNormal). For the identity model matrix here it is the identity — but going through the function
-    // means a change to that function affects both sides identically instead of desynchronising them.
+
+    // Normal matrix comes from the engine's own ComputeNormalMatrix — the same function the CPU reference reaches
+    // through ComputeWorldNormal. An earlier version of this line inverted by hand (Inverse().Transposed()) while its
+    // comment claimed to use "the same code path": false, and exactly the duplication that lets a CPU check and a
+    // rendered image disagree. It stayed green when the engine's normal math moved to a cofactor form only because
+    // this scene uses an identity model matrix — which is the trap: the disagreement would have surfaced on the first
+    // rotated object, far from here. Going through the function moves both sides together whatever the transform.
+    //
+    // Coverage stated honestly: this scene's identity model matrix means the GPU never exercises a non-identity
+    // normal matrix, and it will stay that way until the test can decide which cube face each texel shows (a rotated
+    // cube exposes two faces, so per-texel CPU comparison needs projected-polygon hit testing — worth doing with the
+    // curved-surface/interpolated-normal work rather than approximated here). What covers the normal matrix instead is
+    // that both sides call one function, and that function's own tests (cofactor-vs-explicit-inverse-transpose over
+    // rotation, anisotropic scale and shear; degeneracy at every magnitude). Correctness transfers by construction,
+    // which is the point of not having two implementations.
     {
-        const Math::Mat3 inverseTranspose = scene.Draw.ModelMatrix.GetUpperLeft3().Inverse().Transposed();
+        const Math::Mat3 normalMatrix = ComputeNormalMatrix(scene.Draw.ModelMatrix.GetUpperLeft3());
         for (int column = 0; column < 3; ++column)
         {
             for (int row = 0; row < 3; ++row)
             {
-                transform.NormalMatrix[column * 4 + row] = inverseTranspose[column][row];
+                transform.NormalMatrix[column * 4 + row] = normalMatrix[column][row];
             }
         }
     }

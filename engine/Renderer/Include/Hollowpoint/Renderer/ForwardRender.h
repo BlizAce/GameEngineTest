@@ -104,6 +104,16 @@ struct ForwardPassParams
                                                             const ForwardDrawItem& draw, const Vec3& worldPosition,
                                                             const Vec3& localGeometricNormal);
 
+//! The normal matrix for a model basis: inverse transpose of a 3x3 transform, computed scale-robustly.
+//!
+//! This is what gets uploaded to a shader's NormalMatrix uniform. Exposed because the CPU reference and every GPU
+//! submission need the SAME matrix — a test or renderer that inverts by hand (Mat3::Inverse().Transposed()) drifts
+//! from this function the moment either changes, and the symptom is lighting that differs between the CPU check and
+//! the rendered image. Derivation and scale-robustness reasoning: see CofactorMatrix in the .cpp; degeneracy handling:
+//! HasUsableOrientation there too (a collapsed or non-finite basis asserts and returns identity — call
+//! ComputeWorldNormal instead when a partial direction is worth salvaging).
+[[nodiscard]] HP_RENDERER_API Mat3 ComputeNormalMatrix(const Mat3& modelBasis);
+
 //! The world-space shading normal for a triangle's geometric normal under a model matrix.
 //!
 //! Normals transform by the inverse transpose of the upper-left 3x3 — not by the model matrix itself. For the

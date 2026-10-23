@@ -1396,3 +1396,34 @@ than from memory.
 **Tooling note:** `nodiscard` on `WriteFileAtomic` caught an unchecked result *in a test*, which is exactly what the
 attribute is for — bound it to a counter and asserted all writers succeeded, since one good write otherwise hides five
 failed ones.
+
+### Session 14 (cont. 4) — scene file I/O, and a durability test that was worthless until rewritten
+
+**Shipped:** `SaveSceneToFile` / `LoadSceneFromFile` — the engine can now persist scenes at all. Serialising happens
+before writing so content errors and I/O errors stay in separate channels; load failures reuse the parse-error channel
+with the path in the message; saving creates parent directories; output is asserted **byte-identical** to
+`WriteScene + WriteJson` because scenes live in version control and get diffed. Found an API gap writing the test:
+`WriteFileAtomic` had a `string_view` overload and `WriteFileTruncate` did not.
+
+**The important part is a test I wrote that could not fail.** It asserted *"if the write failed, the original survived"*
+— a conditional expectation on the outcome I hoped for. Replacing temp+rename with a direct truncate-then-write
+`ofstream` left it **completely green**: the mutant simply succeeded instead of failing, so the guarded check never ran.
+Same class as a test whose precondition excludes its subject — both pass by never evaluating anything.
+
+Two rules worth keeping:
+1. **Never assert `if (failed) then (safe)`.** Assert the contract unconditionally — here, *when atomicity is impossible
+   the operation must fail rather than degrade* (best-effort callers have `WriteFileTruncate`).
+2. **Pick the lever that separates the implementations you are guarding against.** Every argument-level failure (empty
+   path, null data) is rejected before either version touches bytes, and a read-only *file* fails both — opening an
+   existing file for writing does not need directory write permission, which is exactly why truncate-then-write slips
+   through those. A **read-only directory containing a writable file** is what separates them: only the atomic version
+   needs to create an entry.
+
+The case also probes whether the environment enforces directory permissions before trusting its own result (root, or a
+filesystem without permission bits, lets creation through regardless) — using the same syscall the implementation uses,
+so the probe cannot disagree with it — and `WARN`s instead of reporting an untested pass. Verified: 3 CHECKs execute on
+this host, and the truncate mutant now fails 2 assertions. **Mutation testing is the only thing that found this; reading
+the test carefully did not.**
+
+Also corrected a scene-level comment implying its empty-path case proved durability. It does not, for the reason above,
+and saying so at the call site is what stops the next reader from trusting it.

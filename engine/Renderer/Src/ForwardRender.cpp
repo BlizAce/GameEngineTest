@@ -188,7 +188,21 @@ Vec3 ComputeWorldNormal(const Mat4& modelMatrix, const Vec3& localGeometricNorma
 Vec3 ComputeForwardShadingCpu(const ForwardPassParams& params, const ForwardDrawItem& draw, const Vec3& worldPosition,
                               const Vec3& localGeometricNormal)
 {
-    const Vec3 normalWorld = ComputeWorldNormal(draw.ModelMatrix, localGeometricNormal).Normalized();
+    // Flat-face path: derive the world normal from the model matrix, then hand off. ComputeWorldNormal already
+    // normalises and ShadeWorldPointCpu normalises again — as this function did before the split, so results are
+    // bit-identical to the pre-refactor code (normalising a unit vector is not exactly a no-op in float, and the
+    // equivalence tests compare against values produced here).
+    return ShadeWorldPointCpu(params, draw, worldPosition, ComputeWorldNormal(draw.ModelMatrix, localGeometricNormal));
+}
+
+Vec3 ShadeWorldPointCpu(const ForwardPassParams& params, const ForwardDrawItem& draw, const Vec3& worldPosition,
+                        const Vec3& worldNormal)
+{
+    // Normalised here rather than by the caller: this is the CPU mirror of the fragment shader's
+    // `normalize(InWorldNormal)`, which normalises an INTERPOLATED vector. Putting it inside means both sides
+    // normalise exactly once, at the same point in the pipeline — a caller that pre-normalised and this function that
+    // re-normalised would differ by float rounding from a GPU that did one of the two.
+    const Vec3 normalWorld = worldNormal.Normalized();
 
     // Toward the eye, matching EvaluateDirectLight's documented convention (viewDirection points surface→eye).
     const Vec3 toEye = params.CameraPosition - worldPosition;

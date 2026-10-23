@@ -303,13 +303,12 @@ struct ForwardScene
     // this scene uses an identity model matrix — which is the trap: the disagreement would have surfaced on the first
     // rotated object, far from here. Going through the function moves both sides together whatever the transform.
     //
-    // Coverage stated honestly: this scene's identity model matrix means the GPU never exercises a non-identity
-    // normal matrix, and it will stay that way until the test can decide which cube face each texel shows (a rotated
-    // cube exposes two faces, so per-texel CPU comparison needs projected-polygon hit testing — worth doing with the
-    // curved-surface/interpolated-normal work rather than approximated here). What covers the normal matrix instead is
-    // that both sides call one function, and that function's own tests (cofactor-vs-explicit-inverse-transpose over
-    // rotation, anisotropic scale and shear; degeneracy at every magnitude). Correctness transfers by construction,
-    // which is the point of not having two implementations.
+    // Coverage stated honestly: THIS scene's identity model matrix means it never exercises a non-identity normal
+    // matrix, and no arrangement of this cube can — a rotated one exposes two faces, so per-texel CPU comparison would
+    // need projected-polygon hit testing to decide which face each texel shows. That gap was recorded here rather than
+    // papered over, and the case below ("interpolated normals under a non-identity normal matrix...") closes it: one
+    // triangle covering the viewport has exactly-known barycentrics, so no visibility resolution is needed. What this
+    // case contributes in the meantime is that both sides call one ComputeNormalMatrix, so they cannot drift.
     {
         const Math::Mat3 normalMatrix = ComputeNormalMatrix(scene.Draw.ModelMatrix.GetUpperLeft3());
         for (int column = 0; column < 3; ++column)
@@ -544,6 +543,34 @@ struct ForwardScene
     return true;
 }
 
+//! A single triangle with per-vertex normals, sized to cover the test camera's whole orthographic view.
+/**
+ * One triangle rather than a mesh, deliberately: with a single primitive every texel belongs to exactly one triangle,
+ * so its barycentric coordinates follow from screen position alone and the CPU can reproduce what the rasteriser
+ * interpolated without any projected-polygon hit testing (which is what made a rotated cube unusable here — two faces
+ * visible means "which normal should this pixel have" needs visibility resolved first).
+ *
+ * Vertices sit well outside the view (the camera sees world [-1,1]^2 at kHalfExtent = 1) so the same geometry keeps
+ * covering the frame under rotation and anisotropic scale without re-deriving coverage. The cost is that barycentrics
+ * vary slowly across the visible square — measured: the interpolated normal sweeps ~0.18 and ~0.21 in its X and Y
+ * channels across the 16x16 target, still far more than the comparison tolerance, so a wrong interpolation cannot hide.
+ *
+ * Normals are three distinct directions all with positive Z, so every convex combination keeps positive Z and can
+ * never reach a zero-length vector — which would make the shader's normalize() undefined and the comparison vacuous.
+ * Coverage was verified numerically over all 256 pixel centres before this geometry was committed to.
+ */
+[[nodiscard]] GeometryData MakeCoverageTriangle()
+{
+    GeometryData geometry;
+    geometry.Vertices = {
+        GeometryVertex(Vec3(-3.0f, -3.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), Vec2(0.0f, 0.0f)),
+        GeometryVertex(Vec3(6.0f, -3.0f, 0.0f), Vec3(0.6f, 0.0f, 0.8f), Vec2(1.0f, 0.0f)),
+        GeometryVertex(Vec3(-3.0f, 6.0f, 0.0f), Vec3(0.0f, 0.6f, 0.8f), Vec2(0.0f, 1.0f)),
+    };
+    geometry.Indices = {0u, 1u, 2u};
+    return geometry;
+}
+
 }  // namespace
 
 TEST_SUITE("Renderer/ForwardRenderGPU")
@@ -673,5 +700,171 @@ TEST_SUITE("Renderer/ForwardRenderGPU")
         const Float32 difference = std::abs(pixelsWithSpot[cornerIndex].X - pixelsWithoutSpot[cornerIndex].X);
         CHECK_MESSAGE(difference <= 1.0e-4f, "spot leaked outside its cone: " << pixelsWithSpot[cornerIndex].X << " vs "
                                                                               << pixelsWithoutSpot[cornerIndex].X);
+    }
+
+    TEST_CASE("interpolated normals under a non-identity normal matrix match the CPU reference texel by texel")
+    {
+        GraphicsDevice* device = GetDevice();
+        if (device == nullptr)
+        {
+            WARN((std::string("No graphics device on this host: ") + GraphicsDevice::GetFailureReason()).c_str());
+            return;
+        }
+
+        // Closes two gaps the cube scene structurally could not reach:
+        //
+        //   1. A non-identity NORMAL MATRIX had never been exercised on the GPU. The cube used an identity model
+        //      matrix, so ComputeNormalMatrix's output was the identity and any error in it was invisible — the exact
+        //      hole this file's own comments flagged rather than pretending it was covered.
+        //   2. INTERPOLATED normals had never been tested at all: MakeCube gives one constant normal per face (hard
+        //      edges require that), so rasteriser interpolation was a no-op everywhere it ran.
+        //
+        // Both close together under an orthographic camera drawing one triangle. Orthographic keeps clip w at exactly
+        // 1 for every vertex — neither OrthographicRH nor LookAtRH writes column 3, verified in MathCore — and
+        // perspective-correct interpolation with equal w degenerates to plain screen-space linear interpolation. So
+        // the CPU can compute what the GPU interpolated, from barycentrics, without guessing at a hardware detail.
+        //
+        // Anisotropic scale (not rotation alone) is deliberate: it makes the normal matrix genuinely different from
+        // the model basis, which is the entire reason normals transform by the inverse transpose. Rotation-only would
+        // leave the two nearly interchangeable and quietly weaken what is being compared.
+        ForwardScene scene;
+        const GeometryData coverage = MakeCoverageTriangle();
+        scene.Draw.Geometry = &coverage;
+        scene.Draw.ModelMatrix =
+            Math::Mat4::Rotate(Vec3(0.0f, 0.0f, 1.0f), 0.7f) * Math::Mat4::Scale(Vec3(1.5f, 0.8f, 2.0f));
+
+        std::vector<Vec3> pixels;
+        std::string failure;
+        REQUIRE_MESSAGE(RenderForwardFrame(*device, scene, pixels, failure), failure);
+        REQUIRE(pixels.size() == kSize * kSize);
+
+        // --- What the GPU was told, recomputed here so nothing about the transform is assumed -------------------
+        const Math::Mat3 normalMatrix = ComputeNormalMatrix(scene.Draw.ModelMatrix.GetUpperLeft3());
+        REQUIRE_FALSE(normalMatrix == Math::Mat3::Identity());  // precondition: otherwise this case proves nothing
+
+        // World positions and UN-normalised transformed normals. Un-normalised is essential rather than merely tidier:
+        // the vertex stage emits `mat3(NormalMatrix) * InNormal` and the rasteriser interpolates THAT, normalising only
+        // per fragment. Normalising on this side instead would compare a different quantity than the GPU computed —
+        // under anisotropic scale that difference is exactly what is under test, so it would vanish.
+        std::array<Vec3, 3> worldPositions{};
+        std::array<Vec3, 3> transformedNormals{};
+        for (std::size_t vertex = 0; vertex < 3u; ++vertex)
+        {
+            const GeometryVertex& input = coverage.Vertices[vertex];
+            worldPositions[vertex] = scene.Draw.ModelMatrix.TransformPoint(input.GetPosition());
+            transformedNormals[vertex] = normalMatrix * input.GetNormal();
+        }
+
+        // Screen positions in texel units (x right, y DOWN to match readback order — the same top-left origin the
+        // camera helper documents). Affine because w is exactly 1, which is what makes this reproducible at all.
+        std::array<std::array<Float32, 2>, 3> screen{};
+        for (std::size_t vertex = 0; vertex < 3u; ++vertex)
+        {
+            const Vec3 ndc = scene.Camera.Project(worldPositions[vertex]);
+            screen[vertex] = {(ndc.X * 0.5f + 0.5f) * static_cast<Float32>(kSize),
+                              (0.5f - ndc.Y * 0.5f) * static_cast<Float32>(kSize)};
+        }
+
+        // Twice the signed area, and the winding indicator. Non-degenerate or every barycentric below is meaningless.
+        const Float32 twiceArea = (screen[1][0] - screen[0][0]) * (screen[2][1] - screen[0][1]) -
+                                  (screen[2][0] - screen[0][0]) * (screen[1][1] - screen[0][1]);
+        REQUIRE_MESSAGE(std::abs(twiceArea) > 1.0f, "coverage triangle projects to a sliver");
+
+        UInt32 compared = 0;
+        Float32 worstRelativeError = 0.0f;
+        std::string firstFailure;
+
+        for (UInt32 texelY = 0; texelY < kSize; ++texelY)
+        {
+            for (UInt32 texelX = 0; texelX < kSize; ++texelX)
+            {
+                // Pixel CENTRE: rasterisers evaluate fragments there, not at lattice corners.
+                const Float32 sampleX = static_cast<Float32>(texelX) + 0.5f;
+                const Float32 sampleY = static_cast<Float32>(texelY) + 0.5f;
+
+                // Barycentrics from edge functions — the construction hardware uses, so agreement here is agreement
+                // about the interpolation rather than about some algebraically-equivalent formula.
+                auto edge = [&](std::size_t a, std::size_t b) {
+                    return (screen[b][0] - screen[a][0]) * (sampleY - screen[a][1]) -
+                           (screen[b][1] - screen[a][1]) * (sampleX - screen[a][0]);
+                };
+                const Float32 lambda0 = edge(1, 2) / twiceArea;
+                const Float32 lambda1 = edge(2, 0) / twiceArea;
+                const Float32 lambda2 = 1.0f - lambda0 - lambda1;
+
+                // Coverage asserted rather than assumed: outside the triangle the texel still holds the NaN clear and
+                // comparing it would compare nothing. With one primitive covering everything this must hold at every
+                // texel, so a failure means the geometry or transform stopped covering the view — reported as the
+                // setup bug it is instead of being logged as a shading difference.
+                if (lambda0 < -1e-4f || lambda1 < -1e-4f || lambda2 < -1e-4f)
+                {
+                    INFO("texel (" << texelX << "," << texelY << ") barycentric (" << lambda0 << ", " << lambda1 << ", "
+                                   << lambda2 << ")");
+                    FAIL("coverage triangle does not cover this texel — setup bug, not a shading difference");
+                    continue;
+                }
+
+                const Vec3 interpolatedNormal =
+                    Vec3(transformedNormals[0].X * lambda0 + transformedNormals[1].X * lambda1 +
+                             transformedNormals[2].X * lambda2,
+                         transformedNormals[0].Y * lambda0 + transformedNormals[1].Y * lambda1 +
+                             transformedNormals[2].Y * lambda2,
+                         transformedNormals[0].Z * lambda0 + transformedNormals[1].Z * lambda1 +
+                             transformedNormals[2].Z * lambda2);
+
+                const Vec3 worldPosition =
+                    Vec3(worldPositions[0].X * lambda0 + worldPositions[1].X * lambda1 + worldPositions[2].X * lambda2,
+                         worldPositions[0].Y * lambda0 + worldPositions[1].Y * lambda1 + worldPositions[2].Y * lambda2,
+                         worldPositions[0].Z * lambda0 + worldPositions[1].Z * lambda1 + worldPositions[2].Z * lambda2);
+
+                // ShadeWorldPointCpu takes the interpolated normal directly — the CPU mirror of the fragment shader's
+                // normalize(InWorldNormal). ComputeForwardShadingCpu would instead re-derive a constant face normal
+                // from the model matrix, which is precisely the thing that cannot describe this surface.
+                const Vec3 expected = ShadeWorldPointCpu(scene.Params, scene.Draw, worldPosition, interpolatedNormal);
+
+                const float* texel = reinterpret_cast<const float*>(pixels.data()) +
+                                     static_cast<std::size_t>(texelY) * kSize * 4u +
+                                     static_cast<std::size_t>(texelX) * 4u;
+                REQUIRE_MESSAGE(!std::isnan(texel[0]), "texel never written — the NaN clear survived, so nothing drew");
+
+                const Vec3 actual(texel[0], texel[1], texel[2]);
+                ++compared;
+
+                // Relative to the largest channel: shading spans orders of magnitude across this frame (the point
+                // light falls off sharply toward the corners), so a fixed absolute band would be either meaningless at
+                // the bright end or unreachable at the dark one. 2e-3 covers float32 rounding through interpolation
+                // plus lavapipe's software transcendentals; a wrong normal matrix or reversed interpolation moves
+                // results by percent-scale amounts, orders of magnitude outside this window.
+                const Float32 scale = std::max(
+                    Float32(1.0), std::max(std::abs(expected.X), std::max(std::abs(expected.Y), std::abs(expected.Z))));
+                const Float32 tolerance = 2.0e-3f * scale;
+
+                const Float32 error =
+                    std::max(std::abs(actual.X - expected.X),
+                             std::max(std::abs(actual.Y - expected.Y), std::abs(actual.Z - expected.Z)));
+                worstRelativeError = std::max(worstRelativeError, error / scale);
+
+                if (error > tolerance && firstFailure.empty())
+                {
+                    firstFailure = "texel (" + std::to_string(texelX) + "," + std::to_string(texelY) +
+                                   ") barycentric (" + std::to_string(lambda0) + ", " + std::to_string(lambda1) + ", " +
+                                   std::to_string(lambda2) + ")\n  world  " + Describe(worldPosition) + "\n  normal " +
+                                   Describe(interpolatedNormal) + "\n  gpu    " + Describe(actual) + "\n  cpu    " +
+                                   Describe(expected);
+                }
+            }
+        }
+
+        INFO("worst relative error: " << worstRelativeError);
+        INFO("first mismatch:\n" << firstFailure);
+        CHECK_MESSAGE(firstFailure.empty(), "interpolated-normal shading disagrees with the CPU reference");
+        CHECK(compared == kSize * kSize);
+
+        // The interpolation must actually vary, or this case proves nothing: a shader that ignored its varying and
+        // used a constant normal would match a CPU doing the same. Asserting the spread keeps a vacuous pass from
+        // ever being mistaken for coverage.
+        const Float32 normalSpread = std::abs(transformedNormals[0].X - transformedNormals[1].X) +
+                                     std::abs(transformedNormals[0].Y - transformedNormals[1].Y);
+        CHECK(normalSpread > 0.1f);
     }
 }

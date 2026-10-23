@@ -437,4 +437,104 @@ TEST_SUITE("Renderer/ForwardRender")
         // The out-of-range guard must compare against the same generated constant, not a hand-typed copy.
         CHECK(eight.find("index >= 8") != std::string::npos);
     }
+
+    TEST_CASE("the flat-face and world-normal entry points agree exactly")
+    {
+        // ShadeWorldPointCpu was split out of ComputeForwardShadingCpu, which now derives the world normal and hands
+        // off. That refactor is only safe if the two paths produce BIT-IDENTICAL results — not merely close ones — so
+        // that every existing equivalence test keeps measuring shading rather than the refactor. Comparing with ==
+        // rather than a tolerance is deliberate: any difference at all means the split moved something (a normalise, a
+        // clamp) that should have stayed put.
+        BasicScene scene;
+
+        ForwardLight directional;
+        directional.Light.Type = LightComponent::LightType::Directional;
+        directional.Light.Color = Vec3(0.4f, 0.7f, 1.0f);
+        directional.Light.Intensity = 2.5f;
+        directional.WorldDirection = Vec3(-0.3f, -0.6f, -0.8f);
+        scene.Params.Lights.push_back(directional);
+
+        ForwardLight point;
+        point.Light.Type = LightComponent::LightType::Point;
+        point.WorldPosition = Vec3(1.2f, -0.4f, 2.0f);
+        point.Light.Color = Vec3(1.0f, 0.6f, 0.2f);
+        point.Light.Intensity = 5.0f;
+        point.Light.Range = 8.0f;
+        scene.Params.Lights.push_back(point);
+
+        scene.Draw.LightIndices = {0u, 1u};
+
+        // A non-identity model matrix so the world normal genuinely differs from the local one — with an identity
+        // transform both paths would trivially agree and the test would prove nothing.
+        scene.Draw.ModelMatrix =
+            Math::Mat4::Rotate(Vec3(1.0f, 0.4f, -0.2f), 0.9f) * Math::Mat4::Scale(Vec3(2.0f, 0.5f, 1.3f));
+
+        const std::vector<Vec3> positions = {
+            Vec3(0.0f, 0.0f, 0.5f),
+            Vec3(0.31f, -0.22f, 0.5f),
+            Vec3(-0.44f, 0.4f, 0.1f),
+        };
+        const std::vector<Vec3> localNormals = {
+            Vec3(0.0f, 0.0f, 1.0f),
+            Vec3(1.0f, 0.0f, 0.0f),
+            Vec3(0.0f, -1.0f, 0.0f),
+        };
+
+        for (const Vec3& position : positions)
+        {
+            for (const Vec3& localNormal : localNormals)
+            {
+                INFO("position " << Describe(position) << " local normal " << Describe(localNormal));
+
+                const Vec3 viaFlat = ComputeForwardShadingCpu(scene.Params, scene.Draw, position, localNormal);
+                const Vec3 viaWorld = ShadeWorldPointCpu(scene.Params, scene.Draw, position,
+                                                         ComputeWorldNormal(scene.Draw.ModelMatrix, localNormal));
+
+                CHECK(viaFlat.X == viaWorld.X);
+                CHECK(viaFlat.Y == viaWorld.Y);
+                CHECK(viaFlat.Z == viaWorld.Z);
+            }
+        }
+    }
+
+    TEST_CASE("the world-normal entry point normalises its input, like the shader does")
+    {
+        // The GPU normalises the INTERPOLATED vector (normalize(InWorldNormal)), so this function must too — a caller
+        // handing over an un-normalised interpolated normal is the normal case, not an edge case. A scaled input that
+        // changed the result would mean callers have to know to normalise first, which is exactly the kind of implicit
+        // contract that breaks when someone interpolates two normals of different lengths.
+        BasicScene scene;
+
+        ForwardLight directional;
+        directional.Light.Type = LightComponent::LightType::Directional;
+        directional.Light.Color = Vec3(1.0f);
+        directional.Light.Intensity = 1.5f;
+        directional.WorldDirection = Vec3(-0.2f, -0.5f, -0.9f);
+        scene.Params.Lights.push_back(directional);
+        scene.Draw.LightIndices = {0};
+
+        const Vec3 position(0.1f, 0.05f, 0.4f);
+        const Vec3 unitNormal = Vec3(0.3f, 0.4f, 1.0f).Normalized();
+
+        const Vec3 fromUnit = ShadeWorldPointCpu(scene.Params, scene.Draw, position, unitNormal);
+        // Interpolation routinely yields a short vector (convex combinations of unit vectors are shorter than unit),
+        // and this input is un-normalised on purpose.
+        const Vec3 scaledNormal = unitNormal * 0.37f;
+
+        // Tolerance, deliberately NOT == — the one place in these tests where exactness would be wrong. Scaling a unit
+        // vector by 0.37 then normalising does not return the original bits: measured ~3e-8 relative, pure float32
+        // rounding through two round-trips. The comparison that matters is against the size of the bug being excluded —
+        // if this function skipped normalising, dot(N,L) would carry the 0.37 and output would drop by tens of percent
+        // (~1e-1). So 1e-5 sits three orders above rounding and four below failure: it cannot pass a missing
+        // normalisation, and cannot fail on arithmetic noise. Exactness is the right bar when two code paths must agree
+        // (see the case above); equivalence under re-rounding is a different property and needs its own bar.
+        const Vec3 fromScaled = ShadeWorldPointCpu(scene.Params, scene.Draw, position, scaledNormal);
+        INFO("unit " << Describe(fromUnit) << "  scaled-input " << Describe(fromScaled));
+        CHECK(Approximately(fromScaled, fromUnit, 1.0e-5f));
+
+        // And it must not be vacuously true: an input pointing somewhere else has to differ, or the function would be
+        // ignoring its normal argument entirely.
+        const Vec3 differentDirection = Vec3(0.9f, 0.1f, 0.4f).Normalized();
+        CHECK(ShadeWorldPointCpu(scene.Params, scene.Draw, position, differentDirection) != fromUnit);
+    }
 }

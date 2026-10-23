@@ -104,6 +104,23 @@ struct ForwardPassParams
                                                             const ForwardDrawItem& draw, const Vec3& worldPosition,
                                                             const Vec3& localGeometricNormal);
 
+//! The same shading, given the surface NORMAL ALREADY IN WORLD SPACE — the CPU mirror of what the fragment shader
+//! actually receives.
+/**
+ * Split out because a rasterised surface does not have a geometric normal, it has an INTERPOLATED one: the vertex
+ * stage transforms per-vertex normals and the rasteriser blends them across the triangle. Passing a local geometric
+ * normal through ComputeForwardShadingCpu can only ever describe a flat face (its documented contract), which is fine
+ * for a cube but cannot describe a sphere — and, more to the point for tests, cannot verify that the GPU interpolated
+ * what the CPU expected. This entry point takes the interpolated value directly so both sides evaluate identical
+ * inputs, isolating interpolation from shading.
+ *
+ * `worldNormal` is normalised internally (see the comment in the definition) exactly as the shader does, so callers
+ * hand over whatever the interpolation produced rather than pre-normalising it — pre-normalising on the CPU and
+ * normalising again on neither side would differ in float rounding from a GPU that normalises once.
+ */
+[[nodiscard]] HP_RENDERER_API Vec3 ShadeWorldPointCpu(const ForwardPassParams& params, const ForwardDrawItem& draw,
+                                                      const Vec3& worldPosition, const Vec3& worldNormal);
+
 //! The normal matrix for a model basis: inverse transpose of a 3x3 transform, computed scale-robustly.
 //!
 //! This is what gets uploaded to a shader's NormalMatrix uniform. Exposed because the CPU reference and every GPU

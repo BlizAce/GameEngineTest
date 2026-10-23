@@ -633,4 +633,67 @@ bool AreSceneTypesRegistered()
     return g_SceneTypesRegistered.load(std::memory_order_acquire);
 }
 
+// ---------------------------------------------------------------------------
+// File I/O.
+// ---------------------------------------------------------------------------
+
+SceneSaveFileResult SaveSceneToFile(const World& world, std::string_view path, const SceneSaveOptions& options)
+{
+    SceneSaveFileResult result;
+    if (path.empty())
+    {
+        result.Error = Core::FileError::NotSupported;
+        result.Message = "SaveSceneToFile called with an empty path";
+        HP_LOG_ERROR("SCENE", "%s", result.Message.c_str());
+        return result;
+    }
+
+    // Serialise first, deliberately. Producing the JSON cannot fail on I/O grounds, so any error raised here is a
+    // content problem and any error below is an I/O problem — keeping the two channels separate is what lets an editor
+    // say "this scene cannot be written" versus "the disk refused" without guessing from a single bool.
+    const std::string text = Serialization::WriteJson(WriteScene(world, options));
+
+    // Atomic: a save interrupted by a crash must leave the PREVIOUS file intact rather than a half-written document
+    // that no longer loads. This is the entire reason the wrapper exists — callers should not have to remember it.
+    const Core::FileOperationResult written = Core::WriteFileAtomic(path, text);
+    if (!written.Succeeded)
+    {
+        result.Error = written.Error;
+        result.Message = "cannot save scene to '" + std::string(path) + "': " + written.Message;
+        HP_LOG_ERROR("SCENE", "%s", result.Message.c_str());
+        return result;
+    }
+
+    result.Saved = true;
+    result.Error = Core::FileError::None;
+    return result;
+}
+
+SceneLoadReport LoadSceneFromFile(World& world, std::string_view path, const SceneLoadOptions& options)
+{
+    if (path.empty())
+    {
+        SceneLoadReport report;
+        report.Loaded = false;
+        report.Errors.push_back({0, "LoadSceneFromFile called with an empty path"});
+        return report;
+    }
+
+    const Core::TextResult text = Core::ReadFileText(path);
+    if (!text.Succeeded)
+    {
+        // Reported through the same Errors channel a parse failure uses, so callers check one thing. The distinction
+        // survives in the message: "no such file" invites an editor to offer creating it, while a syntax error should
+        // show its position instead.
+        SceneLoadReport report;
+        report.Loaded = false;
+        report.Errors.push_back({0, "cannot read '" + std::string(path) + "': " + text.Message});
+        return report;
+    }
+
+    // LoadSceneFromText already reports syntax errors as load errors rather than throwing, so nothing to add here —
+    // and prepending the path would duplicate it on every content error, making long messages noisier to read.
+    return LoadSceneFromText(world, text.Value, options);
+}
+
 }  // namespace Hollowpoint::Scene

@@ -119,6 +119,9 @@ struct FileOperationResult
 [[nodiscard]] HP_CORE_API FileOperationResult WriteFileTruncate(std::string_view path, const void* data,
                                                                 UInt64 byteCount);
 
+//! Text convenience overload, mirroring WriteFileAtomic — without it every text call site spells out a length.
+[[nodiscard]] HP_CORE_API FileOperationResult WriteFileTruncate(std::string_view path, std::string_view text);
+
 // --- Querying --------------------------------------------------------------------
 
 [[nodiscard]] HP_CORE_API bool FileExists(std::string_view path) noexcept;

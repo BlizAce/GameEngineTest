@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "Hollowpoint/Core/FileSystem.h"
 #include "Hollowpoint/Core/Guid.h"
 #include "Hollowpoint/ECS/World.h"
 #include "Hollowpoint/Reflection/Descriptors.h"
@@ -214,5 +215,35 @@ SceneLoadReport LoadScene(World& world, const JsonValue& document, const SceneLo
 
 //! Convenience: parses text then loads. Reports a JSON syntax error as a single load error rather than throwing.
 SceneLoadReport LoadSceneFromText(World& world, std::string_view text, const SceneLoadOptions& options = {});
+
+// --- File I/O ------------------------------------------------------------------
+//
+// Thin wrappers over the text functions plus Core::FileSystem, which owns path handling, encoding and failure
+// classification. They live here rather than at each call site for two reasons: a save that silently truncates the old
+// file destroys a level when the process dies mid-write (WriteFileAtomic is the only correct choice, and it must not be
+// something every caller has to remember), and a load failure has to distinguish "no such file" from "unparseable" —
+// an editor offers "create it" for the first and "here is the syntax error" for the second.
+
+//! Outcome of saving: either success, or why nothing was written. Carries no report because a save that got as far as
+//! producing JSON has already succeeded or failed at writing — the two-step (serialise, then write) keeps a
+//! serialisation problem from being reported as an I/O one.
+struct SceneSaveFileResult
+{
+    bool Saved = false;
+    Core::FileError Error = Core::FileError::None;
+    std::string Message;  //!< Empty on success; names the path and reason otherwise.
+};
+
+//! Serialises `world` and writes it atomically, creating parent directories as needed. Bytes are identical to
+//! WriteScene + WriteJson, so a file saved here round-trips with the text API and stays diff-friendly in version
+//! control.
+[[nodiscard]] SceneSaveFileResult SaveSceneToFile(const World& world, std::string_view path,
+                                                  const SceneSaveOptions& options = {});
+
+//! Reads a `.hpscene` file and loads it. A missing or unreadable file reports through the returned report's Errors
+//! with the path in the message, so callers have one failure channel for "could not read" and "would not parse" —
+//! which is what an editor needs to decide between offering to create a scene and showing a syntax error.
+[[nodiscard]] SceneLoadReport LoadSceneFromFile(World& world, std::string_view path,
+                                                const SceneLoadOptions& options = {});
 
 }  // namespace Hollowpoint::Scene

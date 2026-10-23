@@ -20,6 +20,9 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>     // ::open, probing whether directory permissions are enforced
+#include <sys/stat.h>  // ::chmod for the read-only-directory durability case
+
 #if !defined(_WIN32)
     #include <unistd.h>  // ::getpid for unique scratch directory names.
 #endif
@@ -579,6 +582,70 @@ TEST_SUITE("Core/FileSystem")
             CHECK_FALSE(zeroRead.Succeeded);
             CHECK(zeroRead.Error == FileError::NotSupported);
         }
+    }
+
+    TEST_CASE("atomic writing refuses rather than destroying when it cannot write atomically")
+    {
+        // THE durability test, and the contract it pins: WriteFileAtomic guarantees a reader never sees a partial file
+        // and a failed save never loses the previous one. When atomicity is impossible the operation must therefore
+        // FAIL — a caller who wants best-effort has WriteFileTruncate. Asserting that unconditionally is what makes
+        // this test able to fail: an earlier version checked "if it failed, the original survived", which a
+        // truncate-then-write implementation passes by simply succeeding instead. Verified: replacing temp+rename with
+        // a direct ofstream left that version green. A conditional expectation on the outcome you hope for is not a
+        // test.
+        //
+        // Why a read-only DIRECTORY (with a writable FILE) is the right lever: every failure reachable from arguments
+        // (empty path, null data) is rejected before either implementation touches bytes, and a read-only FILE fails
+        // both too — opening an existing file for writing does not need directory write permission, which is precisely
+        // why the truncate version slips through. Only "cannot create the temporary" separates them.
+        ScopedTempDirectory temp("durability");
+        const std::string directory = temp.Directory("readonly_dir");
+        REQUIRE(CreateDirectoryRecursive(directory).Succeeded);
+
+        const std::string path = JoinPath(directory, "precious.txt");
+        REQUIRE(WriteFileAtomic(path, "the only copy").Succeeded);
+        REQUIRE(ReadFileText(path).Value == "the only copy");
+
+        // Drop write permission on the directory while leaving the file itself writable.
+        const bool madeReadOnly = chmod(directory.c_str(), 0500) == 0;
+        if (!madeReadOnly)
+        {
+            WARN("could not make the scratch directory read-only; durability path untested here");
+            return;
+        }
+
+        // Probe whether this environment actually enforces directory permissions before trusting the outcome: running
+        // as root (or on a filesystem without permission bits) lets file creation through regardless, and reporting
+        // success there would be a lie about having tested anything. The probe is the real syscall the implementation
+        // uses, so it cannot disagree with it.
+        const std::string probePath = JoinPath(directory, "probe.txt");
+        const bool permissionsEnforced = (::open(probePath.c_str(), O_CREAT | O_WRONLY, 0600) == -1);
+        std::error_code ignored;
+        std::filesystem::remove(probePath, ignored);
+
+        if (!permissionsEnforced)
+        {
+            chmod(directory.c_str(), 0700);
+            WARN(
+                "this environment does not enforce directory write permissions (running as root?); durability path "
+                "untested here");
+            return;
+        }
+
+        FileOperationResult result;
+        {
+            Hollowpoint::Test::ScopedLogCapture logs;
+            result = WriteFileAtomic(path, "replacement that must never land");
+        }
+
+        chmod(directory.c_str(), 0700);  // Restore before asserting, so a failure cannot leak an unlistable directory.
+
+        CHECK_FALSE(result.Succeeded);  // The contract: no atomicity, no write.
+        CHECK(ReadFileText(path).Value == "the only copy");
+
+        // No temporary left behind in the directory that just refused one (it may be unwritable, and a stale temp there
+        // would then be permanently undeletable).
+        CHECK(ListDirectoryEntries(directory, true).size() == 1u);
     }
 
     TEST_CASE("FileErrorName covers every enumerator without falling through to blank")

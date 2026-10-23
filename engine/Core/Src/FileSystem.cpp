@@ -499,6 +499,11 @@ FileOperationResult WriteFileTruncate(std::string_view path, const void* data, U
     return MakeOperationSuccess();
 }
 
+FileOperationResult WriteFileTruncate(std::string_view path, std::string_view text)
+{
+    return WriteFileTruncate(path, text.data(), text.size());
+}
+
 // --- Querying --------------------------------------------------------------------------
 
 bool FileExists(std::string_view path) noexcept

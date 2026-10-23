@@ -1,11 +1,14 @@
 #include "TestSupport.h"
 
 #include <cmath>
+#include <filesystem>
+#include <random>
 #include <string>
 #include <vector>
 
 #include <doctest/doctest.h>
 
+#include "Hollowpoint/Core/FileSystem.h"
 #include "Hollowpoint/Core/Guid.h"
 #include "Hollowpoint/ECS/World.h"
 #include "Hollowpoint/Math/MathCore.h"
@@ -99,6 +102,54 @@ std::string WriteAndReload(World& world, World& destination)
     REQUIRE(report.Loaded);
     return text;
 }
+
+// ---------------------------------------------------------------------------
+// Scratch file for the file-I/O cases at the bottom of this file.
+//
+// Names must be unique per case AND per process: ctest runs test binaries concurrently, and two tests sharing a scratch
+// path means one deletes the other's fixture — producing failures that only appear under -j and blame whichever test
+// lost the race. random_device supplies the cross-process entropy (fs::unique_path does this job but is deprecated in
+// C++20); the counter keeps cases inside one process apart even if the RNG repeats.
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] std::filesystem::path MakeScratchScenePath(std::string_view label)
+{
+    static Hollowpoint::Core::UInt64 s_Counter = 0;
+    const Hollowpoint::Core::UInt64 token = s_Counter++;
+
+    std::random_device entropy;
+    const Hollowpoint::Core::UInt64 randomPart =
+        (static_cast<Hollowpoint::Core::UInt64>(entropy()) << 32) ^ static_cast<Hollowpoint::Core::UInt64>(entropy());
+
+    // The whole path lives inside one scratch DIRECTORY so cleanup can remove the tree: SaveSceneToFile creates parent
+    // directories, and leaving "…/levels/level01/" behind under /tmp is how a suite slowly fills a tmpfs.
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() /
+        ("hp_scene_" + std::string(label) + "_" + std::to_string(randomPart) + "_" + std::to_string(token));
+
+    return directory / "scene.hpscene";
+}
+
+class ScopedScratchScene
+{
+public:
+    explicit ScopedScratchScene(std::string_view label) : Path(MakeScratchScenePath(label))
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all(Path.parent_path(), ignored);
+    }
+
+    ~ScopedScratchScene()
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all(Path.parent_path(), ignored);
+    }
+
+    ScopedScratchScene(const ScopedScratchScene&) = delete;
+    ScopedScratchScene& operator=(const ScopedScratchScene&) = delete;
+
+    std::filesystem::path Path;
+};
 
 }  // namespace
 
@@ -974,5 +1025,187 @@ TEST_SUITE("Scene/SceneIO")
 
         CHECK(logs.GetWarningCount() >= 1u);
         CHECK(ComponentFactory::Get().IsRegistered("AmbiguousName"));
+    }
+    TEST_CASE("a world saved to a file reloads with the same entities and transforms")
+    {
+        ScopedScratchScene scratch("roundtrip");
+
+        World source;
+        MakePlaceable(source, Vec3(1.0f, 2.0f, 3.0f));
+        MakePlaceable(source, Vec3(-4.0f, 0.5f, 0.0f));
+
+        const SceneSaveFileResult saved = SaveSceneToFile(source, scratch.Path.string());
+        INFO(saved.Message);
+        REQUIRE(saved.Saved);
+        REQUIRE(Hollowpoint::Core::FileExists(scratch.Path.string()));
+
+        World destination;
+        const SceneLoadReport loaded = LoadSceneFromFile(destination, scratch.Path.string());
+        loaded.ReportToLog("roundtrip");
+        REQUIRE(loaded.Loaded);
+        CHECK_FALSE(loaded.HasErrors());
+        REQUIRE(loaded.CreatedEntities.size() == 2u);
+
+        // Spot-check that a transform came back through the file, not merely the entity count: a load creating two
+        // entities with default transforms would satisfy the count while being completely wrong.
+        int matched = 0;
+        for (const Entity& entity : loaded.CreatedEntities)
+        {
+            const LocalTransform* transform = destination.TryGetComponent<LocalTransform>(entity);
+            if (transform == nullptr)
+            {
+                continue;
+            }
+            if (Near(transform->Position, Vec3(1.0f, 2.0f, 3.0f)))
+            {
+                ++matched;
+            }
+            if (Near(transform->Position, Vec3(-4.0f, 0.5f, 0.0f)))
+            {
+                ++matched;
+            }
+        }
+        CHECK(matched == 2);
+    }
+
+    TEST_CASE("file output is byte-identical to the text API")
+    {
+        // The two paths must produce the same bytes. Scenes are checked into version control and diffed, so a file
+        // writer that reformatted (or silently used compact JSON) would show every scene as changed on save. This pins
+        // the wrapper as a wrapper rather than a second serialiser with its own formatting opinions.
+        ScopedScratchScene scratch("bytes");
+
+        World world;
+        MakePlaceable(world, Vec3(7.0f, 8.0f, 9.0f));
+
+        const std::string expectedText = Hollowpoint::Serialization::WriteJson(WriteScene(world));
+        REQUIRE(SaveSceneToFile(world, scratch.Path.string()).Saved);
+
+        const Hollowpoint::Core::TextResult onDisk = Hollowpoint::Core::ReadFileText(scratch.Path.string());
+        REQUIRE(onDisk.Succeeded);
+        CHECK(onDisk.Value == expectedText);
+    }
+
+    TEST_CASE("saving creates missing parent directories")
+    {
+        ScopedScratchScene scratch("parents");
+        const std::filesystem::path nested = scratch.Path.parent_path() / "levels" / "level01" / "scene.hpscene";
+
+        World world;
+        MakePlaceable(world, Vec3(0.0f));
+
+        const SceneSaveFileResult saved = SaveSceneToFile(world, nested.string());
+        INFO(saved.Message);
+        REQUIRE(saved.Saved);
+        CHECK(Hollowpoint::Core::FileExists(nested.string()));
+
+        // And the scene at that new depth still loads — creating directories is worthless if the path is then unusable.
+        World reloaded;
+        CHECK(LoadSceneFromFile(reloaded, nested.string()).Loaded);
+    }
+
+    TEST_CASE("loading a missing file reports through Errors with the path, and leaves the world alone")
+    {
+        ScopedScratchScene scratch("missing");
+
+        World world;
+        const Entity existing = MakePlaceable(world, Vec3(1.0f));
+        REQUIRE_FALSE(existing.IsNull());
+
+        const std::filesystem::path absent = scratch.Path.parent_path() / "does_not_exist.hpscene";
+        const SceneLoadReport report = LoadSceneFromFile(world, absent.string());
+        CHECK_FALSE(report.Loaded);
+        REQUIRE(report.HasErrors());
+        // The path must appear in the message: an editor told "cannot read scene" across five open files cannot say
+        // which one is unusable.
+        CHECK(report.Errors[0].Message.find("does_not_exist.hpscene") != std::string::npos);
+
+        // A failed load must not have cleared or corrupted what was already loaded — LoadSceneFromText only clears on a
+        // document it accepts, and the read-failure path must honour the same rule.
+        CHECK(world.IsAlive(existing));
+    }
+
+    TEST_CASE("loading a corrupt file reports a parse error naming a position")
+    {
+        ScopedScratchScene scratch("corrupt");
+        REQUIRE(Hollowpoint::Core::WriteFileTruncate(scratch.Path.string(), "{ this is not json").Succeeded);
+
+        World world;
+        const SceneLoadReport report = LoadSceneFromFile(world, scratch.Path.string());
+        CHECK_FALSE(report.Loaded);
+        REQUIRE(report.HasErrors());
+        // Syntax errors carry line/column from the parser. Distinguishing "unreadable" from "unparseable" is what lets
+        // an editor offer to create a scene in the first case and show a caret in the second.
+        CHECK(report.Errors[0].Message.find("line") != std::string::npos);
+    }
+
+    TEST_CASE("a failed save leaves the previous file intact and reports why")
+    {
+        ScopedScratchScene scratch("torn");
+
+        World first;
+        MakePlaceable(first, Vec3(1.0f, 1.0f, 1.0f));
+        REQUIRE(SaveSceneToFile(first, scratch.Path.string()).Saved);
+        const std::string originalBytes = Hollowpoint::Core::ReadFileText(scratch.Path.string()).Value;
+        REQUIRE_FALSE(originalBytes.empty());
+
+        // An empty path cannot be written to, and the contract is that the existing file survives untouched. A naive
+        // truncate-then-write has already destroyed it by the time it notices the bad argument — which is exactly how a
+        // user loses a level to a mistyped filename.
+        {
+            Hollowpoint::Test::ScopedLogCapture logs;
+            const SceneSaveFileResult failed = SaveSceneToFile(first, "");
+            CHECK_FALSE(failed.Saved);
+            CHECK(failed.Error == Hollowpoint::Core::FileError::NotSupported);
+        }
+
+        CHECK(Hollowpoint::Core::ReadFileText(scratch.Path.string()).Value == originalBytes);
+
+        // And it still loads afterwards: the failure was clean rather than partial.
+        World reloaded;
+        CHECK(LoadSceneFromFile(reloaded, scratch.Path.string()).Loaded);
+    }
+
+    TEST_CASE("a hierarchy survives a save and load through the file")
+    {
+        ScopedScratchScene scratch("hierarchy");
+
+        World source;
+        const Entity root = MakePlaceable(source, Vec3(10.0f, 0.0f, 0.0f));
+        const Entity child = MakePlaceable(source, Vec3(0.0f, 5.0f, 0.0f));
+        source.SetParent(child, root);
+
+        REQUIRE(SaveSceneToFile(source, scratch.Path.string()).Saved);
+
+        World destination;
+        const SceneLoadReport loaded = LoadSceneFromFile(destination, scratch.Path.string());
+        REQUIRE(loaded.Loaded);
+        REQUIRE(loaded.CreatedEntities.size() == 2u);
+
+        // Resolve by position rather than assuming slot order survives a file round-trip.
+        auto findByPosition = [&](const Vec3& position) -> Entity {
+            for (const Entity& entity : loaded.CreatedEntities)
+            {
+                const LocalTransform* transform = destination.TryGetComponent<LocalTransform>(entity);
+                if (transform != nullptr && Near(transform->Position, position))
+                {
+                    return entity;
+                }
+            }
+            return Entity();
+        };
+
+        const Entity loadedRoot = findByPosition(Vec3(10.0f, 0.0f, 0.0f));
+        const Entity loadedChild = findByPosition(Vec3(0.0f, 5.0f, 0.0f));
+        REQUIRE_FALSE(loadedRoot.IsNull());
+        REQUIRE_FALSE(loadedChild.IsNull());
+
+        // The parent LINK must be restored, not just both entities: without the two-phase parenting pass the child
+        // loads as a second root and drifts out of place the moment either is moved in the editor.
+        CHECK(destination.GetParent(loadedChild) == loadedRoot);
+        CHECK(destination.GetParent(loadedRoot).IsNull());
+
+        // Exactly one root reported, matching the document's structure.
+        CHECK(loaded.RootEntities.size() == 1u);
     }
 }

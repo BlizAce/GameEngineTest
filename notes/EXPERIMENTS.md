@@ -1353,3 +1353,46 @@ closed it. Architecture table counts re-measured from the binaries' own `--list-
 the *pipe's* status. A failed build leaves stale binaries and ctest still reports 100% pass — this caught me mid-
 mutation-test (a mutation "passed" only because its binary never rebuilt). Every build from here redirects to a log,
 echoes `$?`, then greps.
+
+### Session 14 (cont. 3) — Core::FileSystem, and three bugs found by testing my own comments
+
+The engine had **no route to disk at all** (`SceneIO` takes text it is handed; `std::filesystem` appeared only in tests
+and the log sink). Added `Core::FileSystem.h/.cpp`: classified failures (`FileError`) instead of exceptions, UTF-8-safe
+path conversion, bounded reads, and durable atomic writes. This is the dependency that scene-from-disk, assets and config
+all need, so it went under Core where one implementation covers every module.
+
+**Three real bugs found by probing claims I had written in comments rather than trusting them:**
+1. **procfs reports size 0 for files that have content.** `/proc/uptime` → reported 0, actual 21 bytes; `/proc/cpuinfo`
+   → 0 vs ~39 KB. An exact-length read returns nothing and *looks like a successful empty-file read*. Reported size is
+   now a hint: zero falls through to a bounded chunked read.
+2. **sysfs rounds reported size UP to a page** — a 23-byte attribute reports 4096, so my strict "gcount must equal
+   size" check rejected every sysfs query (the way tools read GPU/power info). Now: short read at clean EOF returns what
+   it read; only a non-EOF failure is an error.
+3. **`std::ios::ate` fails to open on procfs** (seek-to-end unsupported), surfacing as a misleading *"permission
+   denied"* on `/proc/uptime`. The size comes from `file_size()`, so no seek was needed — removed.
+
+Plus non-regular files now rejected outright: `/dev/zero` "reads" successfully and returns as many zeros as asked, which
+for an asset loader is a corrupt asset with no error. **Lesson generalised: when a comment asserts behaviour ("X would
+otherwise spin forever"), run X.** My original comment described a spin risk that my own design already prevented, while
+missing three behaviours it actually did have.
+
+**A test that silently tested nothing:** the device-node guards used `FileExists()`, which *by design* returns false for
+character devices — so the block skipped on every run while reporting green. Caught by noticing the assertions never
+appeared under `-s`. Fixed to `std::filesystem::exists` and now also asserts `FileExists` is false for the same path,
+pinning both sides of that contract. **A test whose precondition excludes its subject is the most expensive kind of
+passing test** — always confirm new assertions actually execute.
+
+**Durability design recorded at the call site:** temp-in-the-*same*-directory (rename is atomic within a filesystem and
+cannot cross a device boundary — a `/tmp` temp fails with EXDEV *after* every byte was written), `fsync` before rename
+(flushing only reaches the page cache), then parent-directory `fsync` because the rename itself is a directory entry a
+crash could lose while file contents survive. C stdio rather than `ofstream` for exactly one reason: `fsync` needs a
+file descriptor and the standard streams do not expose one portably.
+
+Compiler earned its keep on three more: `ifstream` needs `.read()` (not `operator()`), `path::native()` is not UTF-8 on
+POSIX, and `fileno` takes `FILE*` not a stream — all missed by reading, caught by `-Werror`. Also `std::errc` enumerator
+names (`read_only_file_system`, `filename_too_long`; `disk_full` does not exist) verified against the toolchain rather
+than from memory.
+
+**Tooling note:** `nodiscard` on `WriteFileAtomic` caught an unchecked result *in a test*, which is exactly what the
+attribute is for — bound it to a counter and asserted all writers succeeded, since one good write otherwise hides five
+failed ones.

@@ -200,6 +200,14 @@ if(TARGET HollowpointRenderer)
             Renderer/TestLights.cpp
         LIBS Hollowpoint::Renderer)
 
+    # CPU reference + shader generation run everywhere; the rendered comparison needs a device, so this follows the
+    # GPU-target policy (leak checking off) like the other suites that draw.
+    hp_add_module_test(TonemapBlit
+        SOURCES
+            Renderer/TestTonemapBlit.cpp
+        LIBS Hollowpoint::Renderer Hollowpoint::Graphics Hollowpoint::Platform
+        NO_LEAK_CHECK)
+
     # CPU-only like the other shading references: no RHI, no GPU, full leak checking.
     hp_add_module_test(ImageBasedLighting
         SOURCES

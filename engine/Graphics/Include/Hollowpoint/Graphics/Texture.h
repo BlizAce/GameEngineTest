@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -81,14 +82,32 @@ public:
     //! exists — Create returns nullptr when creation failed.
     [[nodiscard]] nvrhi::ITexture* GetNativeTexture() const noexcept;
 
-    //! Copies the whole texture to CPU memory and returns it as converted bytes: NVRHI's documented staging layout,
-    //! which for float formats is 4 bytes per channel regardless of GPU texel size. Synchronous (it waits for the
-    //! copy); correct for tests and tools, never a frame-loop path.
+    //! Copies the whole texture to CPU memory, returning NVRHI's staging layout **verbatim** (no format conversion is
+    //! performed): an RGBA16_FLOAT texture yields 4 × uint16 per texel, an RGBA32_FLOAT one yields 4 × float. Decode
+    //! according to GetDesc().Format — assuming 32-bit channels for any float format reads half the bytes and produces
+    //! garbage that looks like denormals. Synchronous (it waits for the copy); correct for tests and tools, never a
+    //! frame-loop path.
     //!
     //! Returns an empty vector with the reason logged on failure. `outRowPitchBytes` receives the row stride of the
-    //! returned block — it can exceed Width * bytes-per-channel when NVRHI pads rows, and ignoring it corrupts
-    //! every row past the first (measured behaviour, see TestHdrRenderTarget).
+    //! returned block — it can exceed Width * bytes-per-texel when NVRHI pads rows, and ignoring it corrupts every row
+    //! past the first (measured behaviour, see TestHdrRenderTarget).
     [[nodiscard]] std::vector<UInt8> ReadBack(GraphicsDevice& device, UInt32& outRowPitchBytes);
+
+    //! Uploads tightly packed texels into the whole base mip level. Synchronous: it records, executes and waits, so
+    //! the texture holds `pixels` by return. Correct for loading and tests; a real asset streamer batches uploads on
+    //! its own command queue and this deliberately does not pretend otherwise.
+    //!
+    //! `rowPitchBytes == 0` means tightly packed (Width * bytes-per-texel), which is what an asset loader produces.
+    //! Returns false with the reason logged when the size does not cover the texture, or the device/copy fails — a
+    //! short buffer is rejected rather than read past its end, since that failure otherwise shows up as a partially
+    //! uploaded texture and a mystery image much later.
+    //!
+    //! Implemented on a staging texture + copyTexture rather than NVRHI's writeTexture convenience call. That call
+    //! looks like the obvious match but has two properties this API does not want: its rows must be packed to Vulkan's
+    //! 4-byte row-alignment rule (a 3-wide RGB8 source is rejected or misread — it memcpy's min(deviceRowPitch,
+    //! rowPitch) per row and trusts the rest), and it needs a live command list, so it cannot be used from a loader
+    //! that has no queue yet. Staging costs one extra copy at load time and handles arbitrary pitches.
+    bool Update(GraphicsDevice& device, const void* pixels, size_t byteCount, UInt32 rowPitchBytes = 0);
 
 protected:
     ~Texture() override;

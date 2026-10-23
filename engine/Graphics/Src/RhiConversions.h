@@ -72,6 +72,39 @@ namespace Detail
     return format == GraphicsFormat::D32Float;
 }
 
+//! Bytes per texel for a format, used to size uploads and validate pitches. Exhaustive over GraphicsFormat by design:
+//! a new entry must state its size here rather than defaulting to something plausible, because the failure mode of a
+//! wrong size is not an error but a texture whose rows are all shifted by a constant.
+[[nodiscard]] constexpr UInt32 BytesPerPixel(GraphicsFormat format) noexcept
+{
+    switch (format)
+    {
+        case GraphicsFormat::Unknown:
+            return 0;
+        case GraphicsFormat::Rgba8Unorm:
+        case GraphicsFormat::Bgra8Unorm:
+        case GraphicsFormat::Rgba8Srgb:
+            return 4;
+        case GraphicsFormat::Rgba16Float:
+            return 8;
+        case GraphicsFormat::Rg16Float:
+            return 4;
+        case GraphicsFormat::R16Float:
+            return 2;
+        case GraphicsFormat::D32Float:
+            return 4;
+        case GraphicsFormat::R8Unorm:
+            return 1;
+        case GraphicsFormat::Rgba32Float:
+            return 16;
+        case GraphicsFormat::Rg32Float:
+            return 8;
+        case GraphicsFormat::Rgb32Float:
+            return 12;
+    }
+    return 0;
+}
+
 }  // namespace Detail
 
 }  // namespace Hollowpoint::Graphics

@@ -10,7 +10,9 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <string>
+#include <vector>
 
 #include <doctest/doctest.h>
 
@@ -216,6 +218,175 @@ TEST_SUITE("Graphics/Resources")
         const UInt8* right = texelAt(kSize - 3, 4);
         const bool varies = left[0] != right[0] || left[1] != right[1] || left[2] != right[2];
         CHECK(varies);
+    }
+
+    TEST_CASE("texture upload round-trips through the staging path")
+    {
+        GraphicsDevice* device = GetDevice();
+        if (device == nullptr)
+        {
+            WARN("No graphics device; upload needs one");
+            return;
+        }
+
+        // RGBA32_FLOAT so the comparison is exact: half-float storage would make this test measure its own rounding.
+        constexpr UInt32 kSize = 8u;
+        TextureDesc desc;
+        desc.Name = "roundtrip";
+        desc.Width = kSize;
+        desc.Height = kSize;
+        desc.Format = GraphicsFormat::Rgba32Float;
+        desc.IsShaderResource = true;  // what a sampled texture needs, and Update must not disturb it
+        Core::Ref<Texture> texture = Texture::Create(*device, desc);
+        REQUIRE(texture != nullptr);
+
+        // Every texel distinct, so a row/column swap or a pitch error moves pixels rather than hiding. Values are all
+        // exactly representable in half floats as well — the upload path copies bytes verbatim, but a test value that
+        // survives both storage formats keeps this test valid if the default format ever changes under it.
+        std::vector<float> texels(static_cast<size_t>(kSize) * kSize * 4u);
+        for (UInt32 y = 0; y < kSize; ++y)
+        {
+            for (UInt32 x = 0; x < kSize; ++x)
+            {
+                float* texel = texels.data() + (static_cast<size_t>(y) * kSize + x) * 4u;
+                texel[0] = static_cast<float>(x);
+                texel[1] = static_cast<float>(y);
+                texel[2] = static_cast<float>((x * 3u + y * 5u) % 17u);
+                texel[3] = 1.0f;
+            }
+        }
+
+        REQUIRE(texture->Update(*device, texels.data(), texels.size() * sizeof(float)));
+
+        UInt32 rowPitchBytes = 0;
+        const std::vector<UInt8> readBack = texture->ReadBack(*device, rowPitchBytes);
+        REQUIRE_FALSE(readBack.empty());
+        REQUIRE(rowPitchBytes >= kSize * 4u * sizeof(float));
+
+        const auto* floats = reinterpret_cast<const float*>(readBack.data());
+        const size_t perRow = rowPitchBytes / sizeof(float);
+        for (UInt32 y = 0; y < kSize; ++y)
+        {
+            for (UInt32 x = 0; x < kSize; ++x)
+            {
+                const float* actual = floats + perRow * y + static_cast<size_t>(x) * 4u;
+                const float* expected = texels.data() + (static_cast<size_t>(y) * kSize + x) * 4u;
+                INFO("texel (" << x << "," << y << ")");
+                // Exact: this path copies bytes through two stages with no arithmetic, so any difference is a bug —
+                // pitch, state, or the copy region. Tolerances here would hide exactly what is being tested.
+                CHECK(actual[0] == expected[0]);
+                CHECK(actual[1] == expected[1]);
+                CHECK(actual[2] == expected[2]);
+                CHECK(actual[3] == expected[3]);
+            }
+        }
+
+        // Still sampleable after the update: the path transitions to CopyDest and back, and a texture left in a
+        // transfer layout fails later binds with an error that names neither this call nor the reason.
+        UInt32 secondPitch = 0;
+        CHECK_FALSE(texture->ReadBack(*device, secondPitch).empty());
+    }
+
+    TEST_CASE("texture upload honours a padded source pitch")
+    {
+        GraphicsDevice* device = GetDevice();
+        if (device == nullptr)
+        {
+            WARN("No graphics device; upload needs one");
+            return;
+        }
+
+        // A 4x2 image whose rows carry 16 bytes of trailing junk — what an importer hands over when a file's rows are
+        // aligned to something wider than the image. The wrapper must copy rowBytes per row and ignore the padding;
+        // copying byteCount linearly instead produces a sheared image, which is the kind of bug that survives because
+        // square power-of-two test images never have padding.
+        constexpr UInt32 kWidth = 4u;
+        constexpr UInt32 kHeight = 2u;
+        constexpr UInt32 kTexelBytes = 16u;  // RGBA32_FLOAT
+        constexpr UInt32 kPitch = kWidth * kTexelBytes + 16u;
+
+        TextureDesc desc;
+        desc.Name = "padded upload";
+        desc.Width = kWidth;
+        desc.Height = kHeight;
+        desc.Format = GraphicsFormat::Rgba32Float;
+        Core::Ref<Texture> texture = Texture::Create(*device, desc);
+        REQUIRE(texture != nullptr);
+
+        std::vector<unsigned char> padded(static_cast<size_t>(kPitch) * kHeight, 0xABu);  // junk in the padding
+        for (UInt32 y = 0; y < kHeight; ++y)
+        {
+            for (UInt32 x = 0; x < kWidth; ++x)
+            {
+                auto* texel = padded.data() + static_cast<size_t>(kPitch) * y + static_cast<size_t>(kTexelBytes) * x;
+                const float values[4] = {static_cast<float>(x), static_cast<float>(y), 0.5f, 1.0f};
+                std::memcpy(texel, values, sizeof(values));
+            }
+        }
+
+        REQUIRE(texture->Update(*device, padded.data(), padded.size(), kPitch));
+
+        UInt32 rowPitchBytes = 0;
+        const std::vector<UInt8> readBack = texture->ReadBack(*device, rowPitchBytes);
+        REQUIRE_FALSE(readBack.empty());
+        const auto* floats = reinterpret_cast<const float*>(readBack.data());
+        const size_t perRow = rowPitchBytes / sizeof(float);
+
+        for (UInt32 y = 0; y < kHeight; ++y)
+        {
+            for (UInt32 x = 0; x < kWidth; ++x)
+            {
+                const float* actual = floats + perRow * y + static_cast<size_t>(x) * 4u;
+                INFO("texel (" << x << "," << y << ")");
+                CHECK(actual[0] == static_cast<float>(x));
+                CHECK(actual[1] == static_cast<float>(y));
+                CHECK(actual[2] == 0.5f);
+            }
+        }
+    }
+
+    TEST_CASE("texture upload rejects a buffer that is too small")
+    {
+        GraphicsDevice* device = GetDevice();
+        if (device == nullptr)
+        {
+            WARN("No graphics device; upload needs one");
+            return;
+        }
+
+        TextureDesc desc;
+        desc.Name = "short upload";
+        desc.Width = 16;
+        desc.Height = 16;
+        desc.Format = GraphicsFormat::Rgba32Float;
+        Core::Ref<Texture> texture = Texture::Create(*device, desc);
+        REQUIRE(texture != nullptr);
+
+        // Half the bytes needed. Copying anyway reads past the caller's buffer — an ASan catch at best and a silently
+        // half-uploaded texture at worst, which surfaces as a wrong image far from here.
+        std::vector<float> tooSmall(16u * 4u, 1.0f);
+
+        {
+            Test::ScopedLogCapture logs;
+            CHECK_FALSE(texture->Update(*device, tooSmall.data(), tooSmall.size() * sizeof(float)));
+            CHECK(logs.AnyMessageContains("bytes supplied"));
+        }
+
+        // A pitch narrower than one row is rejected for the same reason: the copy would read overlapping rows and
+        // smear rather than fail.
+        std::vector<float> enoughBytes(16u * 16u * 4u, 1.0f);
+        {
+            Test::ScopedLogCapture logs;
+            CHECK_FALSE(texture->Update(*device, enoughBytes.data(), enoughBytes.size() * sizeof(float), 8u));
+            CHECK(logs.AnyMessageContains("narrower than one row"));
+        }
+
+        // Null pixels with a non-zero count is a caller bug worth catching rather than memcpy'ing from.
+        {
+            Test::ScopedLogCapture logs;
+            CHECK_FALSE(texture->Update(*device, nullptr, 64u));
+            CHECK(logs.AnyMessageContains("null pixels"));
+        }
     }
 
     TEST_CASE("wrappers reject invalid configurations instead of creating broken resources")

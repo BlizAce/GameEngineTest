@@ -164,4 +164,114 @@ std::vector<UInt8> Texture::ReadBack(GraphicsDevice& device, UInt32& outRowPitch
     return pixels;
 }
 
+bool Texture::Update(GraphicsDevice& device, const void* pixels, size_t byteCount, UInt32 rowPitchBytes)
+{
+    if (!IsValid())
+    {
+        HP_LOG_ERROR("GRAPHICS", "Texture::Update on an invalid texture");
+        return false;
+    }
+    if (pixels == nullptr)
+    {
+        HP_LOG_ERROR("GRAPHICS", "Texture::Update called with null pixels for \"{}\"", m_Desc.Name);
+        return false;
+    }
+
+    nvrhi::IDevice* rhi = device.GetNativeDevice();
+    if (rhi == nullptr)
+    {
+        return false;
+    }
+
+    // Only the base mip level: partial-mip and subresource uploads belong with the asset streamer, where they can be
+    // batched. Accepting a mip index here would invite callers to assume it regenerates the chain, which nothing does.
+    const UInt32 bytesPerPixel = Detail::BytesPerPixel(m_Desc.Format);
+    if (bytesPerPixel == 0u)
+    {
+        HP_LOG_ERROR("GRAPHICS", "Texture::Update: format of \"{}\" has no known texel size", m_Desc.Name);
+        return false;
+    }
+
+    const UInt32 pitch = rowPitchBytes != 0u ? rowPitchBytes : static_cast<UInt32>(m_Desc.Width) * bytesPerPixel;
+    if (pitch < static_cast<UInt32>(m_Desc.Width) * bytesPerPixel)
+    {
+        // A pitch smaller than one row means the copy would read overlapping rows and produce a smeared texture
+        // rather than failing. Reject it: this is the kind of off-by-one that survives to look like a broken importer.
+        HP_LOG_ERROR("GRAPHICS", "Texture::Update: rowPitchBytes {} is narrower than one row ({} bytes) for \"{}\"",
+                     pitch, static_cast<UInt32>(m_Desc.Width) * bytesPerPixel, m_Desc.Name);
+        return false;
+    }
+
+    const size_t requiredBytes = static_cast<size_t>(pitch) * m_Desc.Height;
+    if (byteCount < requiredBytes)
+    {
+        HP_LOG_ERROR("GRAPHICS", "Texture::Update: {} bytes supplied, {} needed for \"{}\" ({}x{}, pitch {})",
+                     byteCount, requiredBytes, m_Desc.Name, m_Desc.Width, m_Desc.Height, pitch);
+        return false;
+    }
+
+    // Write side of the staging pair. Created from this texture's own descriptor so the CPU layout NVRHI chooses is by
+    // construction the one the copy expects — hand-building a desc is how format mismatches get baked in silently.
+    const nvrhi::TextureDesc gpuDesc = m_Impl->Handle->getDesc();
+
+    nvrhi::StagingTextureHandle staging = rhi->createStagingTexture(gpuDesc, nvrhi::CpuAccessMode::Write);
+    if (!static_cast<bool>(staging))
+    {
+        HP_LOG_ERROR("GRAPHICS", "createStagingTexture failed for update of \"{}\"", m_Desc.Name);
+        return false;
+    }
+
+    size_t stagingRowPitch = 0;
+    void* mapped =
+        rhi->mapStagingTexture(staging, nvrhi::TextureSlice(), nvrhi::CpuAccessMode::Write, &stagingRowPitch);
+    if (mapped == nullptr)
+    {
+        HP_LOG_ERROR("GRAPHICS", "mapStagingTexture failed for update of \"{}\"", m_Desc.Name);
+        return false;
+    }
+
+    // Row by row: the caller's pitch and NVRHI's staging pitch are independent, and assuming either matches the
+    // texture width is the bug this loop exists to prevent. Staging may be padded, and its padding is undefined — so
+    // only the meaningful bytes of each row are written, exactly as ReadBack only returns them.
+    auto* destination = static_cast<UInt8*>(mapped);
+    const auto* source = static_cast<const UInt8*>(pixels);
+    const size_t rowBytes = static_cast<size_t>(m_Desc.Width) * bytesPerPixel;
+    for (UInt32 row = 0; row < m_Desc.Height; ++row)
+    {
+        std::memcpy(destination + stagingRowPitch * row, source + static_cast<size_t>(pitch) * row, rowBytes);
+    }
+
+    rhi->unmapStagingTexture(staging);
+
+    nvrhi::CommandListHandle commandList = rhi->createCommandList();
+    if (!static_cast<bool>(commandList))
+    {
+        HP_LOG_ERROR("GRAPHICS", "createCommandList failed for update of \"{}\"", m_Desc.Name);
+        return false;
+    }
+
+    commandList->open();
+    // The destination needs an explicit state: NVRHI does not insert barriers implicitly and an undefined layout is
+    // silent corruption on a host without validation. (Only the destination — IStagingTexture is an IResource, not an
+    // ITexture, so it cannot be transitioned at all; NVRHI manages staging internally, which is also why ReadBack
+    // transitions just its GPU side.) The texture is then returned to its creation state, since every draw path here
+    // relies on keepInitialState and would otherwise find a texture parked in a transfer layout.
+    commandList->setTextureState(m_Impl->Handle, nvrhi::AllSubresources, nvrhi::ResourceStates::CopyDest);
+    commandList->copyTexture(m_Impl->Handle, nvrhi::TextureSlice(), staging, nvrhi::TextureSlice());
+    commandList->setTextureState(m_Impl->Handle, nvrhi::AllSubresources,
+                                 gpuDesc.keepInitialState ? gpuDesc.initialState : nvrhi::ResourceStates::Common);
+    commandList->close();
+
+    nvrhi::ICommandList* rawCommandList = commandList;
+    rhi->executeCommandLists(&rawCommandList, 1);
+
+    if (!rhi->waitForIdle())
+    {
+        HP_LOG_ERROR("GRAPHICS", "waitForIdle failed during update of \"{}\" (device lost?)", m_Desc.Name);
+        return false;
+    }
+
+    return true;
+}
+
 }  // namespace Hollowpoint::Graphics

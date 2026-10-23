@@ -1250,3 +1250,40 @@ Four commits, each green on debug and ASan before the next started:
   reference into an HDR target (no swapchain needed — same readback trick), then (b) swapchain + present as the thin
   final slice, or (c) jump to M2 scene components (Camera/Light/Script registration, MeshRenderer, scene v1 schema) to
   get content flowing before more renderer polish. Recommend (a) then (c).
+
+### Session 14 (cont.) — self-review finds: scale-dependent epsilon, and a promise the code did not keep
+
+Continuing on my own output rather than adding features, because that is where this project's bugs have consistently
+been. Four real defects found in code I had just written and called green:
+
+1. **Scale-dependent singularity test.** `ComputeWorldNormal` asserted `|det| > 1e-8`. Determinant grows as scale³, so
+   any object below ~0.2 units (a 2 mm prop at metric scale → det 8e-9) tripped it, while a collapsed basis on a *large*
+   object passed. Magnitude was the wrong axis entirely. Replaced with `|det| / Π‖columnᵢ‖`, which is exactly 1 for any
+   scale matrix and degrades only as axes collapse or go parallel — orientation quality, unit-free.
+2. **The inverse path was itself the hazard.** `Mat3::Inverse` rejects `|det| <= kDefaultAbsoluteEpsilon` (same absolute
+   test, now inside core math), and forming `1/det` lost accuracy at extreme scales — measured, a 1e6-uniform transform
+   returned a wrong normal. Normal matrices are cofactor/det and the result is normalised anyway, so the division was
+   never needed: switched to cofactors + a max-entry rescale, which is O(scale²) and magnitude-independent.
+3. **A documented promise the code did not keep.** The function claimed "NaN transform → unlit, not NaN"; its fallback
+   multiplied *through* the NaN matrix and returned NaN. Root cause worth remembering: `Vec3::Normalized`'s comment says
+   "never NaN", but its guard only catches underflow — length²(NaN) is NaN, passes `factor == 0`, multiplies through. An
+   explicit finiteness check now enforces the documented behaviour. (A docstring that overstates a helper's guarantee is
+   a latent bug in every caller that trusts it.)
+4. **Duplicated math with a comment claiming otherwise.** The GPU test built its normal matrix via
+   `Inverse().Transposed()` while its comment said it used "the same code path as the CPU reference". False, and it stayed
+   green through the entire cofactor change *because that scene's model matrix is identity* — the disagreement would have
+   appeared on the first rotated object. `ComputeNormalMatrix` is now public API and both sides call it: correctness
+   transfers by construction instead of by hope.
+
+**Coverage gap recorded, not papered over:** no GPU test yet exercises a non-identity normal matrix. A rotated cube shows
+two faces, so per-texel CPU comparison needs projected-polygon hit testing — deferred to the interpolated-normals work
+with the reason written down at the call site, rather than approximated by a weaker test that implies more than it checks.
+
+**Mutation testing earned its keep again:** transposing the cofactor placement fails exactly the equivalence test. That
+specific mutation is why the test covers rotations and shear — on symmetric bases (identity, axis-aligned scale) the two
+placements are indistinguishable, so an axis-aligned-only test would have passed a wrong implementation.
+
+**Environment trap:** debug and ASan presets share one FetchContent build dir; switching presets can leave a stale CMake
+PCH (`cmake_pch.hxx has been modified since the precompiled header was built`, for every Jolt TU). Fix is reconfiguring
+the target preset. Relatedly — and this bit three times before I enforced it — **a failed build leaves stale binaries and
+ctest still reports 100% pass**. Check the build's exit code, always; "100% tests passed" after `BUILD=1` means nothing.

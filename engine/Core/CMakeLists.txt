@@ -15,6 +15,7 @@ target_include_directories(HollowpointCore PUBLIC
 target_sources(HollowpointCore PRIVATE
     Include/Hollowpoint/Core/API.h
     Include/Hollowpoint/Core/Assert.h
+    Include/Hollowpoint/Core/FileSystem.h
     Include/Hollowpoint/Core/EngineVersion.h
     Include/Hollowpoint/Core/Format.h
     Include/Hollowpoint/Core/Guid.h
@@ -27,6 +28,7 @@ target_sources(HollowpointCore PRIVATE
     Include/Hollowpoint/Core/Time.h
     Include/Hollowpoint/Core/Types.h
     Src/Assert.cpp
+    Src/FileSystem.cpp
     Src/Guid.cpp
     Src/Hash.cpp
     Src/Log.cpp

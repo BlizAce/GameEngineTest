@@ -132,6 +132,7 @@ if(TARGET HollowpointCore)
     hp_add_module_test(Core
         SOURCES
             Core/TestAssert.cpp
+            Core/TestFileSystem.cpp
             Core/TestGuid.cpp
             Core/TestHash.cpp
             Core/TestLog.cpp

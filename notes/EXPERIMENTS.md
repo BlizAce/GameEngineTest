@@ -1587,3 +1587,56 @@ submits and the wait. Recorded as an accepted cost with a named upgrade path, no
 **Also:** `Texture::CreateWrapping` (swapchain back buffers wrapped as engine textures) made private with
 `friend class Swapchain` — a public "wrap any native handle" would let `GetDesc()` disagree with the real image, and
 every readback path trusts `GetDesc()` implicitly to decode by format.
+
+### Session 14 (cont. 8) — the frame ring, and NVRHI's event queries not meaning what they say
+
+M1c/M1d: a frame-slot ring so per-frame writes cannot outrun the GPU, plus the swapchain pixel readback that proves
+presentation end-to-end. Debug + ASan green at 29 targets (FrameRing 9 cases / 116 assertions; Swapchain 11 / 121).
+
+**The API facts that shaped the design came from NVRHI's implementation, not its headers.** Three of its event-query
+semantics are surprising and each forced a different decision:
+
+| fact (read from `vulkan-queries.cpp` / `vulkan-queue.cpp`) | consequence |
+|---|---|
+| `setEventQuery` snapshots `getLastSubmittedID()` at call time | must be called *after* the frame's submissions — EndFrame's contract |
+| a query may only be armed while its id is 0; in release the assert vanishes and a re-set silently re-targets it | EndFrame checks its own invariant instead of trusting NVRHI |
+| `pollCommandList(0)` returns **false forever** | an un-armed query reads as *permanently busy* |
+
+That last one is the interesting bug I did not ship. Arming a query on a queue that has never submitted records id 0, so
+the slot can never complete: `BeginFrame(waitForFree=false)` returns Waiting forever and a skip-frame loop starves. It
+triggers on ending a frame before anything is drawn — load-time warm-up, a fully-culled frame, any test. Fix: one
+bootstrap empty submission at `Create`, which makes the id non-zero for the ring's whole life (`Queue::submit` increments
+and signals its tracking timeline semaphore even with zero command buffers). The obvious alternative — an empty submit
+per `EndFrame` — is correct but costs a submission per frame for a condition that can only ever be true once.
+
+**Two of my test expectations were wrong and the ring was right.** The instructive one passed in debug and failed under
+ASan: it asserted about slot reuse after ending only one of two slots, leaving the other held forever, so `Full` was the
+correct answer. Debug passed by luck — a pending completion query happened to change which slot the cursor inspected.
+Moral for GPU tests: if an assertion can be influenced by whether GPU work has finished yet, assert the waiting form;
+and run repeats on both builds, because "it passed once" is not determinism.
+
+**Coverage found by mutation, not by writing tests.** Removing `BeginFrame`'s wait gate → caught (invariant assert).
+Polling blindly instead of checking the pending flag → caught (3 assertions). **Removing the bootstrap submission →
+caught by nothing**, because submission ids are per-`VkDevice` and every case shared one device that had already drawn, so
+no existing test could reach id 0. Required a case with its own fresh `GraphicsDevice`. This is the second time this
+session a mutation revealed an untestable-here gap (the present-mode fallback was the first); both were only found
+because the mutant was run rather than assumed caught.
+
+**Back-buffer readback, which no earlier presentation test could do.** Clearing (160, 32, 96) through the engine's own
+wrapper and comparing every texel against the reported `GraphicsFormat`'s channel order is the first check that would
+notice a BGRA/RGBA mapping error — all previous tests stayed green under that mutation. Needed `Swapchain::GetTexture`
+(the colour texture, alongside the existing render-target accessor) and `VK_IMAGE_USAGE_TRANSFER_SRC` on the swapchain:
+presentation needs only `COLOR_ATTACHMENT`, so this is capability, not a fix, and it is what lets the engine screenshot
+itself. Mapping `B8G8R8A8_UNORM` to `Rgba8Unorm` now fails two independent checks (76,800 mismatching texels + the
+driver-side format comparison).
+
+The test itself failed on correct code first: its byte conversion truncated a normalised float instead of scaling by 255,
+so it expected black. Fitting, since channel-order mistakes are exactly what it hunts; expected bytes are now computed
+explicitly rather than compared as floats.
+
+**Also:** the doc example for the swapchain's format named an sRGB format while `ChooseSurfaceFormat` deliberately avoids
+sRGB (the blit writes display-encoded values; an sRGB-decoded image would gamma twice). Corrected to what this host
+reports — plain 8-bit UNORM BGRA.
+
+**Status, stated plainly:** the ring has tests and no production caller — there is no application frame loop and no
+executable target yet. "The renderer can no longer overwrite in-flight buffers" is not true until that loop exists.

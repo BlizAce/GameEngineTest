@@ -509,7 +509,12 @@ struct Swapchain::Impl
         createInfo.imageColorSpace = chosen.colorSpace;
         createInfo.imageExtent = extent;
         createInfo.imageArrayLayers = 1;
-        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        // TRANSFER_SRC is not needed to present; it is here because reading a presented frame back is the only way to
+        // verify the presentation path end-to-end (a test can render a known colour into a back buffer and compare the
+        // pixels), and because screenshot support — editor, bug reports, automated visual regression — needs the same
+        // capability. On tile-based GPUs an extra usage bit can cost memory tiling flexibility; on the desktop drivers
+        // this engine targets it is free, and "we could not take a screenshot of what we presented" is the alternative.
+        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         // The compositor's transform rather than IDENTITY: on a rotated display, asking for IDENTITY and rendering
         // unrotated produces a sideways image — passing it through lets the compositor compensate.
@@ -744,6 +749,15 @@ RenderTarget* Swapchain::GetRenderTarget(UInt32 index) const noexcept
         return nullptr;
     }
     return m_Impl->Targets[index].Get();
+}
+
+Texture* Swapchain::GetTexture(UInt32 index) const noexcept
+{
+    if (m_Impl == nullptr || index >= m_Impl->Textures.size())
+    {
+        return nullptr;
+    }
+    return m_Impl->Textures[index].Get();
 }
 
 UInt32 Swapchain::GetWidth() const noexcept

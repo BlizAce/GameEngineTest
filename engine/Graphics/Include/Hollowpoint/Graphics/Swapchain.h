@@ -130,9 +130,14 @@ public:
     [[nodiscard]] UInt32 GetBackBufferCount() const noexcept;
 
     //! The render target for image `index`, already paired with this swapchain's shared depth attachment. Format is
-    //! whatever the compositor chose (BK8G8R8A8_SRGB on most Linux compositors), NOT necessarily Rgba16Float — which is
+    //! whatever the compositor chose (8-bit UNORM BGRA on this host — see GetColourFormat), never Rgba16Float, which is
     //! why an HDR forward pass renders to its own target and this receives a tonemapped blit rather than radiance.
     [[nodiscard]] RenderTarget* GetRenderTarget(UInt32 index) const noexcept;
+
+    //! The colour texture behind image `index` — the same object GetRenderTarget's framebuffer draws into, exposed so
+    //! it can be sampled or read back (screenshots, visual regression). Borrowed: the VkImage belongs to the
+    //! VkSwapchainKHR, so this must not outlive the swapchain. Null for an out-of-range index.
+    [[nodiscard]] Texture* GetTexture(UInt32 index) const noexcept;
 
     [[nodiscard]] UInt32 GetWidth() const noexcept;
     [[nodiscard]] UInt32 GetHeight() const noexcept;

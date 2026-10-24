@@ -524,6 +524,112 @@ TEST_SUITE("Graphics/Swapchain")
         }
     }
 
+    // What the rest of this suite cannot do: prove a frame rendered through the engine's own back-buffer wrappers
+    // arrives as the pixels the format mapping claims. Everything else checks API-level correctness (creation succeeds,
+    // targets are usable attachments), which would still hold if ToEngineFormat picked a channel order that made every
+    // presented frame a colour swap. Reading actual bytes back is the only check that closes that loop.
+    TEST_CASE("a colour cleared through a back buffer reads back with the mapped channel order (display required)")
+    {
+        ScopedPresentableWindow window;
+        SKIP_WITHOUT_DISPLAY(window);
+
+        GraphicsDevice& device = window.GetDevice();
+
+        SwapchainDesc desc;
+        desc.Width = kWidth;
+        desc.Height = kHeight;
+        desc.Name = "test-swapchain-readback";
+
+        Ref<Swapchain> swapchain = Swapchain::Create(device, desc);
+        REQUIRE(swapchain != nullptr);
+
+        const GraphicsFormat format = swapchain->GetColourFormat();
+        INFO("surface format: " << static_cast<int>(format));
+        // 8-bit UNORM formats only: the byte-level expectation below decodes the clear colour by hand, which is exact
+        // for 4x8 and meaningless for float formats. This host reports a BGRA/RGBA 8-bit surface.
+        REQUIRE((format == GraphicsFormat::Bgra8Unorm || format == GraphicsFormat::Rgba8Unorm));
+
+        RenderTarget* target = swapchain->GetRenderTarget(0);
+        REQUIRE(target != nullptr);
+        Texture* backBuffer = swapchain->GetTexture(0);
+        REQUIRE(backBuffer != nullptr);
+
+        // Clear through NVRHI using the engine's own wrapper, so what is verified is the wrapper + format pairing and
+        // not a separately-created texture. An unmistakable colour with distinct channels: a channel-order bug cannot
+        // turn (160, 32, 96) into itself.
+        nvrhi::IDevice* rhi = device.GetNativeDevice();
+        REQUIRE(rhi != nullptr);
+
+        constexpr float kRed = 160.0f / 255.0f;
+        constexpr float kGreen = 32.0f / 255.0f;
+        constexpr float kBlue = 96.0f / 255.0f;
+
+        nvrhi::CommandListHandle commandList = rhi->createCommandList();
+        commandList->open();
+        commandList->setTextureState(backBuffer->GetNativeTexture(), nvrhi::AllSubresources,
+                                     nvrhi::ResourceStates::RenderTarget);
+        commandList->clearTextureFloat(backBuffer->GetNativeTexture(), nvrhi::TextureSubresourceSet(),
+                                       nvrhi::Color(kRed, kGreen, kBlue, 1.0f));
+        commandList->close();
+
+        nvrhi::ICommandList* raw = commandList;
+        rhi->executeCommandLists(&raw, 1);
+
+        // ReadBack transitions to copy-source and copies — which is why the swapchain requests TRANSFER_SRC on its
+        // images (see Build()); without it this call fails rather than returning wrong data.
+        UInt32 rowPitch = 0;
+        const std::vector<UInt8> pixels = backBuffer->ReadBack(device, rowPitch);
+        REQUIRE_FALSE(pixels.empty());
+        REQUIRE(rowPitch >= swapchain->GetWidth() * 4u);
+
+        // Decode by the format the swapchain reported, then require the bytes to match. If ToEngineFormat and the
+        // NVRHI mapping disagreed about BGRA vs RGBA, the read-back bytes would be swapped against this expectation.
+        // Scale the normalised clear colour to bytes and round, matching what an 8-bit UNORM target stores. Written
+        // explicitly rather than compared as floats because the whole point is a byte-level channel-order check.
+        const auto byteOf = [](float channel) { return static_cast<UInt8>(channel * 255.0f + 0.5f); };
+        const UInt32 firstByte = 0;
+
+        // Every texel must carry the clear colour, not just the first: a partially-written or mis-strided buffer shows
+        // up as later rows differing, which is exactly what an ignored row pitch produces.
+        UInt32 mismatchingTexels = 0;
+        for (UInt32 y = 0; y < swapchain->GetHeight(); ++y)
+        {
+            const UInt8* row = pixels.data() + static_cast<size_t>(y) * rowPitch;
+            for (UInt32 x = 0; x < swapchain->GetWidth(); ++x)
+            {
+                const UInt8* texel = row + static_cast<size_t>(x) * 4u;
+                const bool bgraMatches = texel[0] == byteOf(kBlue) && texel[1] == byteOf(kGreen) &&
+                                         texel[2] == byteOf(kRed) && texel[3] == 255;
+                const bool rgbaMatches = texel[0] == byteOf(kRed) && texel[1] == byteOf(kGreen) &&
+                                         texel[2] == byteOf(kBlue) && texel[3] == 255;
+
+                // Exactly one of the two orders may match, and it must be the one the reported format says.
+                const bool expectedMatches = format == GraphicsFormat::Bgra8Unorm ? bgraMatches : rgbaMatches;
+                if (!expectedMatches)
+                {
+                    ++mismatchingTexels;
+                }
+            }
+        }
+
+        INFO("first texel bytes: " << static_cast<int>(pixels[firstByte]) << ", "
+                                   << static_cast<int>(pixels[firstByte + 1]) << ", "
+                                   << static_cast<int>(pixels[firstByte + 2]) << ", "
+                                   << static_cast<int>(pixels[firstByte + 3]));
+        CHECK_MESSAGE(mismatchingTexels == 0u, mismatchingTexels << " texels did not match the cleared colour");
+
+        // Presenting after a readback must still work: ReadBack leaves the image in copy-source layout via NVRHI's
+        // tracker while the swapchain tracks its own transitions, and a presented frame that showed stale or discarded
+        // contents here would mean those two disagree in a way that matters to real rendering.
+        const AcquiredImage acquired = swapchain->Acquire();
+        if (acquired.Status == AcquireStatus::Success)
+        {
+            CHECK(swapchain->Present(acquired.ImageIndex));
+        }
+
+        device.WaitForIdle();
+    }
+
     TEST_CASE("presenting the same image twice is refused (display required)")
     {
         ScopedPresentableWindow window;

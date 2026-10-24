@@ -209,6 +209,14 @@ if(TARGET HollowpointRenderer)
         LIBS Hollowpoint::Renderer Hollowpoint::Graphics Hollowpoint::Platform
         NO_LEAK_CHECK)
 
+    # The scene → renderer bridge, and its reflection registration. Both run with no device: GeometryResolver is an
+    # injected function pointer and the round-trip test drives text through SceneIO, so neither needs a swapchain and
+    # both keep full leak checking despite linking Graphics for CullMode alone.
+    hp_add_module_test(RenderPrimitives
+        SOURCES
+            Game/TestRenderPrimitives.cpp
+        LIBS Hollowpoint::Game)
+
     # CPU-only like the other shading references: no RHI, no GPU, full leak checking.
     hp_add_module_test(ImageBasedLighting
         SOURCES

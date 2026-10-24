@@ -27,6 +27,7 @@
     #define HP_ASSET_API
     #define HP_GRAPHICS_API
     #define HP_RENDERER_API
+    #define HP_GAME_API
     #define HP_PHYSICS_API
     #define HP_AUDIO_API
     #define HP_SCRIPTING_API
@@ -83,6 +84,12 @@
         #define HP_RENDERER_API HP_DLL_EXPORT
     #else
         #define HP_RENDERER_API HP_DLL_IMPORT
+    #endif
+
+    #ifdef HP_GAME_EXPORTS
+        #define HP_GAME_API HP_DLL_EXPORT
+    #else
+        #define HP_GAME_API HP_DLL_IMPORT
     #endif
 
     #ifdef HP_PHYSICS_EXPORTS

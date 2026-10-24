@@ -629,6 +629,98 @@ TEST_SUITE("Graphics/Swapchain")
         }
     }
 
+    // The fallback decision, tested headlessly. Doing this through Swapchain::Create cannot work: this host's surface
+    // offers all four Vulkan present modes, so every request is honoured and the downgrade branch — the one that was
+    // broken — never executes. Any test written against a real compositor here would assert only that support exists.
+    TEST_CASE("present mode resolution falls back to VSync when the request is unsupported")
+    {
+        // VSync asked, VSync available always (FIFO is required of every driver).
+        constexpr PresentModeSupport none{};
+        constexpr PresentModeSupport mailboxOnly{.Mailbox = true};
+        constexpr PresentModeSupport immediateOnly{.Immediate = true};
+        constexpr PresentModeSupport both{.Mailbox = true, .Immediate = true};
+
+        CHECK(ResolvePresentMode(PresentMode::VSync, none) == PresentMode::VSync);
+        CHECK(ResolvePresentMode(PresentMode::VSync, both) == PresentMode::VSync);
+
+        // The branches that matter: unsupported requests degrade, supported ones pass through.
+        CHECK(ResolvePresentMode(PresentMode::Mailbox, mailboxOnly) == PresentMode::Mailbox);
+        CHECK(ResolvePresentMode(PresentMode::Mailbox, immediateOnly) == PresentMode::VSync);
+        CHECK(ResolvePresentMode(PresentMode::Mailbox, none) == PresentMode::VSync);
+
+        CHECK(ResolvePresentMode(PresentMode::Immediate, immediateOnly) == PresentMode::Immediate);
+        CHECK(ResolvePresentMode(PresentMode::Immediate, mailboxOnly) == PresentMode::VSync);
+        CHECK(ResolvePresentMode(PresentMode::Immediate, none) == PresentMode::VSync);
+        CHECK(ResolvePresentMode(PresentMode::Immediate, both) == PresentMode::Immediate);
+
+        // Immediate and Mailbox must not be confused with each other: a resolver that returned the *other* unsupported
+        // mode rather than VSync would satisfy "not the requested one" while producing tearing where low latency was
+        // asked for, or vice versa.
+        CHECK(ResolvePresentMode(PresentMode::Mailbox, immediateOnly) != PresentMode::Immediate);
+        CHECK(ResolvePresentMode(PresentMode::Immediate, mailboxOnly) != PresentMode::Mailbox);
+    }
+
+    // That creation honours the resolved mode rather than re-deriving it. Stated limitation, because it matters for
+    // reading a green result here: on a host whose surface offers every present mode — this one exposes four — resolved
+    // and requested are always equal, so NOTHING can distinguish "passed the resolved mode" from "passed the requested
+    // mode" by observation, and this case proves only that GetPresentMode() agrees with ResolvePresentMode(). Verified:
+    // mutating `resolved` to be derived from desc.Mode instead of ActualMode leaves all 112 assertions passing on this
+    // machine. On a FIFO-only compositor the difference is observable — passing an unsupported mode through fails
+    // vkCreateSwapchainKHR, and the REQUIRE below fires rather than skipping quietly. The resolver's own branches are
+    // covered unconditionally by the headless case above; what is hardware-dependent is only whether creation uses it.
+    TEST_CASE("creation honours the resolved present mode (display required)")
+    {
+        ScopedPresentableWindow window;
+        SKIP_WITHOUT_DISPLAY(window);
+
+        GraphicsDevice& device = window.GetDevice();
+
+        nvrhi::IDevice* rhi = device.GetNativeDevice();
+        REQUIRE(rhi != nullptr);
+        const VkPhysicalDevice physical =
+            reinterpret_cast<VkPhysicalDevice>(rhi->getNativeObject(nvrhi::ObjectTypes::VK_PhysicalDevice).pointer);
+
+        const VkInstance instance =
+            reinterpret_cast<VkInstance>(rhi->getNativeObject(nvrhi::ObjectTypes::VK_Instance).pointer);
+        void* rawSurface = nullptr;
+        REQUIRE(window.GetHandle()->CreateVulkanSurface(instance, &rawSurface));
+        const VkSurfaceKHR surface = static_cast<VkSurfaceKHR>(rawSurface);
+
+        uint32_t modeCount = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &modeCount, nullptr);
+        std::vector<VkPresentModeKHR> offered(modeCount);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &modeCount, offered.data());
+        vkDestroySurfaceKHR(instance, surface, nullptr);
+        REQUIRE_FALSE(offered.empty());
+
+        // Support computed the way Build() does it, from the driver's list.
+        PresentModeSupport support;
+        support.Mailbox = std::find(offered.begin(), offered.end(), VK_PRESENT_MODE_MAILBOX_KHR) != offered.end();
+        support.Immediate = std::find(offered.begin(), offered.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != offered.end();
+
+        // Ask for the mode least likely to be honoured and check the swapchain reports exactly what the resolver says —
+        // not what was requested. On a host with everything this is a pass-through; on a FIFO-only compositor it is the
+        // downgrade, and either way GetPresentMode() must agree with ResolvePresentMode().
+        static constexpr PresentMode kRequests[] = {PresentMode::VSync, PresentMode::Mailbox, PresentMode::Immediate};
+        for (const PresentMode requested : kRequests)
+        {
+            SwapchainDesc desc;
+            desc.Width = kWidth;
+            desc.Height = kHeight;
+            desc.Mode = requested;
+
+            Ref<Swapchain> swapchain = Swapchain::Create(device, desc);
+            INFO("requested mode " << static_cast<int>(requested));
+            REQUIRE_MESSAGE(swapchain != nullptr, "an unsupported present mode must degrade rather than fail creation");
+
+            CHECK(swapchain->GetPresentMode() == ResolvePresentMode(requested, support));
+            // Whatever mode it settled on, the swapchain has to be usable — a fallback that produced a broken object
+            // would be no better than failing.
+            CHECK(swapchain->GetBackBufferCount() >= 2u);
+            CHECK(swapchain->GetRenderTarget(0) != nullptr);
+        }
+    }
+
     TEST_CASE("attaching to a device built without surface extensions says why (display required)")
     {
         PlatformScope* scope = GetDisplayScope();

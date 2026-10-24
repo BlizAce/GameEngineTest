@@ -64,7 +64,23 @@ enum class PresentMode : UInt8
     Immediate,
 };
 
-//! Result of Acquire(), which is the one place out-of-date conditions surface during normal rendering.
+//! Which of the engine's present modes a surface can actually do. VSync is absent because it needs no flag: Vulkan
+//! requires VK_PRESENT_MODE_FIFO_KHR of every driver, so "VSync unsupported" is not a state that can occur.
+struct PresentModeSupport
+{
+    bool Mailbox = false;
+    bool Immediate = false;
+};
+
+//! The mode to use, given what the surface offers. Public and separate from creation because it is worth testing
+//! directly: Vulkan requires `presentMode` to be among the modes a surface reports, so an unsupported request must
+//! degrade rather than reach vkCreateSwapchainKHR — yet on a host offering every mode (this one exposes four), going
+//! through Swapchain::Create can never demonstrate a fallback happening. Extracting the decision makes that branch
+//! testable headlessly and on any machine; creation then only has to honour what it returns.
+[[nodiscard]] HP_GRAPHICS_API PresentMode ResolvePresentMode(PresentMode requested,
+                                                             const PresentModeSupport& support) noexcept;
+
+
 enum class AcquireStatus : UInt8
 {
     Success,    //!< An image was acquired and may be rendered to.

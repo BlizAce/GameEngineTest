@@ -104,6 +104,23 @@ namespace
 
 }  // namespace
 
+PresentMode ResolvePresentMode(PresentMode requested, const PresentModeSupport& support) noexcept
+{
+    // VSync needs no check: VK_PRESENT_MODE_FIFO_KHR is required of every driver by the Vulkan spec, so it is both the
+    // fallback and always reachable. Anything unrecognised in `requested` lands there too rather than being passed on.
+    switch (requested)
+    {
+        case PresentMode::Mailbox:
+            return support.Mailbox ? PresentMode::Mailbox : PresentMode::VSync;
+        case PresentMode::Immediate:
+            return support.Immediate ? PresentMode::Immediate : PresentMode::VSync;
+        case PresentMode::VSync:
+            break;
+    }
+    return PresentMode::VSync;
+}
+
+
 struct Swapchain::Impl
 {
     GraphicsDevice* Device = nullptr;
@@ -442,19 +459,23 @@ struct Swapchain::Impl
 
         // FIFO is guaranteed by spec; a preference only applies if offered. Wayland compositors frequently expose FIFO
         // alone, so mailbox silently becoming VSync is normal — logged because it changes latency, not because it is
-        // an error.
-        const VkPresentModeKHR wanted = ToVkPresentMode(desc.Mode);
-        const bool haveWanted = std::find(modes.begin(), modes.end(), wanted) != modes.end();
-        ActualMode = haveWanted ? desc.Mode : PresentMode::VSync;
-        if (!haveWanted && desc.Mode != PresentMode::VSync)
+        // an error. The decision itself lives in ResolvePresentMode so it can be tested on a host that offers every
+        // mode, where creation alone cannot show a fallback happening.
+        PresentModeSupport support;
+        support.Mailbox = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end();
+        support.Immediate = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end();
+
+        ActualMode = ResolvePresentMode(desc.Mode, support);
+        if (ActualMode != desc.Mode)
         {
             HP_LOG_INFO("GRAPHICS", "{}: requested present mode unavailable, using VSync", desc.Name);
         }
 
-        // What is actually passed to vkCreateSwapchainKHR must be the RESOLVED mode. Using `wanted` here made an
-        // unsupported request (Mailbox on a FIFO-only Wayland compositor) fail vkCreateSwapchainKHR with
-        // VK_ERROR_INITIALIZATION_FAILED instead of falling back as the line above promises — the fallback was
-        // computed, logged, and then not used.
+        // What goes to vkCreateSwapchainKHR is the RESOLVED mode, never the requested one: Vulkan requires presentMode
+        // to be among those the surface reports. Passing `wanted` here (as an earlier revision did) made the fallback
+        // above dead code — computed, logged, and ignored — so a request the compositor does not support would fail
+        // creation instead of degrading. Found by reading rather than by failure: every run to date asked for VSync,
+        // which is always offered, making requested and resolved equal in practice.
         const VkPresentModeKHR resolved = ToVkPresentMode(ActualMode);
 
         // X11/Win32 report the window's size and it must be used; Wayland reports 0xFFFFFFFF ("undefined") and the

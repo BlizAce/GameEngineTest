@@ -18,7 +18,9 @@ target_include_directories(HollowpointGame PUBLIC
 
 target_sources(HollowpointGame PRIVATE
     Include/Hollowpoint/Game/MeshRenderer.h
+    Include/Hollowpoint/Game/RegisterGameTypes.h
     Include/Hollowpoint/Game/RenderPrimitives.h
+    Src/RegisterGameTypes.cpp
     Src/RenderPrimitives.cpp)
 
 target_link_libraries(HollowpointGame PUBLIC

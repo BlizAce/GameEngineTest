@@ -217,6 +217,11 @@ if(TARGET HollowpointRenderer)
             Game/TestRenderPrimitives.cpp
         LIBS Hollowpoint::Game)
 
+    hp_add_module_test(RegisterGameTypes
+        SOURCES
+            Game/TestRegisterGameTypes.cpp
+        LIBS Hollowpoint::Game Hollowpoint::Scene)
+
     # CPU-only like the other shading references: no RHI, no GPU, full leak checking.
     hp_add_module_test(ImageBasedLighting
         SOURCES

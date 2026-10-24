@@ -28,6 +28,7 @@ target_sources(HollowpointGraphics PRIVATE
     Include/Hollowpoint/Graphics/Texture.h
     Src/GlslangInclude.h
     Src/Buffer.cpp
+    Src/FrameRing.cpp
     Src/GraphicsDevice.cpp
     Src/Pipeline.cpp
     Src/RhiConversions.h

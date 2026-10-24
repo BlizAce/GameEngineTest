@@ -217,6 +217,14 @@ if(TARGET HollowpointRenderer)
             Game/TestRenderPrimitives.cpp
         LIBS Hollowpoint::Game)
 
+    # The frame ring tracks queue submissions, not presentation, so these run headlessly — no window, no display
+    # server. Leak checking stays off like the other GPU suites (the driver retains loader state for the process).
+    hp_add_module_test(FrameRing
+        SOURCES
+            Graphics/TestFrameRing.cpp
+        LIBS Hollowpoint::Graphics
+        NO_LEAK_CHECK)
+
     # Presentation runs against a real mapped window (NVRHI has no swapchain, so there is nothing to mock) and needs
     # leak checking off like the other GPU suites: the driver retains loader/D-Bus state for the process lifetime once a
     # surface exists. Cases WARN-and-skip when the host has no display.

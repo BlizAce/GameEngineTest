@@ -217,6 +217,15 @@ if(TARGET HollowpointRenderer)
             Game/TestRenderPrimitives.cpp
         LIBS Hollowpoint::Game)
 
+    # Presentation runs against a real mapped window (NVRHI has no swapchain, so there is nothing to mock) and needs
+    # leak checking off like the other GPU suites: the driver retains loader/D-Bus state for the process lifetime once a
+    # surface exists. Cases WARN-and-skip when the host has no display.
+    hp_add_module_test(Swapchain
+        SOURCES
+            Graphics/TestSwapchain.cpp
+        LIBS Hollowpoint::Graphics Hollowpoint::Platform
+        NO_LEAK_CHECK)
+
     # End-to-end: .hpscene on disk → Game bridge → a real indexed draw through the engine's own forward shaders, with
     # depth and back-face culling ON, compared pixel-to-CPU-reference. GPU-target policy (leak checking off) like the
     # other suites that draw.

@@ -207,6 +207,10 @@ Core::Ref<Pipeline> Pipeline::Create(GraphicsDevice& device, const PipelineDesc&
 
     nvrhi::RasterState raster;
     raster.cullMode = ToNvrhi(desc.TriangleCulling);
+    // Set explicitly rather than inherited: NVRHI's default (false → clockwise front) is the opposite of the
+    // counter-clockwise convention this engine's geometry and glTF both use, which silently inverts what culling keeps.
+    // See PipelineDesc::IsFrontFaceCounterClockwise.
+    raster.frontCounterClockwise = desc.IsFrontFaceCounterClockwise;
 
     nvrhi::DepthStencilState depth;
     depth.depthTestEnable = desc.IsDepthEnabled;

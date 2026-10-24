@@ -64,6 +64,19 @@ struct PipelineDesc
     //! a collision GCC rejects outright (-Wchanges-meaning), which is cheaper than discovering it in a header.
     CullMode TriangleCulling = CullMode::Back;
 
+    //! Winding that counts as front-facing. **Counter-clockwise**, matching glTF, gl and Vulkan's own default for a
+    //! Y-down framebuffer — and the winding MakeCube/MakePlane emit (their triangles' geometric normal agrees with
+    //! their stored vertex normal on all 12 cube triangles, measured).
+    //!
+    //! This field exists because NVRHI's RasterState defaults `frontCounterClockwise` to **false**, which asks Vulkan
+    //! for a *clockwise* front face. Left at that default, back-face culling discards the faces pointing at the camera
+    //! and keeps the ones pointing away — so the first mesh ever drawn with the engine's stated "back-face culling on"
+    //! default rendered its own interior, shading as dot(N,V) ≈ −1 (measured: −0.9999 on a face-on cube, where +1 is
+    //! correct). Disabling culling hid it, which is why every test written before this field passed: each one set
+    //! TriangleCulling = None, so the winding question never came up. Same class as PipelineDesc's other explicit
+    //! defaults above — a library default that reads as an obvious choice and isn't.
+    bool IsFrontFaceCounterClockwise = true;
+
     bool IsDepthEnabled = true;
     CompareFunction DepthFunction = CompareFunction::LessEqual;
     bool IsDepthWriteEnabled = true;

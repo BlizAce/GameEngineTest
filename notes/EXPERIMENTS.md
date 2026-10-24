@@ -1520,3 +1520,70 @@ final `OutColor` line of the generated fragment shader with diagnostics — accu
 (`-ltc | count`) instead of estimated, so they can be re-derived rather than remembered.
 
 Debug + ASan green at 27 targets, format clean. Commits `24034ae` (fix), `213d02b` (test).
+
+### Session 14 (cont. 7) — presentation: a hang that was my own missing fence, and proving it
+
+Three bugs in the first real presentation path, one of them an intermittent driver hang whose cause I initially
+misassigned to the environment. Debug + ASan green at 28 targets.
+
+**Bug 1 — every display test skipped, and looked like a pass.** The swapchain suite was written against a device
+created *before* reading the window's required Vulkan instance extensions. `GraphicsDevice` builds its own
+`VkInstance`, and `VK_KHR_wayland_surface` is an *instance* extension, so `AttachWindow` returned false and each case
+WARNed and returned. Six "passing" tests carried 5 assertions between them. The tell was that ratio, not any failure:
+**assertion count per test case is the cheap detector of a vacuous suite**, and it is now checked whenever a suite
+looks green after being written. Fixing the order (scope → window → read extensions → create device) took the same
+suite to 8 cases / 86 assertions with zero skips.
+
+Also added so this cannot recur quietly: `AttachWindow`'s failure message now names the likely cause (`VK_KHR_surface`
+absent from this instance, with instructions) instead of "could not create a Vulkan surface", because the follow-on
+symptom — every later presentation call reporting *no window attached* while the window is plainly there — points at
+the wrong object. The enabled-extension list is recorded at device creation because Vulkan cannot report it afterwards.
+
+**Bug 2 — `presentMode` fallback computed, logged, and then ignored.** `Build()` resolved an unsupported present mode
+to VSync, logged the downgrade, and passed the *requested* mode to `vkCreateSwapchainKHR`. Not observed failing here
+because every test asks for VSync, which is always offered, so requested and resolved were equal in all runs — the bug
+was invisible by construction. Fixed and commented as such (claiming an observation I did not make would be worse than
+the bug).
+
+**Bug 3 — the interesting one: `vkDeviceWaitIdle` hanging inside `libnvidia-glcore`.** Intermittent, roughly one full
+suite run in eight. Backtrace put it in the test's own `device.WaitForIdle()` after the acquire/present loop, with a
+driver worker thread parked alongside. I first concluded it was environmental (compositor/GLDriver flakiness) and moved
+on. That was wrong, and the way I found out was to stop guessing:
+
+- The transition path used **one command buffer, submitted twice per frame, re-recorded with no fence anywhere in the
+  file** (`grep -c VkFence` → 0). Two valid-usage rules this violates:
+  1. `vkResetCommandBuffer`/`vkBeginCommandBuffer` on a still-executing command buffer is undefined behaviour.
+  2. `vkAcquireNextImageKHR` requires its semaphore to have no uncompleted signal or wait pending; the empty submit
+     issued after an acquire is what consumes that signal, so the *next* acquire must not start before it finishes —
+     otherwise a still-busy binary semaphore is signalled again.
+- Fix: one command buffer + one fence (signalled at creation), waited at the top of `Acquire()` **before**
+  `vkAcquireNextImageKHR` (rule 2's actual requirement) and before re-recording (rule 1). A `TransitionPending` flag is
+  required, not tidiness: both sites wait, so without it the second wait of a frame blocks on a fence nothing will ever
+  signal and burns the full timeout.
+- Also added `vkDeviceWaitIdle` to `Impl::Destroy()`. Resize already did this; the destruction path did not, and
+  "the caller remembered to idle first" is not something owning those semaphores can assume.
+
+**Proving it was the fence and not luck.** A/B on the same machine, sequential, 40 full-suite runs each, 30 s budget:
+
+| phase | runs | hangs | rate |
+|---|---|---|---|
+| A — pre-fix (no fence, no waits, no destroy-time idle) | 40 | 6 | 15.0% |
+| B — fixed | 40 | 0 | 0% |
+
+One-tailed Fisher exact **p ≈ 0.013**. Two earlier attempts at this experiment produced *meaningless* results, both
+worth remembering as failure modes of A/B work rather than as evidence:
+
+- One phase's edits failed to compile and the script measured the **previous binary anyway** — reporting "25/25 clean"
+  for code that was never built. A build-failure check and a `source -nt binary` check are now part of the harness.
+- Another disabled only *some* of the changes, so a clean result could not speak for the rest. Phase A now reverts all
+  four synchronisation edits with asserted anchors, and phase B is verified byte-identical to the known-good file.
+
+**Cost, stated rather than hidden.** The fence bounds how far the CPU runs ahead of the GPU to about one frame, because
+a Vulkan queue completes submissions in order and the waited submit sits behind the frame's draws. Under VSync/FIFO —
+the only mode guaranteed everywhere — the next acquire imposes that pacing anyway, so it is free in the default
+configuration; with `PresentMode::Immediate` it is a real throttle. Timeline semaphores would remove both per-frame
+submits and the wait. Recorded as an accepted cost with a named upgrade path, not as an oversight.
+
+**Also:** `Texture::CreateWrapping` (swapchain back buffers wrapped as engine textures) made private with
+`friend class Swapchain` — a public "wrap any native handle" would let `GetDesc()` disagree with the real image, and
+every readback path trusts `GetDesc()` implicitly to decode by format.

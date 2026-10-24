@@ -75,6 +75,19 @@ Core::Ref<Texture> Texture::Create(GraphicsDevice& device, const TextureDesc& de
     return texture;
 }
 
+Core::Ref<Texture> Texture::CreateWrapping(const TextureDesc& desc, nvrhi::ITexture* native)
+{
+    // No creation and no ownership transfer: `native` is borrowed (the swapchain owns the underlying image), and the
+    // handle stored here is a strong NVRHI reference to the wrapper object, not to the VkImage. Callers must destroy
+    // the returned Texture before whatever owns the image — Swapchain documents that ordering at its Destroy().
+    assert(native != nullptr && "Texture::CreateWrapping requires a valid native texture");
+
+    Core::Ref<Texture> texture = Core::Ref<Texture>(new Texture());
+    texture->m_Desc = desc;
+    texture->m_Impl = new TextureImpl{nvrhi::TextureHandle(native)};
+    return texture;
+}
+
 Texture::~Texture()
 {
     delete m_Impl;

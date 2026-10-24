@@ -115,6 +115,16 @@ protected:
 private:
     Texture() = default;
 
+    //! Wraps an already-existing NVRHI texture — a swapchain back buffer, whose VkImage is owned by the
+    //! VkSwapchainKHR rather than allocated here — in an engine Texture so RenderTarget/Pipeline code can consume it
+    //! like any other. Private because a caller that wraps an arbitrary native handle can produce a Texture whose
+    //! GetDesc() disagrees with the real image, and every readback path trusts GetDesc() implicitly (see its note on
+    //! decoding by format). Only Swapchain allocates such images, so only it may do this; same reasoning as
+    //! RenderTarget's `friend class Pipeline`.
+    [[nodiscard]] static Core::Ref<Texture> CreateWrapping(const TextureDesc& desc, nvrhi::ITexture* native);
+
+    friend class Swapchain;
+
     TextureDesc m_Desc;
 
     // Holds the nvrhi::TextureHandle. Defined in Src/Texture.cpp; pimpl rationale as in Buffer.h. Owned.

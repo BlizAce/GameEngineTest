@@ -178,6 +178,14 @@ public:
     //!
     //! Safe to call more than once with the same window. Passing nullptr detaches. Returns false when surface
     //! creation failed (no compositor, or a backend that cannot present).
+    //!
+    //! **The device must have been created with this window's instance extensions**, i.e. pass
+    //! `window->GetRequiredVulkanInstanceExtensions()` into GraphicsDeviceDesc::ExtraInstanceExtensions *before*
+    //! Create(). The instance is built inside this class, and VK_KHR_wayland_surface/_xlib are instance extensions: a
+    //! device created without them returns false here with the cause logged only as "could not create a Vulkan
+    //! surface", and every later presentation call then reports "no window attached" — naming the symptom, not the
+    //! cause. The required order is therefore scope → window → read its extensions → create device, which is also what
+    //! an application must do; nothing here can detect or repair the wrong order after the fact.
     bool AttachWindow(Platform::Window* window);
 
     [[nodiscard]] bool HasWindow() const noexcept;
@@ -206,6 +214,14 @@ public:
 
 private:
     GraphicsDevice();
+
+    //! Native handles for the swapchain, described with the friendship below. Returned as void* so this header stays
+    //! free of Vulkan includes — the whole reason GraphicsDevice.h is cheap to include.
+    [[nodiscard]] void* GetNativeVkDevice() const noexcept;
+    [[nodiscard]] void* GetNativeVkQueue() const noexcept;
+
+    //! The surface created by AttachWindow, or null. Owned by this class — Swapchain must never destroy it.
+    [[nodiscard]] void* GetNativeVkSurface() const noexcept;
 
     //! Swapchain needs the raw VkDevice/VkQueue/surface that this class owns but does not expose: NVRHI has no
     //! swapchain support at all (its Tutorial.md states this outright and defers to Donut's DeviceManager), so the

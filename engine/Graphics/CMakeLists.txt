@@ -24,6 +24,7 @@ target_sources(HollowpointGraphics PRIVATE
     Include/Hollowpoint/Graphics/RhiAccess.h
     Include/Hollowpoint/Graphics/ShaderBindings.h
     Include/Hollowpoint/Graphics/ShaderCompiler.h
+    Include/Hollowpoint/Graphics/Swapchain.h
     Include/Hollowpoint/Graphics/Texture.h
     Src/GlslangInclude.h
     Src/Buffer.cpp
@@ -34,6 +35,7 @@ target_sources(HollowpointGraphics PRIVATE
     Src/RenderTarget.cpp
     Src/ShaderBindings.cpp
     Src/ShaderCompiler.cpp
+    Src/Swapchain.cpp
     Src/Texture.cpp
     Src/VulkanDispatcher.cpp)
 

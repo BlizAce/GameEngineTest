@@ -2,6 +2,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -235,6 +236,10 @@ public:
             enabledInstanceExtensions.push_back(extension.c_str());
         }
 
+        // Keep the list past creation: Vulkan cannot report an instance's enabled extensions afterwards, and knowing
+        // whether VK_KHR_surface was among them is what turns "surface creation failed" into an actionable message.
+        EnabledInstanceExtensions = instanceExtensions;
+
         VkInstanceCreateInfo instanceInfo{};
         instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         instanceInfo.pApplicationInfo = &application;
@@ -409,6 +414,38 @@ public:
         }
     }
 
+    //! Which instance extensions this object's VkInstance was created with. Recorded at creation because Vulkan offers
+    //! no way to query an instance's enabled extension list afterwards, and the distinction matters for diagnosing
+    //! surface-creation failures (see AttachWindow).
+    std::vector<std::string> EnabledInstanceExtensions;
+
+    [[nodiscard]] bool InstanceExtensionEnabled(std::string_view name) const
+    {
+        return std::find(EnabledInstanceExtensions.begin(), EnabledInstanceExtensions.end(), name) !=
+               EnabledInstanceExtensions.end();
+    }
+
+    [[nodiscard]] bool HasPlatformSurfaceExtension() const
+    {
+        // VK_KHR_surface alone cannot create a surface — it needs the one matching the window system in use. We test
+        // against names rather than VK_USE_PLATFORM_* macros because those are set by whoever includes vulkan.h first,
+        // and here they may well not be; the names themselves are fixed by the spec and cost nothing to list.
+        static constexpr const char* candidates[] = {
+            "VK_KHR_wayland_surface", "VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_display",
+#ifdef _WIN32
+            "VK_KHR_win32_surface",
+#endif
+        };
+        for (const char* name : candidates)
+        {
+            if (InstanceExtensionEnabled(name))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool AttachWindow(Platform::Window* window)
     {
         if (window == nullptr)
@@ -420,7 +457,25 @@ public:
         void* surface = nullptr;
         if (!window->CreateVulkanSurface(instance, &surface) || surface == nullptr)
         {
-            HP_LOG_ERROR("GRAPHICS", "Could not create a Vulkan surface for the window");
+            // Name the overwhelmingly likely cause rather than just "it failed". Surface creation fails here almost
+            // always because this device's VkInstance was created without the platform's surface extension — which is
+            // invisible from here unless someone looks, and its symptom is every later presentation call reporting
+            // "no window attached" while the window is plainly there. Checking the enabled list costs one query on a
+            // path that already failed, so it is free in the working case.
+            std::string hint;
+            if (!InstanceExtensionEnabled(VK_KHR_SURFACE_EXTENSION_NAME))
+            {
+                hint = " — this VkInstance was created without VK_KHR_surface";
+            }
+            else if (!HasPlatformSurfaceExtension())
+            {
+                hint =
+                    " — this VkInstance has VK_KHR_surface but no platform surface extension "
+                    "(pass window->GetRequiredVulkanInstanceExtensions() into "
+                    "GraphicsDeviceDesc::ExtraInstanceExtensions before Create)";
+            }
+
+            HP_LOG_ERROR("GRAPHICS", "Could not create a Vulkan surface for the window{}", hint);
             return false;
         }
 
@@ -762,6 +817,21 @@ nvrhi::IDevice* GraphicsDevice::GetNativeDevice() const noexcept
 bool GraphicsDevice::AttachWindow(Platform::Window* window)
 {
     return m_Impl != nullptr && m_Impl->AttachWindow(window);
+}
+
+void* GraphicsDevice::GetNativeVkDevice() const noexcept
+{
+    return m_Impl != nullptr ? static_cast<void*>(m_Impl->LogicalDevice) : nullptr;
+}
+
+void* GraphicsDevice::GetNativeVkQueue() const noexcept
+{
+    return m_Impl != nullptr ? static_cast<void*>(m_Impl->GraphicsQueue) : nullptr;
+}
+
+void* GraphicsDevice::GetNativeVkSurface() const noexcept
+{
+    return m_Impl != nullptr ? static_cast<void*>(m_Impl->AttachedSurface) : nullptr;
 }
 
 bool GraphicsDevice::CanPresent() const noexcept

@@ -217,6 +217,15 @@ if(TARGET HollowpointRenderer)
             Game/TestRenderPrimitives.cpp
         LIBS Hollowpoint::Game)
 
+    # End-to-end: .hpscene on disk → Game bridge → a real indexed draw through the engine's own forward shaders, with
+    # depth and back-face culling ON, compared pixel-to-CPU-reference. GPU-target policy (leak checking off) like the
+    # other suites that draw.
+    hp_add_module_test(SceneToPixel
+        SOURCES
+            Renderer/TestSceneToPixel.cpp
+        LIBS Hollowpoint::Renderer Hollowpoint::Game Hollowpoint::Scene Hollowpoint::Graphics Hollowpoint::Platform
+        NO_LEAK_CHECK)
+
     hp_add_module_test(RegisterGameTypes
         SOURCES
             Game/TestRegisterGameTypes.cpp

@@ -1427,3 +1427,52 @@ the test carefully did not.**
 
 Also corrected a scene-level comment implying its empty-path case proved durability. It does not, for the reason above,
 and saying so at the call site is what stops the next reader from trusting it.
+
+### Session 14 (cont. 5) — the Game module: a seam, and two comments that argued against their own code
+
+**Shipped:** `Hollowpoint::Game` — `MeshRenderer`, `CollectRenderables` → `RenderPlan`, and reflection registration of
+`MeshRenderer`/`Camera`/`Light`. Two commits (`da66ca2`, `6dfe4a9`), 29 new cases, debug + ASan green at 26 targets.
+
+**Why a module rather than a file:** Renderer links neither ECS nor Graphics so its shading tests need no device and keep
+leak checking; Scene knows entities but nothing about draw calls. A drawable component needs both. Putting it in either
+would have cost one of those properties, and "just put it in Renderer" is how a CPU reference ends up needing a GPU. The
+one RHI-adjacent thing linked is `Graphics::CullMode` — a header enum, no device — which is why the bridge's tests still
+run under full leak checking instead of joining the GPU-target policy.
+
+**Things worth remembering:**
+
+- **A comment that argues the opposite of what the code does is worse than no comment.** Two in the first draft: the
+  unreachable fallback after an exhaustive switch said *"Back must be the fallback rather than None"* while returning
+  `Back` and justifying `None`; a light-index comment claimed indices "keep it cheap" directly above a per-mesh vector
+  copy. Both survived writing and review, and both would have talked a later reader into a wrong model. Fresh-eyes re-read
+  of my own file found them; nothing else would have.
+- **`static_cast` between two same-named enums is the bug that always looks free.** `MeshCullMode::Back == 0` but
+  `Graphics::CullMode::Back == 1`, so a cast silently culls front faces. Guarded by an exhaustive switch with no default,
+  and mutation-tested in both directions: swapping `Back→Front` fails 2 cases, and replacing the whole switch with
+  `static_cast` also fails 2. The second one is the interesting result — I expected the out-of-range case to be useless
+  against a cast and it was the one that caught it, because a cast **preserves** an out-of-range value (200 comes back as
+  200) rather than clamping to something valid. I had written a comment claiming value `3` was "the discriminating
+  choice" for a reason that was wrong on its face; corrected to what the mutation actually showed.
+- **Assuming an axis instead of reading the field.** `RotateLightDirection` used local `-Z` rather than
+  `LightComponent::Direction`. Invisible under identity transforms — which is every test written before it — and turns a
+  default `(0,-1,0)` down-pointing light into one aimed at the horizon, so editor and engine disagree about a fresh scene.
+  Rotation now goes through `GetRotationMatrix`, so scaling a light gizmo to see it cannot swing the beam or produce a
+  zero-length direction from a collapsed axis.
+- **Idempotency by query, not by latch.** Scene's registration latch works because nothing clears it;
+  `ComponentFactory::Clear()` exists and tests/hot-reload use it, so a latch would report "registered" for types that are
+  gone. `AreGameTypesRegistered` checks descriptor AND factory halves — one without the other parses but cannot
+  instantiate, failing later at load time and naming the scene file instead of this function. The test clears the factory,
+  asserts the query flips false, re-registers: that is the hot-reload path, and it only passes because nothing cached a bool.
+- **I wrote a test asserting the wrong policy.** Unknown cull-mode name → I asserted a load *error*. It is a *warning* and
+  the load continues, and Scene is right: one typo in one component must not block opening a level. Verified with a throwaway
+  probe binary rather than by reading (`loaded=1 errors=0 warnings=1: 'Sideways' is not a value of 'MeshCullMode'`), then
+  rewrote the test to assert the documented behaviour — while keeping the parts that matter: the bad value gets named, does
+  not silently become enumerator zero, and its sibling field in the same object still applies. **Guessing at another
+  module's error policy from its name is how you write a confident wrong test; run it and read the output.**
+
+**Process:** commit A was staged with `git update-index` on hand-written partial CMake files so the registration slice could
+land separately, then verified *in a detached worktree at that commit* — configured, built, 25/25 tests. Staged-tree
+self-consistency is cheap to assert and expensive to assume; the worktree is what turns "should build" into "built".
+
+Clang's stricter ASan warnings (`-Wunused-but-set-global`) caught a `g_RegisteredOnce` flag I had stopped reading — dead
+state in a test, which is exactly the kind of thing that later reads as meaningful. GCC's `-Werror` did not flag it.

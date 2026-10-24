@@ -1,6 +1,7 @@
 #include "TestSupport.h"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -82,6 +83,43 @@ bool g_DeviceAvailable = false;
     while (false)
 
 }  // namespace
+
+TEST_SUITE("Graphics/PresentationCapability")
+{
+    TEST_CASE("a created device reports whether it can present")
+    {
+        GraphicsDevice* device = GetSharedDevice();
+        REQUIRE(device != nullptr);
+
+        // CanPresent() answers "was VK_KHR_swapchain enabled on the VkDevice", which is the only question a caller
+        // needs before attempting presentation — and it must be answerable without creating a swapchain, because
+        // swapchain creation on a device that lacks the extension is an undefined-handle failure rather than a clean
+        // error. Probing rather than requiring the extension is deliberate: a compute-only or virtual driver still
+        // gets a working offscreen device (every other test in this file depends on that), it just cannot present.
+        //
+        // Not asserted true-or-false: which holds is a property of the host's driver, not of the engine. What IS
+        // pinned is that the answer is stable across calls and matches an independent enumeration of the physical
+        // device's extensions — a flag hardcoded to true (or set before the extension was actually enabled) fails here.
+        const bool reported = device->CanPresent();
+        CHECK(reported == device->CanPresent());
+
+        nvrhi::IDevice* rhi = device->GetNativeDevice();
+        REQUIRE(rhi != nullptr);
+
+        // Independent check of the exact claim, using a loader property rather than the engine's own bookkeeping:
+        // vkGetDeviceProcAddr resolves an extension's entry points ONLY when that extension was enabled at
+        // vkCreateDevice. So "vkCreateSwapchainKHR resolves" is equivalent to "VK_KHR_swapchain is enabled on this
+        // VkDevice", which is precisely what CanPresent() reports — a stronger and more direct test than enumerating
+        // the physical device's supported extensions, which would pass even if the enable were dropped.
+        const VkDevice nativeDevice =
+            reinterpret_cast<VkDevice>(rhi->getNativeObject(nvrhi::ObjectTypes::VK_Device).pointer);
+        REQUIRE(nativeDevice != VK_NULL_HANDLE);
+
+        const bool entryPointResolves = vkGetDeviceProcAddr(nativeDevice, "vkCreateSwapchainKHR") != nullptr;
+        INFO("vkCreateSwapchainKHR resolves: " << entryPointResolves);
+        CHECK(reported == entryPointResolves);
+    }
+}
 
 TEST_SUITE("Graphics/Device")
 {

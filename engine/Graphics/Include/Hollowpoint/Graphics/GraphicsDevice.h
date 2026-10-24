@@ -194,12 +194,26 @@ public:
     //! device (Create() then returns nullptr, so callers holding a GraphicsDevice always get a non-null pointer).
     [[nodiscard]] nvrhi::IDevice* GetNativeDevice() const noexcept;
 
+    //! True when this device can present, i.e. VK_KHR_swapchain was supported by the selected adapter and enabled at
+    //! VkDevice creation. False on compute-only/virtual drivers and is decided once, at creation — a swapchain cannot
+    //! be added later, so callers branch on this instead of discovering the failure inside Swapchain::Create.
+    //! Offscreen-only uses (asset baking, the test suite) never present and are unaffected by it being false.
+    [[nodiscard]] bool CanPresent() const noexcept;
+
     //! Why creation failed (empty when it succeeded). Intended for a user-visible message: it names the missing
     //! piece ("no Vulkan-capable adapter found", "driver reports Vulkan 1.1, 1.2 required").
     [[nodiscard]] static const char* GetFailureReason();
 
 private:
     GraphicsDevice();
+
+    //! Swapchain needs the raw VkDevice/VkQueue/surface that this class owns but does not expose: NVRHI has no
+    //! swapchain support at all (its Tutorial.md states this outright and defers to Donut's DeviceManager), so the
+    //! engine implements presentation in raw Vulkan and must reach the native objects. Kept as one friend rather than
+    //! public getters because handing out a VkDevice lets any caller destroy it, reorder queue submission, or create
+    //! objects that outlive the device — none of which this class could then reason about. Swapchain.h explains why
+    //! the same escape hatch (GetNativeDevice) does not cover this case.
+    friend class Swapchain;
 
     // Held by pointer so this header stays free of NVRHI/Vulkan types. Defined in Src/GraphicsDevice.cpp.
     GraphicsDeviceImpl* m_Impl = nullptr;

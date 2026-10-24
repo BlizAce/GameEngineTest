@@ -446,6 +446,11 @@ public:
     bool ValidationEnabled = false;
     bool DebugUtilsEnabled = false;
 
+    //! Set by CreateLogicalDevice when VK_KHR_swapchain was both supported and enabled on the VkDevice. This is the
+    //! single source of truth for "can this device present": checking the extension list again later would duplicate
+    //! the decision made at creation, and the two could disagree after a refactor.
+    bool SwapchainSupported = false;
+
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice PhysicalDevice = VK_NULL_HANDLE;
     VkDevice LogicalDevice = VK_NULL_HANDLE;
@@ -482,6 +487,30 @@ public:
 
 private:
     std::vector<const char*> enabledLayers;  // Kept alive for the lifetime of vkCreateInstance's caller frame.
+
+    //! True when the selected physical device offers a *device-level* extension (as opposed to the instance-level
+    //! ones ExtensionSupported checks). vkCreateDevice fails wholesale if an enabled name is unsupported, so every
+    //! entry in the list must pass this first.
+    [[nodiscard]] bool DeviceExtensionSupported(const char* name) const
+    {
+        uint32_t count = 0;
+        if (vkEnumerateDeviceExtensionProperties(PhysicalDevice, nullptr, &count, nullptr) != VK_SUCCESS)
+        {
+            return false;
+        }
+
+        std::vector<VkExtensionProperties> properties(count);
+        vkEnumerateDeviceExtensionProperties(PhysicalDevice, nullptr, &count, properties.data());
+
+        for (const VkExtensionProperties& property : properties)
+        {
+            if (std::strcmp(property.extensionName, name) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
     [[nodiscard]] static bool ExtensionSupported(const char* name)
     {
@@ -588,11 +617,30 @@ private:
         // Buffer device address underlies shader resource pointers and NVRHI's getBufferDeviceAddress.
         features12.bufferDeviceAddress = VK_TRUE;
 
+        // --- Device extensions -------------------------------------------------
+        // VK_KHR_swapchain is PROBED rather than required. Presentation needs it, and NVRHI does not create
+        // swapchains itself (its Tutorial.md says so outright and points at Donut's DeviceManager), so this engine
+        // owns that path and the extension has to be enabled here at device creation — it cannot be added later.
+        //
+        // Probing instead of demanding keeps headless device creation exactly as reliable as before this feature
+        // existed: a driver or ICD without swapchain (some compute-only and CI/virtual setups) still gets a working
+        // offscreen GraphicsDevice, just one that reports CanPresent() == false. Making it mandatory would turn an
+        // absent presentation path into "no device at all", which is strictly worse for the test suite and for
+        // asset-baking tools that never show a window.
+        std::vector<const char*> enabledDeviceExtensions;
+        if (DeviceExtensionSupported(VK_KHR_SWAPCHAIN_EXTENSION_NAME))
+        {
+            enabledDeviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+            SwapchainSupported = true;
+        }
+
         VkDeviceCreateInfo deviceInfo{};
         deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         deviceInfo.pNext = &features12;
         deviceInfo.queueCreateInfoCount = 1;
         deviceInfo.pQueueCreateInfos = &queueInfo;
+        deviceInfo.enabledExtensionCount = static_cast<uint32_t>(enabledDeviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty() ? nullptr : enabledDeviceExtensions.data();
 
         const VkResult result = vkCreateDevice(PhysicalDevice, &deviceInfo, nullptr, &LogicalDevice);
         if (result != VK_SUCCESS)
@@ -714,6 +762,11 @@ nvrhi::IDevice* GraphicsDevice::GetNativeDevice() const noexcept
 bool GraphicsDevice::AttachWindow(Platform::Window* window)
 {
     return m_Impl != nullptr && m_Impl->AttachWindow(window);
+}
+
+bool GraphicsDevice::CanPresent() const noexcept
+{
+    return m_Impl != nullptr && m_Impl->SwapchainSupported;
 }
 
 bool GraphicsDevice::HasWindow() const noexcept

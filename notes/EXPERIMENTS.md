@@ -1476,3 +1476,47 @@ self-consistency is cheap to assert and expensive to assume; the worktree is wha
 
 Clang's stricter ASan warnings (`-Wunused-but-set-global`) caught a `g_RegisteredOnce` flag I had stopped reading — dead
 state in a test, which is exactly the kind of thing that later reads as meaningful. GCC's `-Werror` did not flag it.
+
+### Session 14 (cont. 6) — scene → pixel end-to-end, and a culling default that culled the front faces
+
+**Shipped:** `SceneToPixelTests` (4 cases) — write a `.hpscene`, load it from disk, collect through the Game bridge,
+submit as **indexed** geometry through the engine's own generated forward shaders with depth + back-face culling ON,
+read one pixel, compare to `ComputeForwardShadingCpu`. Plus the engine bug it caught on first run.
+
+**The bug.** `PipelineDesc` advertises its defaults as "stated explicitly rather than inherited from library defaults" —
+and front-face winding *was* inherited. NVRHI's `RasterState` defaults `frontCounterClockwise = false`, i.e. Vulkan gets a
+**clockwise** front face, so with the engine's own `CullMode::Back` default rasterisation discarded the faces pointing at
+the camera and kept those pointing away. Measured on a face-on cube: `dot(N,V) = -0.9999`, where +1 is correct.
+
+**Why nothing had caught it, which is the interesting part:** every GPU test to date set `TriangleCulling = None`. So the
+winding question never arose — and each of those tests was individually correct. The engine's culling default was
+unexercised *by construction*: the set of tests covered every path except the one the default takes, which is precisely
+the path every future scene would take. Making a test turn culling off is the move that hides this class of bug, so the
+new test deliberately does the opposite and says so at the line.
+
+`MakeCube`'s comment ("wound consistently … inherit the face's outward orientation") was **true** — all 12 triangles'
+geometric normals agree with their stored vertex normals — and unasserted. The claim that failed was about the *pipeline
+consuming* the geometry, not the geometry. Now both halves are pinned: winding-vs-normal on CPU, and the pixel test fails
+3 assertions if the pipeline's front-face fix is reverted, 7 if `MakeCube`'s triangle order is reversed.
+
+**Two traps hit while building it, both worth remembering:**
+
+- **Assuming which world point a pixel shows.** An off-origin cube (off-origin *on purpose*, to catch an ignored model
+  matrix) does not project its face centre to NDC origin — so "sample the centre pixel, compare against the CPU reference
+  at the face centre" compares one surface point against a pixel showing another. Fixed by intersecting the camera's
+  principal ray with the face plane and asserting the solved point projects back to |NDC| < 1e-4. The framing assertion is
+  what makes the numeric one mean anything: without it, a mismatch reads as a shading bug when it is a geometry one.
+- **`drawIndexed` needs the index buffer in `GraphicsState`, not in the draw call.** Omitting it cost a device-lost that
+  surfaced as *"readback failed"* several calls later with nothing naming the missing binding. The engine has no index
+  format in `GraphicsFormat` either (no indexed draw existed before), so NVRHI's `R32_UINT` is named directly through the
+  documented escape hatch rather than inventing an enum value mid-test.
+
+**Diagnosis method that worked:** when output was black-but-alpha-1 (shader ran, produced zero), replacing *only* the
+final `OutColor` line of the generated fragment shader with diagnostics — accumulated.r / LightCount / light type /
+`dot(N,V)` — localised it in one run. Alpha is worth reading in any "black frame" investigation: NaN = never written,
+0 = cleared and not drawn or drawn black, 1 = shader ran.
+
+**Also:** doc case counts were stale (Graphics 38→41, Renderer 101→108). Now counted from the test binaries
+(`-ltc | count`) instead of estimated, so they can be re-derived rather than remembered.
+
+Debug + ASan green at 27 targets, format clean. Commits `24034ae` (fix), `213d02b` (test).

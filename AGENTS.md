@@ -222,6 +222,10 @@ scripts/run_tests.sh                                        # full gate: format 
   - `ecs: fix dangling component pointer when destroying a parent entity`
 - Before every commit: `scripts/run_tests.sh` green, `scripts/format.py --check` clean, and the diff
   reviewed for style compliance (see §8).
+- **Push after every verified commit.** Review happens on GitHub, so a local commit is not delivered
+  work — say "pushed", not "committed", when reporting status. `git push origin main` belongs in the
+  same gate as building and testing; an agent session that accumulates local commits leaves the
+  reviewer looking at a stale tree. (Found the hard way: 13 sessions' worth of commits sat unpushed.)
 - Never commit build outputs, IDE files, or generated shaders. Never force-push or rewrite history on
   `main`; never touch credentials or `.git/config` of remotes.
 

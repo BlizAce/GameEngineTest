@@ -19,6 +19,7 @@
 
 #include "TestSupport.h"
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,7 @@
 #include "Hollowpoint/Core/RefCounted.h"
 #include "Hollowpoint/Core/Types.h"
 #include "Hollowpoint/ECS/World.h"
+#include "Hollowpoint/Game/ForwardShaderLayout.h"
 #include "Hollowpoint/Game/MeshRenderer.h"
 #include "Hollowpoint/Game/RegisterGameTypes.h"
 #include "Hollowpoint/Game/RenderPrimitives.h"
@@ -120,85 +122,56 @@ namespace
 }
 
 // ---------------------------------------------------------------------------
-// Uniform layouts. These MUST match the generated shaders' blocks exactly — and that is not a comment doing the
-// trusting: ForwardRender.h documents each block, and the byte offsets below are asserted against the shader's field
-// order by the layout test in this file (which parses the generated GLSL for its uniform declarations).
+// Uniform layouts.
+//
+// These used to be hand-written copies inside this file, which meant the test was pinning *its own* description of the
+// contract against the shader while production held a third one — a drift between those two could not fail anything.
+// They now come from ForwardShaderLayout.h, the same types SceneRenderer uploads through, so the layout test below
+// checks the code that actually ships.
 // ---------------------------------------------------------------------------
 
-//! FrameParams (slot 0): mat4 ViewProjection; vec4 CameraPositionAndPad.
-struct alignas(16) FrameBlock
-{
-    float ViewProjection[16];
-    float CameraPositionAndPad[4];
-};
+using Hollowpoint::Game::ForwardFrameBlock;
+using Hollowpoint::Game::ForwardMaterialBlock;
+using Hollowpoint::Game::ForwardTransformBlock;
+using Hollowpoint::Game::ShaderLayout::EncodeLightType;
+using Hollowpoint::Game::ShaderLayout::StoreMat4;
 
-//! DrawTransform (slot 1): mat4 ModelMatrix; mat4 NormalMatrix.
-struct alignas(16) TransformBlock
-{
-    float ModelMatrix[16];
-    float NormalMatrix[16];
-};
-
-//! LightArray (slot 2), structure-of-arrays, maxLightsPerDraw entries.
-struct alignas(16) LightBlock
+//! LightArray (slot 2), structure-of-arrays, for the 8-light bound this test's shaders are generated with. The shared
+//! header exposes offsets rather than a fixed-size struct (the renderer's bound is runtime-configurable), so the upload
+//! here packs a flat buffer through the same offset helper production uses.
+struct LightBlock
 {
     static constexpr UInt32 kMaxLights = 8;
 
-    float PositionAndIntensity[kMaxLights][4];
-    float ColorTypeAndRange[kMaxLights][4];
-    float RangeAndSpotAngles[kMaxLights][4];
-    float DirectionAndPad[kMaxLights][4];
+    //! Four vec4 (16 bytes each) per light — the block's GLSL size, asserted below against the shader.
+    static constexpr Size kBytes = static_cast<Size>(kMaxLights) * 4u * 16u;
+
+    std::array<float, kBytes / sizeof(float)> Bytes{};
+
+    [[nodiscard]] float* Field(UInt32 field, UInt32 index)
+    {
+        return &Bytes[Hollowpoint::Game::ShaderLayout::LightFieldOffset(kMaxLights, field, index) / sizeof(float)];
+    }
 };
 
-//! DrawMaterial (slot 3): vec4 BaseColor; vec4 MaterialParams.
-struct alignas(16) MaterialBlock
-{
-    float BaseColor[4];
-    float MaterialParams[4];
-};
-
-//! DrawLightIndices (slot 4): ivec4 LightIndices[ceil(N/4)]; int LightCount.
-struct alignas(16) IndexBlock
+//! DrawLightIndices (slot 4): ivec4 LightIndices[ceil(N/4)]; int LightCount at its own 16-byte unit.
+struct IndexBlock
 {
     static constexpr UInt32 kMaxLights = 8;
 
-    int LightIndices[(kMaxLights + 3) / 4][4];
-    int LightCount;
+    std::array<int, 12> Values{};  // two ivec4s + count + tail padding
+
+    void SetIndex(UInt32 index, UInt32 value)
+    {
+        Values[(index / 4u) * 4u + (index % 4u)] = static_cast<int>(value);
+    }
+
+    void SetCount(UInt32 count)
+    {
+        Values[Hollowpoint::Game::ShaderLayout::IndexBlockCountOffset(kMaxLights) / sizeof(int)] =
+            static_cast<int>(count);
+    }
 };
-
-//! Column-major copy into a GLSL `mat4`'s storage. Mat4 already stores column-major (pinned by MathCoreTests), so this
-//! is a straight element walk — written explicitly rather than memcpy'd so the intent survives a Mat4 layout change.
-void StoreMat4(float (&destination)[16], const Mat4& source)
-{
-    for (int column = 0; column < 4; ++column)
-    {
-        for (int row = 0; row < 4; ++row)
-        {
-            destination[column * 4 + row] = source[column][row];
-        }
-    }
-}
-
-//! The scene's light type as the shader decodes it: 0 directional, 1 point, 2 spot.
-/**
- * This mapping lives here because nothing else in the engine states it — ForwardRender.cpp writes the field and the
- * generated GLSL compares raw integers, with no shared constant and (verified) no static_assert anywhere pinning
- * LightComponent::LightType's values to those numbers. Reordering that enum therefore silently reinterprets every light
- * in every scene. The layout test below pins both halves of the contract; this function is where a fix should land.
- */
-[[nodiscard]] float EncodeLightType(LightComponent::LightType type) noexcept
-{
-    switch (type)
-    {
-        case LightComponent::LightType::Directional:
-            return 0.0f;
-        case LightComponent::LightType::Point:
-            return 1.0f;
-        case LightComponent::LightType::Spot:
-            return 2.0f;
-    }
-    return 0.0f;
-}
 
 [[nodiscard]] Core::Ref<Buffer> UploadConstant(GraphicsDevice& device, nvrhi::IDevice* rhi, const char* name,
                                                const void* data, Size bytes)
@@ -271,14 +244,14 @@ struct RenderedSample
     }
 
     // --- uniform blocks from the plan -------------------------------------------------
-    FrameBlock frame{};
+    ForwardFrameBlock frame{};
     StoreMat4(frame.ViewProjection, params.ViewProjection);
     frame.CameraPositionAndPad[0] = params.CameraPosition.X;
     frame.CameraPositionAndPad[1] = params.CameraPosition.Y;
     frame.CameraPositionAndPad[2] = params.CameraPosition.Z;
     frame.CameraPositionAndPad[3] = 0.0f;
 
-    TransformBlock transform{};
+    ForwardTransformBlock transform{};
     StoreMat4(transform.ModelMatrix, draw.ModelMatrix);
     // The shader uses mat3(NormalMatrix) on an interpolated varying and normalises in the fragment stage, so it needs
     // exactly the matrix ComputeWorldNormal uses on the CPU — computed here from the same helper, never hand-derived.
@@ -302,28 +275,33 @@ struct RenderedSample
         }
 
         const Renderer::ForwardLight& light = params.Lights[slot];
-        lights.PositionAndIntensity[index][0] = light.WorldPosition.X;
-        lights.PositionAndIntensity[index][1] = light.WorldPosition.Y;
-        lights.PositionAndIntensity[index][2] = light.WorldPosition.Z;
-        lights.PositionAndIntensity[index][3] = light.Light.Intensity;
 
-        lights.ColorTypeAndRange[index][0] = light.Light.Color.X;
-        lights.ColorTypeAndRange[index][1] = light.Light.Color.Y;
-        lights.ColorTypeAndRange[index][2] = light.Light.Color.Z;
-        lights.ColorTypeAndRange[index][3] = EncodeLightType(light.Light.Type);
+        float* position = lights.Field(0u, static_cast<UInt32>(index));
+        position[0] = light.WorldPosition.X;
+        position[1] = light.WorldPosition.Y;
+        position[2] = light.WorldPosition.Z;
+        position[3] = light.Light.Intensity;
 
-        lights.RangeAndSpotAngles[index][0] = light.Light.Range;
-        lights.RangeAndSpotAngles[index][1] = light.Light.SpotInnerAngleRadians;
-        lights.RangeAndSpotAngles[index][2] = light.Light.SpotOuterAngleRadians;
-        lights.RangeAndSpotAngles[index][3] = 0.0f;
+        float* colour = lights.Field(1u, static_cast<UInt32>(index));
+        colour[0] = light.Light.Color.X;
+        colour[1] = light.Light.Color.Y;
+        colour[2] = light.Light.Color.Z;
+        colour[3] = EncodeLightType(light.Light.Type);
 
-        lights.DirectionAndPad[index][0] = light.WorldDirection.X;
-        lights.DirectionAndPad[index][1] = light.WorldDirection.Y;
-        lights.DirectionAndPad[index][2] = light.WorldDirection.Z;
-        lights.DirectionAndPad[index][3] = 0.0f;
+        float* range = lights.Field(2u, static_cast<UInt32>(index));
+        range[0] = light.Light.Range;
+        range[1] = light.Light.SpotInnerAngleRadians;
+        range[2] = light.Light.SpotOuterAngleRadians;
+        range[3] = 0.0f;
+
+        float* direction = lights.Field(3u, static_cast<UInt32>(index));
+        direction[0] = light.WorldDirection.X;
+        direction[1] = light.WorldDirection.Y;
+        direction[2] = light.WorldDirection.Z;
+        direction[3] = 0.0f;
     }
 
-    MaterialBlock material{};
+    ForwardMaterialBlock material{};
     material.BaseColor[0] = draw.Material.BaseColor.X;
     material.BaseColor[1] = draw.Material.BaseColor.Y;
     material.BaseColor[2] = draw.Material.BaseColor.Z;
@@ -334,15 +312,17 @@ struct RenderedSample
     IndexBlock indices{};
     for (Size index = 0; index < draw.LightIndices.size(); ++index)
     {
-        indices.LightIndices[index / 4][index % 4] = static_cast<int>(draw.LightIndices[index]);
+        indices.SetIndex(static_cast<UInt32>(index), draw.LightIndices[index]);
     }
-    indices.LightCount = static_cast<int>(draw.LightIndices.size());
+    indices.SetCount(static_cast<UInt32>(draw.LightIndices.size()));
 
     Core::Ref<Buffer> frameBuffer = UploadConstant(device, rhi, "e2e-frame", &frame, sizeof(frame));
     Core::Ref<Buffer> transformBuffer = UploadConstant(device, rhi, "e2e-transform", &transform, sizeof(transform));
-    Core::Ref<Buffer> lightBuffer = UploadConstant(device, rhi, "e2e-lights", &lights, sizeof(lights));
+    Core::Ref<Buffer> lightBuffer =
+        UploadConstant(device, rhi, "e2e-lights", lights.Bytes.data(), lights.Bytes.size() * sizeof(float));
     Core::Ref<Buffer> materialBuffer = UploadConstant(device, rhi, "e2e-material", &material, sizeof(material));
-    Core::Ref<Buffer> indexBuffer = UploadConstant(device, rhi, "e2e-indices", &indices, sizeof(indices));
+    Core::Ref<Buffer> indexBuffer =
+        UploadConstant(device, rhi, "e2e-indices", indices.Values.data(), indices.Values.size() * sizeof(int));
 
     if (frameBuffer == nullptr || transformBuffer == nullptr || lightBuffer == nullptr || materialBuffer == nullptr ||
         indexBuffer == nullptr)
@@ -631,24 +611,24 @@ TEST_SUITE("Renderer/SceneToPixel")
         // FrameParams: mat4 (64 bytes) + vec4 (16) = 80.
         CHECK(contains(vertexGlsl, "mat4 ViewProjection"));
         CHECK(contains(vertexGlsl, "vec4 CameraPositionAndPad"));
-        CHECK(sizeof(FrameBlock) == 80u);
+        CHECK(sizeof(ForwardFrameBlock) == 80u);
 
         // DrawTransform: two mat4s = 128.
         CHECK(contains(vertexGlsl, "mat4 ModelMatrix"));
         CHECK(contains(vertexGlsl, "mat4 NormalMatrix"));
-        CHECK(sizeof(TransformBlock) == 128u);
+        CHECK(sizeof(ForwardTransformBlock) == 128u);
 
         // LightArray: four vec4 arrays of 8 = 512, in the order the upload writes them.
         CHECK(contains(fragmentGlsl, "vec4 PositionAndIntensity[8]"));
         CHECK(contains(fragmentGlsl, "vec4 ColorTypeAndRange[8]"));
         CHECK(contains(fragmentGlsl, "vec4 RangeAndSpotAngles[8]"));
         CHECK(contains(fragmentGlsl, "vec4 DirectionAndPad[8]"));
-        CHECK(sizeof(LightBlock) == 512u);
+        CHECK(LightBlock::kBytes == 512u);  // four vec4 per light x 8 lights
 
         // DrawMaterial: two vec4s = 32.
         CHECK(contains(fragmentGlsl, "vec4 BaseColor"));
         CHECK(contains(fragmentGlsl, "vec4 MaterialParams"));
-        CHECK(sizeof(MaterialBlock) == 32u);
+        CHECK(sizeof(ForwardMaterialBlock) == 32u);
 
         // DrawLightIndices: ivec4[2] (32) + int (4). The C++ struct is alignas(16) — required for a std140 uniform
         // buffer — so the tail pads to 48; that padding is never read by the shader, but the size is asserted exactly

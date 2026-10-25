@@ -20,8 +20,12 @@ target_sources(HollowpointGame PRIVATE
     Include/Hollowpoint/Game/MeshRenderer.h
     Include/Hollowpoint/Game/RegisterGameTypes.h
     Include/Hollowpoint/Game/RenderPrimitives.h
+    Include/Hollowpoint/Game/ForwardShaderLayout.h
+    Include/Hollowpoint/Game/SceneRenderer.h
+    Src/ForwardShaderLayout.cpp
     Src/RegisterGameTypes.cpp
-    Src/RenderPrimitives.cpp)
+    Src/RenderPrimitives.cpp
+    Src/SceneRenderer.cpp)
 
 target_link_libraries(HollowpointGame PUBLIC
     Hollowpoint::Core

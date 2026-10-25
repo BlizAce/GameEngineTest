@@ -248,6 +248,15 @@ if(TARGET HollowpointRenderer)
             Game/TestRegisterGameTypes.cpp
         LIBS Hollowpoint::Game Hollowpoint::Scene)
 
+    # The production scene renderer (Game::SceneRenderer): the class an application calls, as opposed to
+    # SceneToPixelTests' hand-rolled submission which tests the generated shaders. Covers its caches, clear policy,
+    # frame-slot discipline and refusal paths, all of which need a device. GPU-target policy for leak checking.
+    hp_add_module_test(SceneRenderer
+        SOURCES
+            Game/TestSceneRenderer.cpp
+        LIBS Hollowpoint::Game Hollowpoint::Graphics Hollowpoint::Renderer
+        NO_LEAK_CHECK)
+
     # CPU-only like the other shading references: no RHI, no GPU, full leak checking.
     hp_add_module_test(ImageBasedLighting
         SOURCES

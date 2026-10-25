@@ -73,6 +73,22 @@ public:
     //! which would otherwise let one typo hijack unrelated entities' behaviour.
     bool BindScript(std::string_view name);
 
+    //! Binds the Lua global `name` and then runs `on_create` for every entity in `world` already carrying that script
+    //! name.
+    /**
+     * Exists because a scene-loaded entity is created before any VM exists to notify. SceneIO stores only a script
+     * *name* on the entity (the loader must not know about Lua), so binding is the moment the behaviour starts existing
+     * for it — and if initialisation is not run there, a behaviour whose `on_update` reads state its own `on_create`
+     * set fails every frame with `attempt to index a nil value` and the entity simply never moves. Observed exactly
+     * that way on the first scene with scripts in it: dozens of nil-index errors, no motion, and a screenshot identical
+     * to frame 1.
+     *
+     * Notify-after-bind rather than notify-always: rebinding (hot reload) must not re-run initialisation over live
+     * entities, so only the first successful bind of a name initialises them. That is also why this returns
+     * BindScript's result unchanged — false means "no such global", and nothing was notified.
+     */
+    bool BindAndInitialize(std::string_view name, World& world);
+
     [[nodiscard]] bool IsScriptBound(std::string_view name) const;
 
     //! Drops every binding and releases the Lua references. Called on reload so stale references to discarded script

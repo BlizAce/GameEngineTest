@@ -7,6 +7,7 @@
 #include "Hollowpoint/Core/Log.h"
 #include "Hollowpoint/Core/Time.h"
 #include "Hollowpoint/ECS/Hierarchy.h"
+#include "Hollowpoint/Math/Angles.h"
 #include "Hollowpoint/Scene/LocalTransform.h"
 #include "Hollowpoint/Scene/TransformHierarchy.h"
 #include "Hollowpoint/Scripting/EngineAPI.h"
@@ -19,6 +20,7 @@ namespace Hollowpoint::Scripting
 
 using ECS::Entity;
 using ECS::World;
+using Math::Quat;
 using Math::Transform;
 using Math::Vec3;
 using Scene::LocalTransform;
@@ -298,6 +300,127 @@ int SetPosition(lua_State* state)
     return 1;
 }
 
+//! hp.get_local_position(handle) -> x, y, z, ok
+/**
+ * Exists because get_position returns the **world** position while set_position writes the **local** one — both choices
+ * are right for their common use (a script aiming a camera or measuring a distance wants world; a script placing an
+ * entity under its authored parent wants local), but together they make the single most common script operation — "read
+ * my transform, move myself relative to it" — expressible only incorrectly. A parented entity bobbed through
+ * get_position/set_position drifts toward world axes as fast as it moves, and nothing logs a warning. Given that pair
+ * in the API, the local form is the one a caller wants when they ask for "the position I set".
+ */
+int GetLocalPosition(lua_State* state)
+{
+    ApiState& context = Context(state);
+    const Entity entity = Resolve(context, static_cast<std::int64_t>(lua_tointeger(state, 1)));
+    if (entity.IsNull())
+    {
+        PushPosition(state, Vec3(0.0f, 0.0f, 0.0f), false);
+        return 4;
+    }
+
+    const LocalTransform* local = context.WorldPointer->TryGetComponent<LocalTransform>(entity);
+    if (local == nullptr)
+    {
+        // A live entity with no transform: reported the same way a dead one is, because from script side the response
+        // is identical — do not move it. hp.create_entity always adds the component, so this is an entity created by
+        // C++.
+        PushPosition(state, Vec3(0.0f, 0.0f, 0.0f), false);
+        return 4;
+    }
+
+    PushPosition(state, local->Position, true);
+    return 4;
+}
+
+//! hp.set_rotation(handle, x, y, z, w) -> bool — local rotation from a quaternion.
+int SetRotation(lua_State* state)
+{
+    ApiState& context = Context(state);
+    const Entity entity = Resolve(context, static_cast<std::int64_t>(lua_tointeger(state, 1)));
+    if (entity.IsNull())
+    {
+        lua_pushboolean(state, 0);
+        return 1;
+    }
+
+    const auto x = static_cast<float>(luaL_checknumber(state, 2));
+    const auto y = static_cast<float>(luaL_checknumber(state, 3));
+    const auto z = static_cast<float>(luaL_checknumber(state, 4));
+    const auto w = static_cast<float>(luaL_checknumber(state, 5));
+
+    // Normalised rather than rejected when off by rounding. A quaternion built in Lua from angle/axis arithmetic is
+    // rarely unit length to the last bit, and Mat4::FromQuaternion on a non-unit input scales the entity — a visible
+    // corruption whose cause (an unnormalised script value) is three layers away from the symptom. Normalized() maps a
+    // near-zero quaternion to identity, which is the only sensible reading of "no rotation specified".
+    LocalTransform& local = context.WorldPointer->AddComponent<LocalTransform>(entity);
+    local.Rotation = Quat(x, y, z, w).Normalized();
+
+    context.TransformsStale = true;
+    lua_pushboolean(state, 1);
+    return 1;
+}
+
+//! hp.get_rotation(handle) -> x, y, z, w, ok — local rotation as a quaternion.
+/**
+ * Quaternion rather than Euler angles because it is the stored form: an Euler round-trip through three numbers would
+ * let a script that reads and writes unchanged rotate the entity (gimbal decomposition is not unique), and the fix on
+ * the script side would be "don't do that". Scripts that want angles build a quaternion from them —
+ * hp.set_rotation_euler.
+ */
+int GetRotation(lua_State* state)
+{
+    ApiState& context = Context(state);
+    const Entity entity = Resolve(context, static_cast<std::int64_t>(lua_tointeger(state, 1)));
+
+    Quat rotation = Quat::Identity();
+    bool valid = false;
+    if (!entity.IsNull())
+    {
+        if (const LocalTransform* local = context.WorldPointer->TryGetComponent<LocalTransform>(entity);
+            local != nullptr)
+        {
+            rotation = local->Rotation;
+            valid = true;
+        }
+    }
+
+    lua_pushnumber(state, rotation.X);
+    lua_pushnumber(state, rotation.Y);
+    lua_pushnumber(state, rotation.Z);
+    lua_pushnumber(state, rotation.W);
+    lua_pushboolean(state, valid ? 1 : 0);
+    return 5;
+}
+
+//! hp.set_rotation_euler(handle, yaw, pitch, roll) -> bool — radians, applied in the engine's Y→X→Z order.
+/**
+ * The convenience half of set_rotation, and the form most content is authored in. Order is EulerAngles' documented
+ * Y→X→Z (yaw/pitch/roll), i.e. the same convention the editor gizmo and Math::EulerAngles use — a second convention
+ * here would put two answers one call apart.
+ */
+int SetRotationEuler(lua_State* state)
+{
+    ApiState& context = Context(state);
+    const Entity entity = Resolve(context, static_cast<std::int64_t>(lua_tointeger(state, 1)));
+    if (entity.IsNull())
+    {
+        lua_pushboolean(state, 0);
+        return 1;
+    }
+
+    const auto yaw = static_cast<float>(luaL_checknumber(state, 2));
+    const auto pitch = static_cast<float>(luaL_checknumber(state, 3));
+    const auto roll = static_cast<float>(luaL_checknumber(state, 4));
+
+    LocalTransform& local = context.WorldPointer->AddComponent<LocalTransform>(entity);
+    local.Rotation = Math::EulerAngles(yaw, pitch, roll).ToQuaternion();
+
+    context.TransformsStale = true;
+    lua_pushboolean(state, 1);
+    return 1;
+}
+
 //! Shared implementation of spawn_prefab / spawn_prefab_at. `placementOffset` is null for the unpositioned form.
 int SpawnPrefabImpl(lua_State* state, ApiState& context, const std::optional<Vec3>& placementPosition)
 {
@@ -406,11 +529,24 @@ struct Registration
 };
 
 constexpr Registration Registrations[] = {
-    {"create_entity", CreateEntity}, {"destroy_entity", DestroyEntity},  {"is_alive", IsAlive},
-    {"get_parent", GetParent},       {"get_first_child", GetFirstChild}, {"get_next_sibling", GetNextSibling},
-    {"set_parent", SetParent},       {"get_position", GetPosition},      {"set_position", SetPosition},
-    {"spawn_prefab", SpawnPrefab},   {"spawn_prefab_at", SpawnPrefabAt}, {"time", GetTime},
-    {"log_info", LogInfo},           {"log_warning", LogWarning},
+    {"create_entity", CreateEntity},
+    {"destroy_entity", DestroyEntity},
+    {"is_alive", IsAlive},
+    {"get_parent", GetParent},
+    {"get_first_child", GetFirstChild},
+    {"get_next_sibling", GetNextSibling},
+    {"set_parent", SetParent},
+    {"get_position", GetPosition},
+    {"set_position", SetPosition},
+    {"get_local_position", GetLocalPosition},
+    {"get_rotation", GetRotation},
+    {"set_rotation", SetRotation},
+    {"set_rotation_euler", SetRotationEuler},
+    {"spawn_prefab", SpawnPrefab},
+    {"spawn_prefab_at", SpawnPrefabAt},
+    {"time", GetTime},
+    {"log_info", LogInfo},
+    {"log_warning", LogWarning},
 };
 
 void RegisterEngineAPIFunctions(lua_State* state, void* opaqueContext, const ScriptVM& vm)

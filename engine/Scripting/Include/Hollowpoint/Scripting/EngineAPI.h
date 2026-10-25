@@ -63,8 +63,12 @@ void RegisterEngineAPI(ScriptVM& vm, const EngineAPIConfig& config);
 //   hp.get_first_child(handle)               -> handle (0 when none)
 //   hp.get_next_sibling(handle)              -> handle (0 when none)
 //   hp.set_parent(handle, parent)            -> bool          parent 0 detaches to root
-//   hp.get_position(handle)                  -> x, y, z, ok   world position (ok false when the entity is gone)
-//   hp.set_position(handle, x, y, z)         -> bool          local position (adds the component if absent)
+//   hp.get_position(handle)                  -> x, y, z, ok   **world** position (ok false when the entity is gone)
+//   hp.set_position(handle, x, y, z)         -> bool          **local** position (adds the component if absent)
+//   hp.get_local_position(handle)            -> x, y, z, ok   **local** position — the value set_position wrote
+//   hp.get_rotation(handle)                  -> x, y, z, w, ok  local rotation as a quaternion
+//   hp.set_rotation(handle, x, y, z, w)      -> bool          local rotation from a quaternion (normalised for you)
+//   hp.set_rotation_euler(handle, y, p, r)   -> bool          ... from yaw/pitch/roll in radians (Y→X→Z, see Angles.h)
 //   hp.spawn_prefab(name)                    -> handle        first root of a new instance (0 on failure)
 //   hp.spawn_prefab_at(name, x, y, z)        -> handle        ... placed at that world position (0 on failure)
 //   hp.time()                                -> number        monotonic seconds since the VM started

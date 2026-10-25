@@ -18,6 +18,7 @@
 #include "Hollowpoint/Scripting/EngineAPI.h"
 #include "Hollowpoint/Scripting/EntityHandle.h"
 #include "Hollowpoint/Scripting/LuaInclude.h"
+#include "Hollowpoint/Scripting/RegisterScriptTypes.h"
 #include "Hollowpoint/Scripting/ScriptSystem.h"
 #include "Hollowpoint/Scripting/ScriptVM.h"
 #include "Hollowpoint/Serialization/JsonWriter.h"
@@ -44,16 +45,18 @@ bool Near(const Vec3& a, const Vec3& b, float epsilon = kEpsilon)
     return std::fabs(a.X - b.X) < epsilon && std::fabs(a.Y - b.Y) < epsilon && std::fabs(a.Z - b.Z) < epsilon;
 }
 
-// Registers the test's ScriptComponent with reflection + the scene factory, so scenes containing scripts round-trip.
+// Registers ScriptComponent for the scene-format round-trip cases below. This deliberately calls the engine's own
+// RegisterScriptTypes rather than registering a private name here: the scene-file spelling (`Script`, field
+// `scriptName`) is then exercised exactly as a real .hpscene hits it, and the process keeps exactly one descriptor for
+// the type. A second registration under a different name would have been accepted by the registry (it keys descriptors
+// by name), so this suite would have passed while production used a name nothing had ever tested.
+//
 // Done once at namespace scope because the registry is a process-wide singleton and registering per test would fail
 // after the first one.
 const bool kScriptComponentRegistered = []() {
     Scene::RegisterSceneTypes();
-    Hollowpoint::Reflection::Registry::Get()
-        .RegisterType<ScriptComponent>("ScriptComponent")
-        .Field("scriptName", &ScriptComponent::ScriptName);
-    Scene::ComponentFactory::Get().Register<ScriptComponent>("ScriptComponent");
-    return true;
+    RegisterScriptTypes();
+    return AreScriptTypesRegistered();
 }();
 
 // A two-entity prefab (root + child offset in Y), matching what real content looks like.
@@ -845,6 +848,130 @@ TEST_SUITE("Scripting/EngineAPI")
         // Lua's error text is what a developer reads, so it must reach the log intact.
         CHECK(logs.AnyMessageContains("script bug"));
     }
+
+    TEST_CASE("get_local_position returns what set_position wrote, even under a parent")
+    {
+        // The reason this pair exists: get_position answers in WORLD space while set_position writes LOCAL space. Both
+        // are right for their own use, but together they leave "read where I am and move relative to that" expressible
+        // only wrong — a bobbing child of a moving parent drifts toward world axes every frame and nothing logs it.
+        // This case is the regression test for that trap, written as the drift scenario so it fails if local ever
+        // becomes world.
+        World world;
+        TestContext context(world);
+
+        RunOrThrow(context.VM, R"LUA(
+            parent = hp.create_entity()
+            child = hp.create_entity()
+            hp.set_parent(child, parent)
+            hp.set_position(parent, 10, 0, 0)
+            hp.set_position(child, 0, 5, 0)
+        )LUA");
+
+        // World position of the child is (10, 5, 0); its local position — what was authored — is (0, 5, 0).
+        lua_State* state = context.VM.GetLuaState();
+        REQUIRE_EQ(luaL_loadstring(state, "return hp.get_local_position(child)"), 0);
+        REQUIRE_EQ(lua_pcall(state, 0, 4, 0), LUA_OK);
+        CHECK(lua_tonumber(state, -4) == 0.0);
+        CHECK(lua_tonumber(state, -3) == 5.0);
+        CHECK(lua_tonumber(state, -2) == 0.0);
+        CHECK(lua_toboolean(state, -1) == 1);
+        lua_pop(state, 4);
+
+        // And a script's own read-modify-write stays put instead of sliding toward the origin.
+        RunOrThrow(context.VM, R"LUA(
+            local x, y, z = hp.get_local_position(child)
+            hp.set_position(child, x, y + 1, z)
+        )LUA");
+
+        TransformHierarchy transforms;
+        transforms.Update(world);
+        const Entity child = DecodeEntity(static_cast<std::int64_t>(EvalNumber(context.VM, "child")));
+        const Vec3 position = transforms.GetWorldMatrix(world, child).GetTranslation();
+        CHECK(Near(position, Vec3(10.0f, 6.0f, 0.0f)));
+    }
+
+    TEST_CASE("get_local_position and the rotation setters refuse cleanly on bad input")
+    {
+        World world;
+        TestContext context(world);
+
+        // No entity: false / ok=false rather than an error, matching set_position's documented policy.
+        CHECK(EvalNumber(context.VM, "hp.set_rotation(-1, 0, 0, 0, 1) and 1 or 0") == 0.0);
+        CHECK(EvalNumber(context.VM, "hp.set_rotation_euler(0, 0, 0, 0) and 1 or 0") == 0.0);
+
+        lua_State* state = context.VM.GetLuaState();
+        REQUIRE_EQ(luaL_loadstring(state, "return hp.get_local_position(-1)"), 0);
+        REQUIRE_EQ(lua_pcall(state, 0, 4, 0), LUA_OK);
+        CHECK(lua_toboolean(state, -1) == 0);
+        lua_pop(state, 4);
+
+        // A live entity with no LocalTransform (created in C++, not through hp.create_entity): reported as unavailable
+        // rather than answered with a confident identity.
+        const Entity bare = world.CreateEntity();
+        // select(5, ...) because `f() and ...` keeps only the first return value — and in Lua 0 is truthy, so an
+        // expression built on the x component would report success for every case including this one.
+        CHECK(EvalNumber(context.VM, "select(5, hp.get_local_position(" + std::to_string(EncodeEntity(bare)) +
+                                         ")) and 1 or 0") == 0.0);
+        CHECK(EvalNumber(context.VM,
+                         "select(5, hp.get_rotation(" + std::to_string(EncodeEntity(bare)) + ")) and 1 or 0") == 0.0);
+    }
+
+    TEST_CASE("set_rotation_euler rotates the entity, and get_rotation reads it back exactly")
+    {
+        World world;
+        TestContext context(world);
+
+        RunOrThrow(context.VM, R"LUA(
+            e = hp.create_entity()
+            hp.set_rotation_euler(e, math.pi / 2, 0, 0)   -- yaw 90 degrees about +Y
+        )LUA");
+
+        const Entity entity = DecodeEntity(static_cast<std::int64_t>(EvalNumber(context.VM, "e")));
+        REQUIRE(world.TryGetComponent<LocalTransform>(entity) != nullptr);
+
+        // A +X unit vector yawed 90° about +Y lands on -Z (right-handed). Checking the rotated basis vector rather than
+        // the quaternion's components pins the *convention*, which is what an accidental change of sign or axis order
+        // would break silently while every component still looked plausible.
+        const LocalTransform& local = world.GetComponent<LocalTransform>(entity);
+        const Vec3 rotated = local.Rotation * Vec3(1.0f, 0.0f, 0.0f);
+        CHECK(std::fabs(rotated.X) < 1.0e-4f);
+        CHECK(std::fabs(rotated.Y) < 1.0e-4f);
+        CHECK(std::fabs(rotated.Z + 1.0f) < 1.0e-4f);
+
+        // get_rotation returns the stored value, so a script can read and re-write without drift.
+        lua_State* state = context.VM.GetLuaState();
+        REQUIRE_EQ(luaL_loadstring(state, "return hp.get_rotation(e)"), 0);
+        REQUIRE_EQ(lua_pcall(state, 0, 5, 0), LUA_OK);
+        CHECK(std::fabs(lua_tonumber(state, -5) - local.Rotation.X) < 1.0e-6);
+        CHECK(std::fabs(lua_tonumber(state, -4) - local.Rotation.Y) < 1.0e-6);
+        CHECK(std::fabs(lua_tonumber(state, -3) - local.Rotation.Z) < 1.0e-6);
+        CHECK(std::fabs(lua_tonumber(state, -2) - local.Rotation.W) < 1.0e-6);
+        CHECK(lua_toboolean(state, -1) == 1);
+        lua_pop(state, 5);
+    }
+
+    TEST_CASE("set_rotation normalises rather than corrupting scale")
+    {
+        World world;
+        TestContext context(world);
+
+        // Not unit length: exactly what a script produces from axis-angle arithmetic. Passed through unnormalised it
+        // makes Mat4::FromQuaternion scale the entity — visible as the object shrinking, with the cause three layers
+        // away.
+        RunOrThrow(context.VM, "e = hp.create_entity() hp.set_rotation(e, 0, 2, 0, 0)");
+
+        const Entity entity = DecodeEntity(static_cast<std::int64_t>(EvalNumber(context.VM, "e")));
+        const LocalTransform& local = world.GetComponent<LocalTransform>(entity);
+        CHECK(std::fabs(local.Rotation.Length() - 1.0f) < 1.0e-5f);
+
+        TransformHierarchy transforms;
+        transforms.Update(world);
+        const Hollowpoint::Math::Mat4 matrix = transforms.GetWorldMatrix(world, entity);
+        const float columnScale =
+            std::sqrt(matrix.Columns[0][0] * matrix.Columns[0][0] + matrix.Columns[0][1] * matrix.Columns[0][1] +
+                      matrix.Columns[0][2] * matrix.Columns[0][2]);
+        CHECK(std::fabs(columnScale - 1.0f) < 1.0e-4f);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1282,10 @@ TEST_SUITE("Scripting/ScriptSystem")
 
         const std::string saved = Hollowpoint::Serialization::WriteJson(Scene::WriteScene(world));
         CHECK(saved.find("Behaviour") != std::string::npos);
+        // The scene-file component name and field, asserted explicitly: they are the public on-disk contract of
+        // RegisterScriptTypes, and a rename would otherwise show up only as "old scenes silently lost their scripts".
+        CHECK(saved.find("\"Script\"") != std::string::npos);
+        CHECK(saved.find("\"scriptName\"") != std::string::npos);
 
         World reloaded;
         REQUIRE(Scene::LoadSceneFromText(reloaded, saved).Loaded);
@@ -1168,6 +1299,85 @@ TEST_SUITE("Scripting/ScriptSystem")
             }
         });
         CHECK(found == 1u);
+    }
+
+    TEST_CASE("BindAndInitialize runs on_create for entities a scene already attached the script to")
+    {
+        // The scenario the runtime hits and nothing else could reach: SceneIO knows nothing about Lua, so it loads an
+        // entity carrying a script *name* with no VM in existence. By the time the host binds the behaviour, the entity
+        // is already here — and if binding does not initialise it, on_update reads state its own on_create never set
+        // and fails every frame (`attempt to index a nil value`), which is exactly what the first scripted demo scene
+        // did.
+        World world;
+        TestContext context(world);
+
+        RunOrThrow(context.VM, R"LUA(
+            initialised = 0
+            Counter = {
+                on_create = function(e) initialised = initialised + 1 end,
+                on_update = function(e, dt)
+                    -- Reads nothing, so a plain BindScript would appear to work here; the point is that on_create ran.
+                end
+            }
+        )LUA");
+
+        ScriptSystem system(context.VM);
+        for (int index = 0; index < 3; ++index)
+        {
+            const Entity entity = world.CreateEntity();
+            world.AddComponent<ScriptComponent>(entity).ScriptName = "Counter";
+        }
+        // One entity carrying a different script: it must not be initialised by this bind.
+        const Entity other = world.CreateEntity();
+        world.AddComponent<ScriptComponent>(other).ScriptName = "OtherBehaviour";
+
+        REQUIRE_FALSE(system.IsScriptBound("Counter"));
+        REQUIRE(system.BindAndInitialize("Counter", world));
+        CHECK(EvalNumber(context.VM, "initialised") == 3.0);
+        CHECK(system.GetErrorCount() == 0u);
+
+        // Ticking then works with no errors — the property that actually broke in the runtime.
+        system.Update(world, 0.016f);
+        CHECK(system.GetErrorCount() == 0u);
+    }
+
+    TEST_CASE("rebinding does not re-run on_create over live entities")
+    {
+        // Hot reload replaces code; it must not reset gameplay state. Entities that have been alive since before the
+        // reload would otherwise have their script-local data wiped with no warning — the reason BindAndInitialize
+        // initialises only on a name's first successful bind.
+        World world;
+        TestContext context(world);
+
+        RunOrThrow(context.VM, "count = 0\nReloaded = { on_create = function(e) count = count + 1 end }");
+        ScriptSystem system(context.VM);
+
+        const Entity entity = world.CreateEntity();
+        world.AddComponent<ScriptComponent>(entity).ScriptName = "Reloaded";
+
+        REQUIRE(system.BindAndInitialize("Reloaded", world));
+        CHECK(EvalNumber(context.VM, "count") == 1.0);
+
+        RunOrThrow(context.VM, "Reloaded = { on_create = function(e) count = count + 1 end }");
+        REQUIRE(system.BindAndInitialize("Reloaded", world));
+        CHECK(EvalNumber(context.VM, "count") == 1.0);
+    }
+
+    TEST_CASE("BindAndInitialize reports a missing global without initialising anything")
+    {
+        World world;
+        TestContext context(world);
+
+        RunOrThrow(context.VM, "ranCreate = false\nGhost = { on_create = function(e) ranCreate = true end }");
+        ScriptSystem system(context.VM);
+
+        const Entity entity = world.CreateEntity();
+        world.AddComponent<ScriptComponent>(entity).ScriptName = "NotAGlobal";
+
+        Hollowpoint::Test::ScopedLogCapture logs;
+        CHECK_FALSE(system.BindAndInitialize("NotAGlobal", world));
+        CHECK(EvalNumber(context.VM, "ranCreate and 1 or 0") == 0.0);
+        CHECK(logs.GetWarningCount() >= 1u);
     }
 
     TEST_CASE("hp.error_count reflects errors caught by this VM")

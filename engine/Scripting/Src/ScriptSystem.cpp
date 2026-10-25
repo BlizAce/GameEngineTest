@@ -54,6 +54,45 @@ bool ScriptSystem::BindScript(std::string_view name)
     return true;
 }
 
+bool ScriptSystem::BindAndInitialize(std::string_view name, World& world)
+{
+    const bool wasBound = IsScriptBound(name);
+
+    if (!BindScript(name))
+    {
+        return false;  // no such global table; nothing was initialised, and BindScript reported why
+    }
+
+    // Only the first bind initialises. Rebinding is hot reload, and running on_create over entities that have been
+    // alive since before the reload would reset gameplay state (a script's own counters, positions it stored) with no
+    // warning.
+    if (wasBound)
+    {
+        return true;
+    }
+
+    // Snapshot first: on_create is arbitrary script code and may create or destroy entities, which walking live storage
+    // cannot survive. Update() snapshots for the same reason; this is the same hazard one hook earlier.
+    std::vector<Entity> candidates;
+    world.ForEachEntity([&world, &name, &candidates](const Entity& entity) {
+        const ScriptComponent* component = world.TryGetComponent<ScriptComponent>(entity);
+        if (component != nullptr && component->ScriptName == name)
+        {
+            candidates.push_back(entity);
+        }
+    });
+
+    for (const Entity& entity : candidates)
+    {
+        // Re-checked: an earlier on_create in this batch may have destroyed a later candidate.
+        if (world.IsAlive(entity))
+        {
+            NotifyCreate(world, entity);
+        }
+    }
+    return true;
+}
+
 bool ScriptSystem::IsScriptBound(std::string_view name) const
 {
     return std::any_of(m_BoundScripts.begin(), m_BoundScripts.end(),

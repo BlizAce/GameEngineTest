@@ -15,9 +15,11 @@ target_sources(HollowpointScripting PRIVATE
     Include/Hollowpoint/Scripting/LuaInclude.h
     Include/Hollowpoint/Scripting/EntityHandle.h
     Include/Hollowpoint/Scripting/ScriptSystem.h
+    Include/Hollowpoint/Scripting/RegisterScriptTypes.h
     Include/Hollowpoint/Scripting/ScriptVM.h
     Src/EngineAPI.cpp
     Src/EntityHandle.cpp
+    Src/RegisterScriptTypes.cpp
     Src/ScriptSystem.cpp
     Src/ScriptVM.cpp)
 

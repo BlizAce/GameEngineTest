@@ -286,11 +286,13 @@ struct Swapchain::Impl
             return false;
         }
 
-        // Signalled at creation: the first SubmitBarrier then has nothing to wait for, rather than needing a "has this
-        // ever been submitted" flag alongside it.
+        // Unsignalled at creation, which is what vkQueueSubmit requires of its fence (VUID-vkQueueSubmit-fence-00063).
+        // This used to be VK_FENCE_CREATE_SIGNALED_BIT, intended to spare a "has this ever been submitted" flag — but
+        // TransitionPending below is exactly that flag and already guards the first wait, so the signalled start only
+        // made the first submit of every run illegal. Invisible for months because no validation layer was installed on
+        // this host (see LayerSupported), and drivers accepted it.
         VkFenceCreateInfo fenceInfo{};
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
         return vkCreateFence(VkDevices, &fenceInfo, nullptr, &BarrierFence) == VK_SUCCESS;
     }
@@ -514,7 +516,14 @@ struct Swapchain::Impl
         // pixels), and because screenshot support — editor, bug reports, automated visual regression — needs the same
         // capability. On tile-based GPUs an extra usage bit can cost memory tiling flexibility; on the desktop drivers
         // this engine targets it is free, and "we could not take a screenshot of what we presented" is the alternative.
-        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        //
+        // TRANSFER_DST for the same reason: the tone-map blit clears the back buffer before drawing (an undefined
+        // destination makes "drew nothing" indistinguishable from "drew black"), and vkCmdClearColorImage needs the bit
+        // — validation rejected the first real frame with `missing VK_IMAGE_USAGE_TRANSFER_DST_BIT` on exactly this
+        // image. A swapchain that omitted it would work until the clear, then fail mid-frame at the point where the
+        // layout barrier to TRANSFER_DST_OPTIMAL is illegal too.
+        createInfo.imageUsage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         // The compositor's transform rather than IDENTITY: on a rotated display, asking for IDENTITY and rendering
         // unrotated produces a sideways image — passing it through lets the compositor compensate.
@@ -555,10 +564,22 @@ struct Swapchain::Impl
         textureDesc.setArraySize(1);
         textureDesc.setIsRenderTarget(true);
         textureDesc.debugName = desc.Name + " image";
-        // No initial state and no keepInitialState: these layouts are managed by the transitions in this file, and
-        // letting NVRHI issue its own would fight them.
-        textureDesc.initialState = nvrhi::ResourceStates::Unknown;
-        textureDesc.keepInitialState = false;
+        // These wrappers must declare a tracked initial state, and it must be RenderTarget (colour-attachment-optimal).
+        //
+        // Leaving initialState at Unknown made every draw into a back buffer log "Unknown prior state of texture ...
+        // swapchain image" — one error per frame from NVRHI's barrier tracker, which is the RHI telling the truth: with
+        // keepInitialState false and no beginTrackingTextureState call, it has no idea what layout the image is in and
+        // cannot place a correct transition. Silent on this host (no validation layer); a correctness problem
+        // everywhere else.
+        //
+        // RenderTarget is not a guess, it is an invariant this file maintains: TransitionAllToRenderable puts every
+        // image there once, Present moves it to PRESENT_SRC_KHR, and Acquire brings it back before handing it out — so
+        // at the moment a caller records into an acquired image, colour-attachment-optimal is exactly where it is.
+        // Declaring that lets NVRHI seed its tracker (no error), skip a transition it would otherwise have to guess at,
+        // and restore the same state at command-list close, which is again a no-op. Our own foreign submits keep the
+        // invariant; NVRHI never sees the present-side transition and never needs to.
+        textureDesc.initialState = nvrhi::ResourceStates::RenderTarget;
+        textureDesc.keepInitialState = true;
 
         WrappedImages.clear();
         Textures.clear();
@@ -694,19 +715,11 @@ Core::Ref<Swapchain> Swapchain::Create(GraphicsDevice& device, const SwapchainDe
     impl->PhysicalDevice =
         reinterpret_cast<VkPhysicalDevice>(rhi->getNativeObject(nvrhi::ObjectTypes::VK_PhysicalDevice).pointer);
 
-    // Which family the engine's single queue belongs to: command pools must be created for that family. Probing by
-    // equality rather than assuming family 0, which is conventional but not guaranteed on multi-queue devices.
-    uint32_t familyCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(impl->PhysicalDevice, &familyCount, nullptr);
-    for (uint32_t family = 0; family < familyCount; ++family)
-    {
-        VkQueue probe = VK_NULL_HANDLE;
-        vkGetDeviceQueue(impl->VkDevices, family, 0, &probe);
-        if (probe == impl->Queue)
-        {
-            impl->QueueFamilyIndex = family;
-        }
-    }
+    // Which family the engine's single queue belongs to: command pools must be created for that family. Asked of the
+    // device, which chose it while enumerating queue properties. The previous code probed every family with
+    // vkGetDeviceQueue and compared handles — undefined behaviour, since only one family was requested at VkDevice
+    // creation (validation reports VUID-vkGetDeviceQueue-queueFamilyIndex-00384 for each of the others).
+    impl->QueueFamilyIndex = device.GetVkQueueFamilyIndex();
 
     Core::Ref<Swapchain> swapchain = Core::Ref<Swapchain>(new Swapchain());
     swapchain->m_Impl = impl;
@@ -846,12 +859,52 @@ AcquiredImage Swapchain::Acquire()
 
     m_Impl->Acquired[index] = true;
 
+    // Wait for the acquire AND bring this image back to a renderable layout, in one submit.
+    //
+    // The layout half is not optional and was missing until the first real frame loop ran: Present() leaves an image in
+    // PRESENT_SRC_KHR, and nothing put it back — so the second time an image came round, rendering wrote into an
+    // attachment whose layout the spec does not permit a colour write in. Undefined behaviour: on this driver it
+    // rendered (which is exactly why a test that acquires once and presents once passes), and validation layers would
+    // call it.
+    //
+    // oldLayout = UNDEFINED rather than PRESENT_SRC_KHR, deliberately. It is Vulkan's "discard the contents, I will
+    // overwrite them" idiom, and it is legal precisely because acquire already guarantees the compositor finished
+    // reading this image. Declaring it lets a driver skip the resolve/copy it would otherwise perform to preserve
+    // pixels nobody reads — naming PRESENT_SRC_KHR would be the more descriptive spelling and strictly slower on
+    // tile-based GPUs.
+    //
+    // The consequence, stated because it is not obvious and will matter later: back-buffer contents are NOT preserved
+    // across an acquire. Nothing may read last frame's presented image through a back buffer (a temporal effect —
+    // motion blur, TAA, a debug "compare to previous" — must sample its own history texture, which it should be writing
+    // anyway). Every current consumer clears before drawing, so nothing depends on contents today; this is the
+    // constraint that would have to change if one did.
+    //
+    // Expressed as a barrier inside the acquire's own submit rather than a second one: queue order already serialises
+    // it against the caller's next submission, so this costs no extra sync.
+    VkImageMemoryBarrier layoutBarrier{};
+    layoutBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    layoutBarrier.srcAccessMask = 0;  // must be zero when oldLayout is UNDEFINED
+    layoutBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    layoutBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    layoutBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    layoutBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    layoutBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    layoutBarrier.image = m_Impl->Images[index];
+    layoutBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    layoutBarrier.subresourceRange.levelCount = 1;
+    layoutBarrier.subresourceRange.layerCount = 1;
+
     // Make subsequent work wait for the acquire. NVRHI cannot wait on a foreign semaphore, so the dependency is
-    // expressed by queue ordering: this (empty) submit is enqueued before whatever the caller submits next, and one
-    // Vulkan queue completes submissions in order. See the header for the full model.
-    if (!m_Impl->SubmitBarrier({}, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                               m_Impl->ImageAvailable, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_NULL_HANDLE,
-                               "acquire wait"))
+    // expressed by queue ordering: this submit is enqueued before whatever the caller submits next, and one Vulkan
+    // queue completes submissions in order. See the header for the full model.
+    // Destination stage is COLOR_ATTACHMENT_OUTPUT, not TOP_OF_PIPE. The barrier's dstAccessMask asks for
+    // colour-write access, and validation rejects an access flag the destination stage cannot produce
+    // (VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02820) — TOP_OF_PIPE "waits on nothing", which here would also be
+    // wrong: the point is that the colour pass does not start writing until the acquire has finished. The wait stage on
+    // the ImageAvailable semaphore is the same stage for the same reason.
+    if (!m_Impl->SubmitBarrier({layoutBarrier}, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, m_Impl->ImageAvailable,
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_NULL_HANDLE, "acquire wait"))
     {
         m_Impl->Acquired[index] = false;
         result.Status = AcquireStatus::OutOfDate;

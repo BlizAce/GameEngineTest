@@ -67,6 +67,21 @@ public:
     //! The NVRHI framebuffer for GraphicsState. Never null on an instance that exists.
     [[nodiscard]] nvrhi::IFramebuffer* GetNativeFramebuffer() const noexcept;
 
+    // Attachments, borrowed.
+    //
+    // Why public: this revision of NVRHI has no framebuffer-scoped clear — `clearTextureFloat` and
+    // `clearDepthStencilTexture` take an `ITexture*` — so a pass holding only a RenderTarget cannot clear what it is
+    // about to draw into. A pass that must not leave attachments uncleared (attachment memory is undefined at creation;
+    // notes/EXPERIMENTS.md session 14) therefore needs the textures, and without these accessors every caller would
+    // keep its own Ref copies beside the target — a second source of truth about what is attached, which is the drift
+    // this class exists to prevent. Const and borrowed: the target owns both attachments and keeps them alive for its
+    // own lifetime (RenderTargetDesc holds Refs precisely because Ref's pointer constructor adopts), so these pointers
+    // are valid exactly as long as the target is.
+    [[nodiscard]] const Texture* GetColourTexture() const noexcept;
+
+    //! The depth attachment, or null when HasDepth() is false.
+    [[nodiscard]] const Texture* GetDepthTexture() const noexcept;
+
 protected:
     // Pipeline needs the attachment info this target was built with to create a matching pipeline state — and only
     // Pipeline does. Exposing it publicly would let callers assemble pipelines against hand-made infos, exactly the

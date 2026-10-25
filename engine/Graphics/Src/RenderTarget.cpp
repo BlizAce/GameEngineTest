@@ -103,6 +103,20 @@ nvrhi::IFramebuffer* RenderTarget::GetNativeFramebuffer() const noexcept
     return m_Impl != nullptr ? m_Impl->Framebuffer : nullptr;
 }
 
+const Texture* RenderTarget::GetColourTexture() const noexcept
+{
+    return m_Impl != nullptr ? m_Impl->ColourAttachment.Get() : nullptr;
+}
+
+const Texture* RenderTarget::GetDepthTexture() const noexcept
+{
+    if (m_Impl == nullptr)
+    {
+        return nullptr;
+    }
+    return m_Impl->DepthAttachment.Get();
+}
+
 const nvrhi::FramebufferInfo& RenderTarget::GetFramebufferInfo() const noexcept
 {
     // The instance exists only if Create succeeded, which guarantees a non-null impl; the fallback is a static

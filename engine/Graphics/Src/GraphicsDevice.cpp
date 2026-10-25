@@ -23,10 +23,68 @@ namespace
 
 std::string g_FailureReason;
 
-//! Vulkan 1.1, the API level requested when *creating* the instance. The instance is deliberately created at 1.1 so
-//! vkEnumerateInstanceVersion can then report the driver's real level and an old driver produces a clear message
-//! rather than failing inside vkCreateInstance.
+//! The floor for a created instance: everything this layer needs is available from 1.1, and asking an old loader for a
+//! newer instance fails outright, so nothing may request less than this without also being unable to run.
 constexpr UInt32 kVulkanApi11 = MakeVulkanVersion(1, 1, 0);
+
+//! The highest API version the installed loader supports, or 1.0 when it predates the query (pre-1.1 loaders have no
+//! vkEnumerateInstanceVersion and report 1.0 by implication).
+/**
+ * Resolved through vkGetInstanceProcAddr(VK_NULLPTR, ...) rather than called directly: that is the documented way to
+ * get a pre-instance loader entry point, and it degrades to null on a loader old enough to lack the function instead of
+ * failing to link. (The comment here previously claimed the instance had to be created at 1.1 "so
+ * vkEnumerateInstanceVersion can report the driver's real level" — that is not how the query works, it is answered by
+ * the loader before any instance exists, and holding the instance at 1.1 for that reason was what made core-1.2 device
+ * features silently unavailable. See InstanceApiVersionFor.)
+ */
+[[nodiscard]] UInt32 QueryLoaderApiVersion() noexcept
+{
+    // Vulkan's own VK_API_VERSION_* macros expand to old-style casts, which this project builds with -Werror; the local
+    // MakeVulkanVersion helper is the cast-free spelling of the same value.
+    constexpr UInt32 kApiFloor = MakeVulkanVersion(1, 0, 0);
+
+    auto* enumerateInstanceVersion =
+        reinterpret_cast<PFN_vkEnumerateInstanceVersion>(vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion"));
+    if (enumerateInstanceVersion == nullptr)
+    {
+        return kApiFloor;
+    }
+
+    uint32_t version = 0;
+    if (enumerateInstanceVersion(&version) != VK_SUCCESS)
+    {
+        return kApiFloor;
+    }
+    return version;
+}
+
+//! The API version to create an instance at, given what this device requires and what the loader offers.
+/**
+ * Must be at least RequiredApiVersion whenever the loader can supply it. VkPhysicalDeviceVulkan12Features chained into
+ * vkCreateDevice is ignored unless the *instance* was created with apiVersion >= 1.2
+ * (VUID-VkDeviceCreateInfo-pNext-02829 / -02830), and NVRHI chains exactly that struct to negotiate buffer device
+ * address. Creating a 1.1 instance underneath it — what this file did while its default required version was
+ * already 1.2 — asks for a feature the driver never enables while leaving the negotiated capability recorded as
+ * available, which validation reports and, with a layer installed, has been observed crashing later in queue
+ * submission.
+ *
+ * Capped at the loader's own version, because vkCreateInstance fails outright when asked for more. When the requirement
+ * is above what the loader offers the instance is still created (at the loader's level) so the adapter filter below can
+ * produce its specific "No Vulkan adapter meets the required API version" message rather than a raw initialisation
+ * failure.
+ */
+[[nodiscard]] UInt32 InstanceApiVersionFor(UInt32 requiredApiVersion) noexcept
+{
+    const UInt32 loader = QueryLoaderApiVersion();
+    UInt32 wanted = requiredApiVersion > kVulkanApi11 ? requiredApiVersion : kVulkanApi11;
+    // A loader newer than 1.0 can always satisfy the cap; on a 1.0-only loader the query above already returned the
+    // floor, so clamping unconditionally is both correct and free of the special case.
+    if (loader < wanted)
+    {
+        wanted = loader;
+    }
+    return wanted;
+}
 
 [[nodiscard]] constexpr UInt32 VulkanMajor(UInt32 version) noexcept
 {
@@ -202,23 +260,24 @@ public:
         application.applicationVersion = MakeVulkanVersion(0, 1, 0);
         application.pEngineName = "Hollowpoint";
         application.engineVersion = MakeVulkanVersion(0, 1, 0);
-        // The instance is created at 1.1 so vkEnumerateInstanceVersion can then report the driver's real level;
-        // asking for 1.2 up front would make an older driver fail without a useful message.
-        application.apiVersion = kVulkanApi11;
+        // Version negotiation: at least what this device requires, capped by the loader. A fixed 1.1 here silently
+        // disabled every core-1.2 device feature NVRHI negotiates — see InstanceApiVersionFor.
+        application.apiVersion = InstanceApiVersionFor(desc.RequiredApiVersion);
 
         std::vector<std::string> instanceExtensions = DedupeExtensions(desc.ExtraInstanceExtensions);
         std::vector<const char*> enabledInstanceExtensions;
         enabledInstanceExtensions.reserve(instanceExtensions.size());
 
-        // Validation and debug utils are *requested* extensions: absent on shipping drivers, so they are probed
-        // rather than assumed. Their absence must not fail device creation.
-        const bool wantValidation = desc.EnableValidation && ExtensionSupported(kValidationLayerName);
+        // Validation is a *layer*; debug utils is an *extension the layer offers*. They are probed through different
+        // APIs because they live in different namespaces — see LayerSupported for why conflating them disabled
+        // validation everywhere. Both are optional: absent on shipping drivers, so neither may fail device creation.
+        const bool wantValidation = desc.EnableValidation && LayerSupported(kValidationLayerName);
         const bool wantDebugUtils = desc.EnableDebugUtils && ExtensionSupported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
         if (desc.EnableValidation && !wantValidation)
         {
-            // A warning, not an error: running without validation is normal on a user machine, but silently doing
-            // so in a debug build would hide exactly the API misuse we want caught.
+            // A warning, not an error: running without validation is normal on a user machine, but silently doing so in
+            // a debug build would hide exactly the API misuse we want caught.
             HP_LOG_WARNING("GRAPHICS", "Vulkan validation layer requested but not installed — running without it");
         }
 
@@ -367,6 +426,30 @@ public:
         return true;
     }
 
+    //! Destroy the attached surface, if any, on the instance that owns it.
+    /**
+     * A VkSurfaceKHR is a child of the VkInstance, so it must be destroyed before it
+     * (VUID-vkDestroyInstance-instance-00629). This was missed until the first real frame loop ran with validation
+     * enabled: AttachWindow destroyed a *previous* surface when re-attaching but nothing destroyed the last one, and no
+     * test ever held a device and a window at the same time, so the leak had no way to appear.
+     */
+    void DestroyAttachedSurface()
+    {
+        if (instance == VK_NULL_HANDLE || AttachedSurface == VK_NULL_HANDLE)
+        {
+            AttachedSurface = VK_NULL_HANDLE;
+            return;
+        }
+
+        auto* destroy =
+            reinterpret_cast<PFN_vkDestroySurfaceKHR>(vkGetInstanceProcAddr(instance, "vkDestroySurfaceKHR"));
+        if (destroy != nullptr)
+        {
+            destroy(instance, AttachedSurface, nullptr);
+        }
+        AttachedSurface = VK_NULL_HANDLE;
+    }
+
     ~GraphicsDeviceImpl()
     {
         // Order matters: NVRHI must release its objects before the native device they belong to is destroyed, and
@@ -394,6 +477,10 @@ public:
             vkDestroyDevice(LogicalDevice, nullptr);
             LogicalDevice = VK_NULL_HANDLE;
         }
+
+        // After the logical device and before the instance: the surface is an instance child, and destroying it while a
+        // VkDevice that used it is still alive is not.
+        DestroyAttachedSurface();
 
         if (instance != VK_NULL_HANDLE)
         {
@@ -567,6 +654,32 @@ private:
         return false;
     }
 
+    //! True when a layer of this name is installed.
+    /**
+     * This checks vkEnumerateInstanceLayerProperties, and that is the whole point: the code here previously probed
+     * vkEnumerateInstanceExtensionProperties(nullptr, ...) — the list of instance *extensions* — for a *layer* name.
+     * The two are different namespaces with no overlap (a layer offers extensions; it is not one), so the lookup could
+     * never succeed and wantValidation was always false. Consequences: validation layers were silently disabled on
+     * every host including any that had them installed, every "validation catches this next time" note in the project's
+     * history described protection that was never active, and the repeated "not installed on this dev box" conclusion
+     * was a misdiagnosis of this check rather than a missing package. Layer presence is now asked of the API that
+     * reports it.
+     */
+    [[nodiscard]] static bool LayerSupported(const char* name)
+    {
+        uint32_t count = 0;
+        if (vkEnumerateInstanceLayerProperties(&count, nullptr) != VK_SUCCESS)
+        {
+            return false;
+        }
+
+        std::vector<VkLayerProperties> available(count);
+        vkEnumerateInstanceLayerProperties(&count, available.data());
+        return std::any_of(available.begin(), available.end(), [name](const VkLayerProperties& candidate) {
+            return std::strcmp(candidate.layerName, name) == 0;
+        });
+    }
+
     [[nodiscard]] static bool ExtensionSupported(const char* name)
     {
         uint32_t count = 0;
@@ -669,8 +782,22 @@ private:
         // Timeline semaphores: NVRHI's Vulkan backend uses them for queue synchronisation. Core in 1.2, which the
         // adapter filter guarantees, so requiring them cannot exclude a device we would otherwise accept.
         features12.timelineSemaphore = VK_TRUE;
-        // Buffer device address underlies shader resource pointers and NVRHI's getBufferDeviceAddress.
+        // Buffer device address underlies shader resource pointers and NVRHI's getBufferDeviceAddress. It is also what
+        // lets a buffer be created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT at all — without the feature enabled,
+        // vkCreateBuffer on such a usage is invalid and validation rejects it (observed on the first real frame, which
+        // builds a shader-visible constant buffer with that flag).
         features12.bufferDeviceAddress = VK_TRUE;
+
+        // Vulkan 1.3 features, chained beneath the 1.2 struct. These are not optional extras: NVRHI records through
+        // vkCmdPipelineBarrier2 and vkCmdBeginRendering/EndRendering on every barrier and every render pass, and both
+        // are gated behind their feature bits. Chaining this struct is only honoured when the instance was created at
+        // apiVersion >= 1.2 (VUID-VkDeviceCreateInfo-pNext-02829) — the same trap that silently disabled features12
+        // before InstanceApiVersionFor existed, so a regression there now shows up here as well.
+        VkPhysicalDeviceVulkan13Features features13{};
+        features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        features13.synchronization2 = VK_TRUE;
+        features13.dynamicRendering = VK_TRUE;
+        features12.pNext = &features13;
 
         // --- Device extensions -------------------------------------------------
         // VK_KHR_swapchain is PROBED rather than required. Presentation needs it, and NVRHI does not create
@@ -727,6 +854,7 @@ private:
             vkDestroyDevice(LogicalDevice, nullptr);
             LogicalDevice = VK_NULL_HANDLE;
         }
+        DestroyAttachedSurface();
         if (instance != VK_NULL_HANDLE)
         {
             vkDestroyInstance(instance, nullptr);
@@ -832,6 +960,13 @@ void* GraphicsDevice::GetNativeVkQueue() const noexcept
 void* GraphicsDevice::GetNativeVkSurface() const noexcept
 {
     return m_Impl != nullptr ? static_cast<void*>(m_Impl->AttachedSurface) : nullptr;
+}
+
+uint32_t GraphicsDevice::GetVkQueueFamilyIndex() const noexcept
+{
+    // The family chosen in CreateLogicalDevice, where it is discovered from queue properties. Returning it here rather
+    // than letting callers probe: see the header note on why probing other families is undefined behaviour.
+    return m_Impl != nullptr ? m_Impl->GraphicsQueueFamily : 0u;
 }
 
 bool GraphicsDevice::CanPresent() const noexcept

@@ -100,10 +100,17 @@ struct GraphicsDeviceDesc
     std::string ApplicationName = "Hollowpoint";
 
     //! Minimum Vulkan API version required of the selected device, packed as Vulkan packs it (major<<22 |
-    //! minor<<12 | patch). 1.2 buys timeline semaphores and buffer device address, both relied on by NVRHI and by
-    //! later features; requiring more than a machine has fails with a clear message rather than at the first
-    //! feature query.
-    UInt32 RequiredApiVersion = MakeVulkanVersion(1, 2, 0);
+    //! minor<<12 | patch).
+    /**
+     * 1.3 is not aspirational — it is what the graphics backend actually runs on. NVRHI's Vulkan backend issues
+     * vkCmdPipelineBarrier2 and vkCmdBeginRendering/vkCmdEndRendering unconditionally (see its
+     * src/vulkan/vulkan-state-tracking.cpp and vulkan-graphics.cpp; its README states "Vulkan 1.3"), and those are core
+     * only from 1.3. With the device created at 1.2 the entry points resolve to null and the first barrier takes down
+     * the process inside vk::Device::pipelineBarrier2's own assertion — observed as a crash in the first frame loop,
+     * after every earlier test had passed (they never record a barrier through NVRHI). 1.2 bought timeline semaphores
+     * and buffer device address; 1.3 additionally buys synchronisation2 and dynamic rendering, both now load-bearing.
+     */
+    UInt32 RequiredApiVersion = MakeVulkanVersion(1, 3, 0);
 
     AdapterPreference Preference = AdapterPreference::HighPerformance;
 
@@ -219,6 +226,16 @@ private:
     //! free of Vulkan includes — the whole reason GraphicsDevice.h is cheap to include.
     [[nodiscard]] void* GetNativeVkDevice() const noexcept;
     [[nodiscard]] void* GetNativeVkQueue() const noexcept;
+
+    //! The queue family the graphics queue was requested from. Needed because a VkCommandPool must be created for the
+    //! family a queue actually belongs to, and there is no way to recover that from a VkQueue afterwards.
+    //!
+    //! Swapchain used to discover it by calling vkGetDeviceQueue for every family and comparing handles — which is a
+    //! spec violation: only the graphics family was passed to vkCreateDevice's pQueueCreateInfos, so querying any other
+    //! index is undefined behaviour (validation reports VUID-vkGetDeviceQueue-queueFamilyIndex-00384 once per frame).
+    //! It happened to work because drivers return null rather than faulting. Reading the value from where it was chosen
+    //! removes both the UB and the O(families) probe.
+    [[nodiscard]] uint32_t GetVkQueueFamilyIndex() const noexcept;
 
     //! The surface created by AttachWindow, or null. Owned by this class — Swapchain must never destroy it.
     [[nodiscard]] void* GetNativeVkSurface() const noexcept;

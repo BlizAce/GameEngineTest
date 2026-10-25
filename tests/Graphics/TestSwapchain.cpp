@@ -21,6 +21,7 @@
 #include <doctest/doctest.h>
 
 #include "Hollowpoint/Core/RefCounted.h"
+#include "Hollowpoint/Graphics/Buffer.h"
 #include "Hollowpoint/Graphics/GraphicsDevice.h"
 #include "Hollowpoint/Graphics/Pipeline.h"
 #include "Hollowpoint/Graphics/RenderTarget.h"
@@ -628,6 +629,140 @@ TEST_SUITE("Graphics/Swapchain")
         }
 
         device.WaitForIdle();
+    }
+
+    // Rendering into a back buffer that has already been presented once. Nothing else in this suite does that: the
+    // cycle test above acquires and presents without ever recording a draw, and the readback test touches image 0
+    // exactly once. So both passed while Acquire left every image in PRESENT_SRC_KHR — the layout a presented image is
+    // left in — and nothing moved it back to one where a colour attachment write is legal. The first real frame loop
+    // hit it on the second time each image came round.
+    TEST_CASE("recording into a reused back buffer leaves NVRHI's state tracker satisfied (display required)")
+    {
+        ScopedPresentableWindow window;
+        SKIP_WITHOUT_DISPLAY(window);
+
+        GraphicsDevice& device = window.GetDevice();
+
+        SwapchainDesc desc;
+        desc.Width = kWidth;
+        desc.Height = kHeight;
+        desc.Name = "test-swapchain-reuse";
+
+        Ref<Swapchain> swapchain = Swapchain::Create(device, desc);
+        REQUIRE(swapchain != nullptr);
+
+        // A pipeline built against a back buffer, so the draw below is real rendering through the engine's wrappers
+        // rather than a clear: the state tracker decides its transitions from what a pass declares it needs.
+        RenderTarget* firstTarget = swapchain->GetRenderTarget(0);
+        REQUIRE(firstTarget != nullptr);
+        Ref<Pipeline> pipeline = BuildProbePipeline(device, *firstTarget);
+        REQUIRE_MESSAGE(pipeline != nullptr, "probe pipeline could not be built against a back buffer");
+
+        nvrhi::IDevice* rhi = device.GetNativeDevice();
+        REQUIRE(rhi != nullptr);
+
+        // The probe pipeline declares a vertex attribute, so drawing needs a vertex buffer. Three vertices covering the
+        // viewport: content is irrelevant, the pass and its attachment transitions are what is under test.
+        BufferDesc vertexBufferDesc;
+        vertexBufferDesc.Name = "swapchain-reuse-vertices";
+        vertexBufferDesc.ByteSize = 3u * 2u * sizeof(float);
+        vertexBufferDesc.Usage = BufferUsage::Vertex;
+        Ref<Buffer> vertexBuffer = Buffer::Create(device, vertexBufferDesc);
+        REQUIRE(vertexBuffer != nullptr);
+
+        {
+            const float vertices[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+            nvrhi::CommandListHandle upload = rhi->createCommandList();
+            upload->open();
+            upload->writeBuffer(vertexBuffer->GetNativeBuffer(), vertices, sizeof(vertices));
+            upload->close();
+            nvrhi::ICommandList* rawUpload = upload;
+            rhi->executeCommandLists(&rawUpload, 1);
+            device.WaitForIdle();
+        }
+
+        // Capturing here rather than before creation: the scope sees only what this case does, so an unrelated
+        // diagnostic from another test cannot satisfy or break it.
+        Hollowpoint::Test::ScopedLogCapture logs;
+
+        const UInt32 imageCount = swapchain->GetBackBufferCount();
+        UInt32 rendered = 0;
+
+        // Two full turns of every image: the first pass establishes that rendering works at all, the second is the case
+        // under test — an image that has been through Present once and must have been returned to a renderable layout
+        // by Acquire.
+        for (UInt32 round = 0; round < imageCount * 2u; ++round)
+        {
+            const AcquiredImage acquired = swapchain->Acquire();
+            INFO("round " << round);
+
+            if (acquired.Status == AcquireStatus::Timeout)
+            {
+                continue;  // compositor busy or window occluded; not a layout question
+            }
+            REQUIRE(acquired.Status == AcquireStatus::Success);
+
+            RenderTarget* target = swapchain->GetRenderTarget(acquired.ImageIndex);
+            REQUIRE(target != nullptr);
+
+            nvrhi::CommandListHandle commandList = rhi->createCommandList();
+            commandList->open();
+            // The vertex buffer has to be bound in *this* command list. Validation reports an unbound vertex binding as
+            // an error on vkCmdDraw, and the pipeline declares a binding — until validation actually worked (see
+            // LayerSupported) this test passed with the buffer created but never bound, because nothing was watching.
+            commandList->setGraphicsState(
+                nvrhi::GraphicsState()
+                    .setPipeline(pipeline->GetNativePipeline())
+                    .setFramebuffer(target->GetNativeFramebuffer())
+                    .addVertexBuffer(nvrhi::VertexBufferBinding{vertexBuffer->GetNativeBuffer(), 0, 0})
+                    .setViewport(nvrhi::ViewportState().addViewportAndScissorRect(nvrhi::Viewport(
+                        static_cast<float>(swapchain->GetWidth()), static_cast<float>(swapchain->GetHeight())))));
+            commandList->draw(nvrhi::DrawArguments().setVertexCount(3).setInstanceCount(1));
+            commandList->close();
+
+            nvrhi::ICommandList* raw = commandList;
+            rhi->executeCommandLists(&raw, 1);
+
+            CHECK(swapchain->Present(acquired.ImageIndex));
+            ++rendered;
+        }
+
+        device.WaitForIdle();
+
+        INFO("rendered into " << rendered << " acquired images");
+        // Without at least a full cycle of images there is no reuse, and this case would be asserting nothing. A host
+        // whose compositor never hands out an image cannot test presentation at all — the WARN makes that visible
+        // rather than quietly green.
+        if (rendered < 2u)
+        {
+            WARN("compositor supplied fewer than two images; reuse path untested");
+            return;
+        }
+
+        // The assertion. NVRHI reports a texture whose layout it cannot determine by logging "Unknown prior state of
+        // texture ..." through its message callback, which GraphicsDevice routes into the engine log (see
+        // MessageCallbackInstance) — so this is observable here even though no validation layer is installed on this
+        // host. It fired once per frame against every swapchain image before Acquire restored a tracked layout.
+        INFO("errors logged: " << logs.GetErrorCount());
+        // Dumped only when the assertion below is about to fail: an unexpected engine log line is otherwise invisible,
+        // and diagnosing one from "6 errors" alone means rerunning under a debugger.
+        if (logs.GetErrorCount() != 0)
+        {
+            for (const std::string& line : logs.GetLines())
+            {
+                // Single argument on purpose: doctest's MESSAGE with a comma-separated list expands via the comma
+                // operator and prints only the last operand's boolean conversion, i.e. "1" instead of the line being
+                // diagnosed.
+                const std::string report = "captured: " + line;
+                MESSAGE(report.c_str());
+            }
+        }
+        CHECK(logs.GetErrorCount() == 0);
+        CHECK_FALSE(logs.AnyMessageContains("Unknown prior state"));
+
+        // And the device survived the reuse, which is the failure mode that follows an invalid transition when the
+        // driver chooses to fault rather than ignore it.
+        CHECK(static_cast<bool>(rhi->createCommandList()));
     }
 
     TEST_CASE("presenting the same image twice is refused (display required)")

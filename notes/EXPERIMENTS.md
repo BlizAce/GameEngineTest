@@ -1640,3 +1640,124 @@ reports — plain 8-bit UNORM BGRA.
 
 **Status, stated plainly:** the ring has tests and no production caller — there is no application frame loop and no
 executable target yet. "The renderer can no longer overwrite in-flight buffers" is not true until that loop exists.
+
+---
+
+## Session 15 — the engine runs: a frame loop, a production scene renderer, and five Vulkan bugs validation had never seen
+
+### What this session was for
+
+Everything before it had been tested in isolation, and the engine still could not be started. `HP_BUILD_RUNTIME` built
+nothing; the only code that ever submitted a frame lived in `tests/Renderer/TestSceneToPixel.cpp`, which proved the shaders
+and upload offsets reproduce the CPU reference and then threw the submission away. FrameRing's own header said the quiet part:
+"tests and no production caller". So the goal was one vertical slice with no gaps — window → device → swapchain → frame ring →
+forward HDR pass → tone map → present — plus scene loading and scripts inside it, and an executable that runs it.
+
+What landed: `Game::SceneRenderer` (a `RenderPlan` in, pixels out), `Runtime::RuntimeApplication` + a `hollowpoint-runtime`
+executable, `Game::ForwardShaderLayout.h`, `.hpscene` → ECS → render-plan collection → draw → tone-mapped present, Lua
+behaviours attached from scene files, and 6 new runtime integration cases on top of the SceneRenderer/Scripting coverage.
+
+### The finding that set the tone: validation had been off this entire time
+
+Not "off on this machine" — *unprobeable*, in code that looked like it was probing. `LayerSupported` checked
+`vkEnumerateInstanceExtensionProperties(nullptr, …)` for a **layer** name. Layers and instance extensions are different
+namespaces with no overlap (a layer offers extensions; it is not one), so the lookup could never succeed, `wantValidation`
+was always false, and every "validation will catch this next time" note in this project's history described protection that
+was never active. Fixed to query `vkEnumerateInstanceLayerProperties`. With layers actually loading, the first real frame
+produced five distinct spec violations in a row — all pre-existing, none of them new.
+
+**1. A fence submitted while signalled.** The swapchain's transition fence was created with
+`VK_FENCE_CREATE_SIGNALED_BIT` to avoid needing a "has this ever been submitted" flag — but `TransitionPending` already *was*
+that flag, so the signalled start made the first submit of every run illegal (`VUID-vkQueueSubmit-fence-00063`). Drivers
+accepted it; validation did not.
+
+**2. Instance API version pinned to 1.1 while the device asked for 1.2 features.** `VkPhysicalDeviceVulkan12Features` chained
+into `vkCreateDevice` is *ignored* unless the instance was created at apiVersion ≥ 1.2
+(`VUID-VkDeviceCreateInfo-pNext-02829`). So buffer device address and timeline semaphores were requested, silently not enabled,
+and recorded as available — which is why the crash surfaced later, inside `vkGetBufferDeviceAddress`, rather than at device
+creation. Replaced with negotiation: max(required, 1.1) capped by the loader's own version.
+
+**3. NVRHI needs Vulkan 1.3, not 1.2.** Its README says "Vulkan 1.3" and it means it: `pipelineBarrier2` and
+`BeginRendering`/`EndRendering` are called unconditionally (`vulkan-state-tracking.cpp`, `vulkan-graphics.cpp`). At a 1.2 device
+those entry points are null and the first barrier dies inside vk.hpp's own assertion. Required version → 1.3, with
+`synchronization2` + `dynamicRendering` chained in `VkPhysicalDeviceVulkan13Features`. **The lesson:** a "minimum version"
+constant is a claim about what the code below it calls; the only way to check the claim is to run the code path.
+
+**4. Swapchain images lacked `TRANSFER_DST`.** The tone-map blit clears the back buffer before drawing, and
+`vkCmdClearColorImage` requires the bit. Validation named the image and the missing flag; presentation itself never needed it,
+so every prior test passed. Added alongside the `TRANSFER_SRC` that readback needs.
+
+**5. `VkSurfaceKHR` leaked at shutdown.** `AttachWindow` destroyed a *previous* surface when re-attaching and nothing destroyed
+the last one (`VUID-vkDestroyInstance-instance-00629`). No test had ever held a device and a window simultaneously, so the leak
+had no way to appear.
+
+**Also:** the acquire-path barrier used `dstStageMask = TOP_OF_PIPE` with `dstAccessMask = COLOR_ATTACHMENT_WRITE`, which is
+both invalid (an access flag the stage cannot produce) and wrong in intent — the colour pass must not start before the acquire
+finishes. Destination stage → `COLOR_ATTACHMENT_OUTPUT`.
+
+### Two scripting gaps that only a running engine could show
+
+**Registration order.** `ScriptComponent`'s scene-file name is registered by the Scripting module (Game must not link
+Scripting, or `HP_ENABLE_SCRIPTING=OFF` stops configuring). My first call to it sat in `InitialiseScripts`, which runs *after*
+`Start` loads the scene — so a scene carrying `"Script"` produced `unknown component type 'Script'; skipped` and scripts that
+never bound. Moved next to `Game::RegisterGameTypes()`, before any load. The failure mode of SceneIO skipping an unregistered
+component (warn, keep going) is exactly right for content and exactly why the symptom pointed at the scene file instead of at
+the missing registration.
+
+**`on_create` never fired for scene-loaded entities.** `NotifyCreate` is documented as "called by whoever creates the entity
+from a scripted context" — and for a scene entity nobody does: the loader creates it, before any VM exists. Binding is the
+moment the behaviour starts existing for those entities, so that is where initialisation belongs. Without it, a behaviour whose
+`on_update` reads state its own `on_create` set fails every frame with `attempt to index a nil value`, and — because hook
+errors are contained by design — the frame count still looked healthy. Added `ScriptSystem::BindAndInitialize(name, world)`:
+bind, then notify entities already carrying that name, only on a name's *first* bind (rebinding is hot reload and must not
+reset live state).
+
+### A/B evidence that scripts move pixels
+
+Not "the log says it ran". Three checks, each isolating one variable:
+
+| Question | Method | Result |
+|---|---|---|
+| Does a transform change reach the screen at all? | Two scenes identical except a 45° yaw baked into the file, `--no-scripting` | diff bbox `(341,406)–(674,661)` — yes |
+| Does the frame loop tick scripts? | probe script logging + moving an entity, frames 3/14/26 | positions differ per frame; bbox grows with N |
+| Does the shipped demo animate by itself? | `demo.hpscene` frames 2 vs 40, before/after the `on_create` fix | **before:** diff `None`, plus 40 nil-index errors. **after:** bbox `(341,406)–(1301,661)`, clean log |
+
+The "before" column is the important one: a screenshot identical to frame 1 with a non-zero frame count and no crash. That
+combination — motion absent, everything else nominal — is what a unit test cannot see and an A/B pair makes obvious.
+
+### Format-string bug class found while reading logs
+
+`HP_LOG_*` formats through `Core::Format` → `std::format`, i.e. `{}` placeholders. Fifteen calls across Scene/Serialization
+passed printf specifiers instead, which `std::vformat` accepts and passes through. So scene-load diagnostics printed literally
+`Scene %s: entity[%u]: %s` — a report whose entire content is its own format string. Found by *reading the log output of a run*
+rather than by reading code; all fifteen converted to `{}`.
+
+The same class exists in the tests: doctest's `MESSAGE("a: ", x)` expands through the comma operator and prints `1`. Observed
+exactly that way — "unexpected graphics error: 1" four times, which is worse than no diagnostic at all. Single-argument
+`MESSAGE` with the string built outside the macro.
+
+### Verification
+
+* `scripts/format.py --check`: clean over 222 files.
+* Debug build: clean under `-Wall -Wextra -Wpedantic -Werror` (including the Vulkan headers' old-style-cast trap — the local
+  cast-free `MakeVulkanVersion` helper is now the spelling used in comparisons).
+* `ctest --test-dir build/debug`: **32/32 passed** (was 31; +RuntimeApplication suite, +7 Scripting cases).
+* `ctest --test-dir build/asan`: **32/32 passed**, ASan+UBSan, 196 s.
+* Runtime with validation on: 4/60/90-frame runs, zero Vulkan validation errors, zero NVRHI errors.
+* Mutation checks (each mutant run, not assumed caught): disabling the frame loop's script tick → the scripting case fails;
+  disabling `BindAndInitialize`'s notify → two Scripting cases fail; injecting one synthetic `GRAPHICS` error → four runtime
+  cases fail with it printed in full. One case (`MaxFrameCount`) correctly stays green under the injected-error mutant because
+  it does not assert on logs — which is the right distribution of assertions, not a gap.
+
+### State at end of session 15
+
+The engine starts, loads a `.hpscene`, runs Lua behaviours that move entities, tone-maps and presents, and can be screenshotted
+unattended: `hollowpoint-runtime --scene assets/scenes/demo.hpscene --script-dir assets/demos/scripts --frames 60
+--screenshot out.png`. The claim "the renderer can no longer overwrite in-flight buffers", which last session explicitly
+withheld because no loop existed, is now a claim about code that runs.
+
+Open, in the order they now cost the most: **assets** (meshes still come from `BuiltInMeshes` behind Game's resolver seam — one
+function to replace with a cgltf loader; textures and a GUID/path database behind it); **input reaching gameplay** (the event
+queue is complete and nobody consumes it beyond resize/close); **physics and audio** facing code; an **editor** hosting the same
+`RunFrame`; and golden-image regression, which the screenshot path makes possible — currently the visual assertions are
+structural (non-empty, colour spread, texel spot-checks against the CPU transform) rather than whole-image.

@@ -40,6 +40,11 @@ if [[ "$QUICK" == "0" ]]; then
     else
         echo "clang-format not found; skipping (install it to enable this gate)"
     fi
+
+    # Docs drift the same way code does, and the status table is what a newcomer uses to judge risk: four of its
+    # "N cases" numbers had quietly stopped matching the sources. Cheap enough to always check, and it needs no build.
+    step "Documented test counts (docs/ARCHITECTURE.md)"
+    python3 scripts/check_doc_counts.py || fail "documented case counts out of date"
 fi
 
 step "Configure (${PRESET})"

@@ -84,14 +84,14 @@ module yet.
 
 | Module | State | Tests |
 |--------|-------|-------|
-| **Core** | ✅ complete | `tests/Core/` — 65 cases: assert routing, GUIDs, FNV hashing, logger (threaded, file sink), allocator + backends + stats, ref counting, clocks and game-time |
+| **Core** | ✅ complete | `tests/Core/` — 90 cases: assert routing, GUIDs, FNV hashing, logger (threaded, file sink), allocator + backends + stats, ref counting, clocks and game-time |
 | **Math** | ✅ complete | `tests/Math/` — 126 cases covering conventions (handedness, clip space, column-majority), transforms, volumes, colour transfer functions, RNG distribution |
 | **ECS** | ✅ core complete | `tests/ECS/` — 118 cases: entity handles + generations, sparse sets, world lifecycle with deferred destruction, component storage/iteration, parent-child hierarchy (cycle rejection, subtree destroy/promote, 20k-deep teardown) |
 | **MathReflection** | ✅ opt-in layer | descriptors for Vec2/Vec3/Vec4/Quat/Color; separate target so Math never depends on Reflection |
-| **Reflection** | ✅ core complete | `tests/Reflection/` — 34 cases: type/field descriptors, scalar bridge, enum + array handling, name interning |
-| **Serialization** | ✅ JSON layer complete | `tests/Serialization/` — 71 cases: document model, strict parser (grammar, UTF-8, surrogates, error positions), deterministic writer, round-trips incl. 20k random doubles |
-| **Scene** | ✅ transforms complete | `tests/Scene/` — 22 cases: world-transform evaluation (parent-before-child order, inheritance through transform-less nodes, staleness, 20k-deep chain) |
-| **Scene I/O** | ✅ `.hpscene` v1 complete | `tests/Scene/` — 36 cases: save/load round-trips, hierarchy + world-transform fidelity, two-phase parenting, version refusal, Guid identity/duplicates, unknown components, byte-stable re-save |
+| **Reflection** | ✅ core complete | `tests/Reflection/` — 35 cases: type/field descriptors, scalar bridge, enum + array handling, name interning |
+| **Serialization** | ✅ JSON layer complete | `tests/Serialization/` — 109 cases (71 JSON, 38 reflection bridge): document model, strict parser (grammar, UTF-8, surrogates, error positions), deterministic writer, round-trips incl. 20k random doubles |
+| **Scene** | ✅ transforms complete | `tests/Scene/TestTransformHierarchy.cpp` — 22 cases: world-transform evaluation (parent-before-child order, inheritance through transform-less nodes, staleness, 20k-deep chain) |
+| **Scene I/O** | ✅ `.hpscene` v1 complete | `tests/Scene/TestSceneIO.cpp` — 43 cases: save/load round-trips, hierarchy + world-transform fidelity, two-phase parenting, version refusal, Guid identity/duplicates, unknown components, byte-stable re-save |
 | **Prefabs** | ✅ complete | `tests/Scene/TestPrefab.cpp` — 20 cases: immutable shared templates, fresh identities per instance, parent-relative spawn transforms, multi-root prefabs, dead-parent refusal |
 | **Platform** | ✅ windowing + input complete | `tests/Platform/` — 36 cases: GLFW lifecycle over the Null backend (DPI, close, clipboard, cursor modes), full input event queue with keycode/modifier mapping, Vulkan surface creation behind an opt-in GPU test |
 | **Scripting** | ✅ VM + sandbox + engine API complete | `tests/Scripting/` — 58 cases: protected calls, memory budget, closed library set, opaque entity handles, hook dispatch with per-script error isolation, prefab spawn through host resolvers, local/world position split (`get_local_position` vs `get_position`, which is what makes "move relative to where I am" expressible at all), quaternion + Euler rotation setters with normalisation, `BindAndInitialize` running `on_create` for entities a scene attached the script to (and *not* re-running it on hot reload) |

@@ -57,7 +57,7 @@ scripts/run_tests.sh --asan
 | `tests/` | doctest suites, one executable per module, registered with CTest |
 | `docs/` | Architecture and per-module design notes |
 | `notes/` | Development log: decisions, measured findings, bugs found by tests |
-| `scripts/` | Format gate, test driver, capture-inspection helper |
+| `scripts/` | Format gate, test driver, docs-count check, capture inspector |
 | `third_party/` | Pinned dependency declarations (fetched, never vendored sources) |
 
 ## Status

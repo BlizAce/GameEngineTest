@@ -1749,6 +1749,32 @@ exactly that way — "unexpected graphics error: 1" four times, which is worse t
   cases fail with it printed in full. One case (`MaxFrameCount`) correctly stays green under the injected-error mutant because
   it does not assert on logs — which is the right distribution of assertions, not a gap.
 
+### The verification step found a doc bug class I had just been warned about
+
+Re-measuring the status table's "N cases" figures after committing — the rule being that such counts are measured from
+sources and never incremented by hand — turned up four that were wrong. All were pre-existing; none was introduced this session:
+
+| Row | Doc said | Sources have | Why it was misleading |
+|---|---|---|---|
+| Core | 65 | 90 | understates a suite that grew |
+| Reflection | 34 | 35 | off by one, invisible in review |
+| Serialization | 71 | 109 | counted only `TestJson.cpp`; the reflection bridge's 38 were never mentioned |
+| Scene | 22 | 85 | **the dangerous one**: the row cited `tests/Scene/` (a directory) while describing only transforms, so the table claimed the whole of Scene was 22 cases when two other files held 63 more |
+
+The last is the interesting failure: it was not a stale number, it was a *scope* error that read as a number. A reader
+comparing "Scene: 22" against "ECS: 118" would reasonably conclude scene handling is thinly tested and go near it carefully —
+or, worse, conclude the opposite about the rows that looked proportionate. Rows describing one file now name it
+(`tests/Scene/TestTransformHierarchy.cpp`), which makes scope explicit and re-checkable.
+
+Fixed with `scripts/check_doc_counts.py`, wired into `scripts/run_tests.sh` next to the format gate: it reads `TEST_CASE`
+counts from sources (not from test binaries, so skipped GPU/display cases cannot make a suite look smaller than it is) and
+also fails when file-scoped rows leave a module's other files uncovered. Controls run against the checker itself, because an
+instrument that only ever prints "OK" is not evidence: perturbing a number → caught; widening a file row back to its
+directory (the original bug) → caught; naming a deleted file → caught, plus the resulting coverage gap named too.
+
+**Generalisation:** any table of counts, versions or "supported since" claims inside documentation is a test assertion with no
+test attached. Either generate it or check it — an unenforced claim decays at exactly the rate nobody notices.
+
 ### State at end of session 15
 
 The engine starts, loads a `.hpscene`, runs Lua behaviours that move entities, tone-maps and presents, and can be screenshotted

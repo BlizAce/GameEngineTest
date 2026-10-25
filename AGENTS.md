@@ -222,6 +222,10 @@ scripts/run_tests.sh                                        # full gate: format 
   - `ecs: fix dangling component pointer when destroying a parent entity`
 - Before every commit: `scripts/run_tests.sh` green, `scripts/format.py --check` clean, and the diff
   reviewed for style compliance (see §8).
+- When a commit adds or removes a `TEST_CASE`, update the counts in `docs/ARCHITECTURE.md`'s status
+  table; `scripts/check_doc_counts.py` prints the true numbers from sources and is part of the gate.
+  Never edit a count by hand — four had drifted before the check existed, one of them describing a
+  whole directory while listing a single file's cases.
 - **Push after every verified commit.** Review happens on GitHub, so a local commit is not delivered
   work — say "pushed", not "committed", when reporting status. `git push origin main` belongs in the
   same gate as building and testing; an agent session that accumulates local commits leaves the

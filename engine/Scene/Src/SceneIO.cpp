@@ -77,7 +77,7 @@ void ComponentFactory::AddEntry(std::string_view typeName, Entry entry)
     {
         // Registering twice is a bug in the registration table rather than a runtime condition. Keeping the first is
         // harmless and deterministic; replacing it would make which factory wins depend on link order.
-        HP_LOG_WARNING("Scene", "Component type '%s' registered twice; keeping the first factory", name.c_str());
+        HP_LOG_WARNING("Scene", "Component type '{}' registered twice; keeping the first factory", name);
         return;
     }
 
@@ -123,7 +123,7 @@ void* ComponentFactory::CreateOrGet(const World& world, Entity entity, std::stri
     {
         // A factory without a descriptor means the component registered a name with one system and not the other —
         // reported by name because that is what the author can grep for.
-        HP_LOG_ERROR("Scene", "Component '%s' has a factory but no reflected type; cannot load it",
+        HP_LOG_ERROR("Scene", "Component '{}' has a factory but no reflected type; cannot load it",
                      std::string(typeName).c_str());
         return nullptr;
     }
@@ -151,17 +151,16 @@ void SceneLoadReport::ReportToLog(const char* sourceName) const
 
     for (const Issue& issue : Errors)
     {
-        HP_LOG_ERROR("Scene", "%s: entity[%u]: %s", name, issue.EntityIndex, issue.Message.c_str());
+        HP_LOG_ERROR("Scene", "{}: entity[{}]: {}", name, issue.EntityIndex, issue.Message);
     }
     for (const Issue& issue : Warnings)
     {
-        HP_LOG_WARNING("Scene", "%s: entity[%u]: %s", name, issue.EntityIndex, issue.Message.c_str());
+        HP_LOG_WARNING("Scene", "{}: entity[{}]: {}", name, issue.EntityIndex, issue.Message);
     }
 
     if (!Errors.empty() || !Warnings.empty())
     {
-        HP_LOG_WARNING("Scene", "%s: loaded with %zu error(s) and %zu warning(s)", name, Errors.size(),
-                       Warnings.size());
+        HP_LOG_WARNING("Scene", "{}: loaded with {} error(s) and {} warning(s)", name, Errors.size(), Warnings.size());
     }
 }
 
@@ -254,7 +253,7 @@ JsonValue WriteScene(const World& world, const SceneSaveOptions& options)
                 // A component with no descriptor cannot be described, so it is skipped with a message naming it.
                 // Common during development when someone adds a struct and forgets HP_REGISTER_TYPE; silently dropping
                 // it would mean a component that vanishes from saved levels.
-                HP_LOG_WARNING("Scene", "Component '%s' has no reflected type; skipping it while saving",
+                HP_LOG_WARNING("Scene", "Component '{}' has no reflected type; skipping it while saving",
                                storage.GetTypeName());
                 return;
             }
@@ -549,7 +548,7 @@ SceneLoadReport LoadDocument(World& world, const JsonValue& document, const Scen
 
     if (sourceName != nullptr && (report.Errors.size() + report.Warnings.size()) > 0)
     {
-        HP_LOG_INFO("Scene", "Loaded '%s' with %zu warning(s)", sourceName, report.Warnings.size());
+        HP_LOG_INFO("Scene", "Loaded '{}' with {} warning(s)", sourceName, report.Warnings.size());
     }
 
     return report;
@@ -644,7 +643,7 @@ SceneSaveFileResult SaveSceneToFile(const World& world, std::string_view path, c
     {
         result.Error = Core::FileError::NotSupported;
         result.Message = "SaveSceneToFile called with an empty path";
-        HP_LOG_ERROR("SCENE", "%s", result.Message.c_str());
+        HP_LOG_ERROR("SCENE", "{}", result.Message);
         return result;
     }
 
@@ -660,7 +659,7 @@ SceneSaveFileResult SaveSceneToFile(const World& world, std::string_view path, c
     {
         result.Error = written.Error;
         result.Message = "cannot save scene to '" + std::string(path) + "': " + written.Message;
-        HP_LOG_ERROR("SCENE", "%s", result.Message.c_str());
+        HP_LOG_ERROR("SCENE", "{}", result.Message);
         return result;
     }
 

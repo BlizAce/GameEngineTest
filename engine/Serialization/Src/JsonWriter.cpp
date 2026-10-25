@@ -36,7 +36,7 @@ std::string FormatDouble(double value)
 
     if (result.ec != std::errc())
     {
-        HP_LOG_ERROR("Serialization", "Formatting the double %g failed; writing null", value);
+        HP_LOG_ERROR("Serialization", "Formatting the double {} failed; writing null", value);
         return "null";
     }
 

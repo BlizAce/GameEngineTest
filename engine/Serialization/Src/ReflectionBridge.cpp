@@ -645,12 +645,12 @@ void ConversionDiagnostics::ReportToLog(const char* context) const
     // the author whether this is one typo or a format mismatch across the whole file.
     for (const std::string& message : Messages)
     {
-        HP_LOG_ERROR("Serialization", "%s: %s", context != nullptr ? context : "conversion", message.c_str());
+        HP_LOG_ERROR("Serialization", "{}: {}", context != nullptr ? context : "conversion", message);
     }
 
     if (Messages.size() > 1)
     {
-        HP_LOG_ERROR("Serialization", "%s: %zu problem(s) total", context != nullptr ? context : "conversion",
+        HP_LOG_ERROR("Serialization", "{}: {} problem(s) total", context != nullptr ? context : "conversion",
                      Messages.size());
     }
 }

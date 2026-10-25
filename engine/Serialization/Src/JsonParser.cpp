@@ -979,8 +979,7 @@ private:
             // file means one of the two definitions is dead and someone will spend an afternoon finding out which.
             if (members.Contains(key))
             {
-                HP_LOG_WARNING("Serialization", "JSON object has a duplicate member '%s'; the last value wins",
-                               key.c_str());
+                HP_LOG_WARNING("Serialization", "JSON object has a duplicate member '{}'; the last value wins", key);
             }
 
             members.Set(std::move(key), std::move(value));

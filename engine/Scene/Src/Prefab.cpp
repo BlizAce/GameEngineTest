@@ -129,7 +129,7 @@ InstantiateResult InstantiatePrefab(World& world, const Prefab& prefab, const In
     {
         // A missing or corrupt asset at runtime is normal (content deleted after a level referenced it), so this is
         // reported rather than asserted. The caller decides whether that is fatal for the level.
-        HP_LOG_WARNING("Scene", "Cannot instantiate prefab '%s': it is not loaded", prefab.GetName().c_str());
+        HP_LOG_WARNING("Scene", "Cannot instantiate prefab '{}': it is not loaded", prefab.GetName());
         return result;
     }
 
@@ -137,8 +137,8 @@ InstantiateResult InstantiatePrefab(World& world, const Prefab& prefab, const In
     {
         // Spawning into a dead handle would silently produce entities parented to whatever slot that index now holds —
         // the classic "spawned onto a recycled entity" bug where an object appears attached to unrelated geometry.
-        HP_LOG_WARNING("Scene", "Cannot instantiate prefab '%s': the requested parent entity is not alive",
-                       prefab.GetName().c_str());
+        HP_LOG_WARNING("Scene", "Cannot instantiate prefab '{}': the requested parent entity is not alive",
+                       prefab.GetName());
         return result;
     }
 

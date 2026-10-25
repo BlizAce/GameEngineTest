@@ -21,6 +21,7 @@
 #include "Hollowpoint/Graphics/Pipeline.h"
 #include "Hollowpoint/Graphics/RenderTarget.h"
 #include "Hollowpoint/Graphics/RhiAccess.h"  // command recording stays NVRHI's by design (see Buffer.h)
+#include "Hollowpoint/Graphics/ShaderBindings.h"
 #include "Hollowpoint/Graphics/ShaderCompiler.h"
 #include "Hollowpoint/Graphics/Texture.h"
 
@@ -430,6 +431,191 @@ TEST_SUITE("Graphics/Resources")
             // editor surfaces to a user — both halves are part of the contract.
             CHECK(asserts.GetCaptureCount() >= 1);
             CHECK(logs.AnyMessageContains("attachments must match"));
+        }
+    }
+
+    TEST_CASE("a sampled-only texture has a defined image layout and survives upload, sampling and readback")
+    {
+        // Regression test. Texture::Create used to give every non-render-target texture an initial state of
+        // ResourceStates::Common — which NVRHI's Vulkan backend maps to vk::ImageLayout::eUndefined. With
+        // keepInitialState set (as it is for all engine textures), CommandList::close() emits a barrier back to that
+        // initial state, so the first command list touching such a texture wrote a barrier whose new layout was
+        // UNDEFINED: an assert in NVRHI debug builds, silent corruption otherwise. It stayed latent because every
+        // existing test left IsRenderTarget at its default of true; the tone-map blit's sampled source was the first
+        // non-RT texture created.
+        //
+        // The case therefore does all three things a sampled texture needs — upload into it, sample it from a shader,
+        // read it back — because each transitions the layout and any one of them alone would pass with a broken initial
+        // state.
+        GraphicsDevice* device = GetDevice();
+        if (device == nullptr)
+        {
+            WARN("no graphics device");
+            return;
+        }
+
+        constexpr UInt32 kSize = 4u;
+
+        TextureDesc desc;
+        desc.Name = "sampled-only";
+        desc.Width = kSize;
+        desc.Height = kSize;
+        desc.Format = GraphicsFormat::Rgba32Float;
+        desc.IsRenderTarget = false;  // the configuration that used to produce an undefined layout
+        desc.IsShaderResource = true;
+        Core::Ref<Texture> texture = Texture::Create(*device, desc);
+        REQUIRE(texture != nullptr);
+
+        std::vector<float> texels(static_cast<size_t>(kSize) * kSize * 4u, 0.0f);
+        for (UInt32 y = 0; y < kSize; ++y)
+        {
+            for (UInt32 x = 0; x < kSize; ++x)
+            {
+                float* texel = texels.data() + (static_cast<size_t>(y) * kSize + x) * 4u;
+                texel[0] = static_cast<float>(x) / 4.0f;
+                texel[1] = static_cast<float>(y) / 4.0f;
+                texel[2] = 0.5f;
+                texel[3] = 1.0f;
+            }
+        }
+
+        // Upload: transitions to CopyDest and back.
+        REQUIRE(texture->Update(*device, texels.data(), texels.size() * sizeof(float)));
+
+        // Sample it from a real fragment shader into a render target. This is the step that reproduces the original
+        // bug: the barrier emitted at close() targets the initial state, so it fires here rather than at upload.
+        nvrhi::IDevice* rhi = device->GetNativeDevice();
+        REQUIRE(rhi != nullptr);
+
+        const std::string header = "#version 450\n" + BuildGlslBindingPrelude();
+        // A full-screen triangle plus a texel-exact sample: uv comes from gl_FragCoord so texel (x,y) of the output
+        // reads texel (x,y) of the source under nearest filtering, which is what makes the assertion below
+        // discriminating. The binding macros come from BuildGlslBindingPrelude rather than numeric bindings — a
+        // hand-written number is the silent-zero failure ShaderBindings.h exists to prevent.
+        const CompiledShader vertex =
+            CompileGlsl(ShaderStage::Vertex,
+                        header +
+                            "void main(){\n"
+                            "  vec2 corner = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));\n"
+                            "  gl_Position = vec4(corner * 2.0f - 1.0f, 0.0f, 1.0f);\n"
+                            "}");
+        REQUIRE_MESSAGE(vertex.Succeeded, vertex.Diagnostics);
+
+        // The extent is a literal rather than textureSize(): querying a bare texture2D needs
+        // GL_EXT_samplerless_texture_functions, and requesting an extension to save writing one number into the source
+        // would make this test depend on driver feature support for no benefit.
+        const std::string extent = std::to_string(kSize) + ".0, " + std::to_string(kSize) + ".0";
+        const CompiledShader fragment = CompileGlsl(
+            ShaderStage::Pixel, header +
+                                    "layout(binding = HP_BINDING_TEXTURE(0)) uniform texture2D SourceTexture;\n"
+                                    "layout(binding = HP_BINDING_SAMPLER(0)) uniform sampler SourceSampler;\n"
+                                    "layout(location = 0) out vec4 OutColour;\n"
+                                    "void main(){\n"
+                                    "  const vec2 kExtent = vec2(" +
+                                    extent +
+                                    ");\n"
+                                    "  vec2 uv = (floor(gl_FragCoord.xy) + vec2(0.5)) / kExtent;\n"
+                                    "  OutColour = texture(sampler2D(SourceTexture, SourceSampler), uv);\n"
+                                    "}");
+        REQUIRE_MESSAGE(fragment.Succeeded, fragment.Diagnostics);
+
+        TextureDesc targetDesc;
+        targetDesc.Name = "sampled-only-target";
+        targetDesc.Width = kSize;
+        targetDesc.Height = kSize;
+        targetDesc.Format = GraphicsFormat::Rgba32Float;
+        Core::Ref<Texture> colour = Texture::Create(*device, targetDesc);
+        REQUIRE(colour != nullptr);
+
+        RenderTargetDesc framebufferDesc;
+        framebufferDesc.Name = "sampled-only-framebuffer";
+        framebufferDesc.Colour = colour;
+        Core::Ref<RenderTarget> target = RenderTarget::Create(*device, framebufferDesc);
+        REQUIRE(target != nullptr);
+
+        PipelineDesc pipelineDesc;
+        pipelineDesc.Name = "sampled-only-pipeline";
+        pipelineDesc.VertexShader.SpirV = vertex.SpirV;
+        pipelineDesc.PixelShader.SpirV = fragment.SpirV;
+        pipelineDesc.Bindings = {
+            BindingSlotDesc{BindingSlotDesc::Kind::SampledTexture, 0},
+            BindingSlotDesc{BindingSlotDesc::Kind::Sampler, 0},
+        };
+        pipelineDesc.BindingsVisibleToPixel = true;
+        pipelineDesc.IsDepthEnabled = false;
+        pipelineDesc.TriangleCulling = CullMode::None;
+
+        Core::Ref<Pipeline> pipeline = Pipeline::Create(*device, pipelineDesc, *target);
+        REQUIRE(pipeline != nullptr);
+
+        nvrhi::SamplerDesc samplerDesc;
+        samplerDesc.setAllFilters(false);
+        samplerDesc.addressU = nvrhi::SamplerAddressMode::Clamp;
+        samplerDesc.addressV = nvrhi::SamplerAddressMode::Clamp;
+        const nvrhi::SamplerHandle sampler = rhi->createSampler(samplerDesc);
+        REQUIRE(static_cast<bool>(sampler));
+
+        const nvrhi::BindingSetHandle bindingSet =
+            rhi->createBindingSet(nvrhi::BindingSetDesc()
+                                      .addItem(nvrhi::BindingSetItem::Texture_SRV(0, texture->GetNativeTexture()))
+                                      .addItem(nvrhi::BindingSetItem::Sampler(0, sampler)),
+                                  pipeline->GetBindingLayout());
+        REQUIRE(static_cast<bool>(bindingSet));
+
+        nvrhi::CommandListHandle commandList = rhi->createCommandList();
+        commandList->open();
+        commandList->clearTextureFloat(colour->GetNativeTexture(), nvrhi::TextureSubresourceSet(),
+                                       nvrhi::Color(0.0f, 0.0f, 0.0f, 1.0f));
+
+        nvrhi::GraphicsState state;
+        state.setPipeline(pipeline->GetNativePipeline())
+            .setFramebuffer(target->GetNativeFramebuffer())
+            .setViewport(nvrhi::ViewportState().addViewportAndScissorRect(
+                nvrhi::Viewport(static_cast<float>(kSize), static_cast<float>(kSize))))
+            .addBindingSet(bindingSet);
+        commandList->setGraphicsState(state);
+        commandList->draw(nvrhi::DrawArguments().setVertexCount(3).setInstanceCount(1));
+        commandList->close();
+
+        nvrhi::ICommandList* raw = commandList;
+        rhi->executeCommandLists(&raw, 1);
+        device->WaitForIdle();
+
+        // Readback: the third transition. Texel (3,3) is the far corner and the most discriminating — a layout problem
+        // typically leaves everything but the sampled region at the clear value.
+        UInt32 rowPitchBytes = 0;
+        const std::vector<UInt8> output = colour->ReadBack(*device, rowPitchBytes);
+        REQUIRE_FALSE(output.empty());
+
+        const auto* floats = reinterpret_cast<const float*>(output.data());
+        const Size perRow = rowPitchBytes / sizeof(float);
+        const float* texelOut = floats + perRow * (kSize - 1u) + static_cast<Size>(kSize - 1u) * 4u;
+
+        INFO("sampled texel " << texelOut[0] << ", " << texelOut[1] << ", " << texelOut[2] << ", " << texelOut[3]);
+        // Nearest sampling of a same-size target: the value must match the uploaded texel, which also proves the upload
+        // landed in the layout the shader then read.
+        CHECK(texelOut[0] == doctest::Approx(0.75f).epsilon(0.02));
+        CHECK(texelOut[1] == doctest::Approx(0.75f).epsilon(0.02));
+        CHECK(texelOut[3] == doctest::Approx(1.0f));
+
+        // A non-render-target texture with no usage at all has no legal layout to be created in, and says so rather
+        // than producing a resource that cannot be touched.
+        {
+            TextureDesc unusable;
+            unusable.Name = "no-usage";
+            unusable.Width = 4;
+            unusable.Height = 4;
+            unusable.Format = GraphicsFormat::Rgba32Float;
+            unusable.IsRenderTarget = false;
+            unusable.IsShaderResource = false;
+
+            // Refused with a logged reason rather than asserted: nothing about the arguments is malformed (a zero-size
+            // texture asserts), this is a configuration that simply cannot be honoured, and an editor creating textures
+            // from author data must get a null back rather than a dialog.
+            Test::ScopedLogCapture logs;
+            CHECK(Texture::Create(*device, unusable) == nullptr);
+            CHECK(logs.GetErrorCount() == 1);
+            CHECK(logs.AnyMessageContains("no usage"));
         }
     }
 }

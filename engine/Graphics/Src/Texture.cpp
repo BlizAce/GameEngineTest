@@ -14,7 +14,9 @@ namespace Hollowpoint::Graphics
 namespace
 {
 
-[[nodiscard]] nvrhi::TextureDesc MakeNvrhiDesc(const TextureDesc& desc)
+//! Converts the engine descriptor and picks the creation state. Returns false when the combination has no legal image
+//! layout (see the state-selection comment below); `outNvrhiDesc` is then untouched.
+[[nodiscard]] bool MakeNvrhiDesc(const TextureDesc& desc, nvrhi::TextureDesc& outNvrhiDesc)
 {
     nvrhi::TextureDesc nvrhiDesc;
     nvrhiDesc.debugName = desc.Name;
@@ -34,13 +36,55 @@ namespace
     // RenderTarget and keep it, so every command list tracks from there. Skipping keepInitialState is how "the
     // target stayed the clear colour" mysteries are born. Depth targets use DepthWrite, which is where depth
     // attachment loads/stores expect them.
-    nvrhiDesc.initialState = desc.IsRenderTarget
-                                 ? (Detail::IsDepthFormat(desc.Format) ? nvrhi::ResourceStates::DepthWrite
-                                                                       : nvrhi::ResourceStates::RenderTarget)
-                                 : nvrhi::ResourceStates::Common;
+    //
+    // The third branch exists because of a trap that cost a debugging session. NVRHI's Vulkan backend converts each
+    // ResourceStates bit to an image layout, and **ResourceStates::Common maps to vk::ImageLayout::eUndefined** (see
+    // g_ResourceStateMap in vulkan-constants.cpp). With keepInitialState set, CommandList::close() emits a barrier back
+    // to the initial state — so an initial state of Common is a barrier whose new layout is UNDEFINED. NVRHI asserts
+    // exactly that in debug (commitBarriersInternal) and writes an invalid transition into the command buffer
+    // otherwise. It stayed latent because nothing created a non-render-target texture until the tone-map blit needed a
+    // sampled source, and every existing test left IsRenderTarget at its default of true. Hence: choose a state with a
+    // real layout per supported usage, and refuse a texture that has none.
+    if (Detail::IsDepthFormat(desc.Format))
+    {
+        // Reported and refused by the caller (an assertion is a report, never a guard — AGENTS.md §4). Returning false
+        // matters because creating a depth texture that is not a render target yields a resource with no legal layout
+        // and no way to use it: every later failure would name the command list rather than this call.
+        if (!desc.IsRenderTarget)
+        {
+            HP_LOG_ERROR("GRAPHICS", "Texture::Create: '{}' is a depth format but not a render target", desc.Name);
+            return false;
+        }
+        nvrhiDesc.initialState = nvrhi::ResourceStates::DepthWrite;
+    }
+    else if (desc.IsRenderTarget)
+    {
+        nvrhiDesc.initialState = nvrhi::ResourceStates::RenderTarget;
+    }
+    else if (desc.IsShaderResource)
+    {
+        // Sampled-only: the layout a shader reads through. Update()/ReadBack() transition out to the transfer layouts
+        // and back, which keepInitialState then restores to a legal, defined layout.
+        nvrhiDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+    }
+    else
+    {
+        // No usage at all: there is no image layout NVRHI can park this in that any operation would accept.
+        HP_LOG_ERROR("GRAPHICS",
+                     "Texture::Create: '{}' has neither IsRenderTarget nor IsShaderResource — a texture with no usage "
+                     "cannot be created",
+                     desc.Name);
+        return false;
+    }
+
     nvrhiDesc.keepInitialState = true;
 
-    return nvrhiDesc;
+    // Note: CreateWrapping (swapchain back buffers) never reaches this function — it wraps an existing native handle
+    // and takes no state decisions, which is correct: a swapchain image's layout belongs to the compositor and
+    // vkAcquireNextImageKHR, and Vulkan permits only UNDEFINED or PRESENT_SRC_KHR between presentation and acquire.
+
+    outNvrhiDesc = nvrhiDesc;
+    return true;
 }
 
 }  // namespace
@@ -57,7 +101,11 @@ Core::Ref<Texture> Texture::Create(GraphicsDevice& device, const TextureDesc& de
         return nullptr;
     }
 
-    const nvrhi::TextureDesc nvrhiDesc = MakeNvrhiDesc(desc);
+    nvrhi::TextureDesc nvrhiDesc;
+    if (!MakeNvrhiDesc(desc, nvrhiDesc))
+    {
+        return nullptr;  // reason already logged with the texture's name
+    }
 
     nvrhi::TextureHandle handle = rhi->createTexture(nvrhiDesc);
     if (!static_cast<bool>(handle))

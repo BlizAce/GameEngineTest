@@ -257,6 +257,24 @@ if(TARGET HollowpointRenderer)
         LIBS Hollowpoint::Game Hollowpoint::Graphics Hollowpoint::Renderer
         NO_LEAK_CHECK)
 
+    # The runtime's screenshot path: format conversion (CPU-only cases) plus a GPU capture compared texel-by-texel
+    # against the CPU display transform. Needs a device; GPU-target leak policy.
+    hp_add_module_test(Screenshot
+        SOURCES
+            Runtime/TestScreenshot.cpp
+        LIBS Hollowpoint::Runtime Hollowpoint::Graphics Hollowpoint::Renderer
+        NO_LEAK_CHECK)
+
+    # The frame loop itself: window -> device -> swapchain -> ring -> forward pass -> tone map -> present, with scene
+    # loading and scripts inside it. Nothing else covers the seams — every subsystem had its own suite while the engine as a
+    # whole had none, which is precisely how "all tests green, engine does not run" was possible. Needs a display; cases skip
+    # with a WARN where there is none, and GPU-target leak policy.
+    hp_add_module_test(RuntimeApplication
+        SOURCES
+            Runtime/TestRuntimeApplication.cpp
+        LIBS Hollowpoint::Runtime Hollowpoint::Game Hollowpoint::Graphics Hollowpoint::Platform
+        NO_LEAK_CHECK)
+
     # CPU-only like the other shading references: no RHI, no GPU, full leak checking.
     hp_add_module_test(ImageBasedLighting
         SOURCES

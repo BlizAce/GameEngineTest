@@ -87,6 +87,13 @@ if(HP_ENABLE_SCRIPTING)
     add_subdirectory(engine/Scripting)
 endif()
 
+# The runtime sits above everything it drives (window, device, swapchain, renderer, scene, scripts), so it is added last
+# among the engine modules. Only meaningful with the graphics stack: without Vulkan there is nothing to present to, and a
+# shell whose sole job is presenting would build into an empty library that links for no reason.
+if(HP_ENABLE_VULKAN)
+    add_subdirectory(engine/Runtime)
+endif()
+
 if(HP_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

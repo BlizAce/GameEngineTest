@@ -1,0 +1,282 @@
+{
+  "formatVersion": 1,
+  "name": "Demo Scene",
+  "entities": [
+    {
+      "id": 0,
+      "components": {
+        "LocalTransform": {
+          "position": {
+            "x": 0.0,
+            "y": 1.2,
+            "z": 6.0
+          },
+          "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+          },
+          "scale": {
+            "x": 1.0,
+            "y": 1.0,
+            "z": 1.0
+          }
+        },
+        "Camera": {
+          "position": {
+            "x": 0.0,
+            "y": 1.2,
+            "z": 6.0
+          },
+          "target": {
+            "x": 0.0,
+            "y": 0.4,
+            "z": 0.0
+          },
+          "verticalFieldOfView": 0.9599311,
+          "nearPlane": 0.1,
+          "farPlane": 200.0
+        }
+      }
+    },
+    {
+      "id": 1,
+      "components": {
+        "Light": {
+          "type": "Directional",
+          "color": {
+            "x": 1.0,
+            "y": 0.95,
+            "z": 0.85
+          },
+          "intensity": 4.0,
+          "direction": {
+            "x": 0.2673,
+            "y": 0.5345,
+            "z": -0.8018
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "components": {
+        "LocalTransform": {
+          "position": {
+            "x": -2.5,
+            "y": 2.0,
+            "z": 2.0
+          },
+          "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+          },
+          "scale": {
+            "x": 1.0,
+            "y": 1.0,
+            "z": 1.0
+          }
+        },
+        "Light": {
+          "type": "Point",
+          "color": {
+            "x": 1.0,
+            "y": 0.45,
+            "z": 0.2
+          },
+          "intensity": 20.0,
+          "range": 14.0
+        }
+      }
+    },
+    {
+      "id": 3,
+      "components": {
+        "LocalTransform": {
+          "position": {
+            "x": 2.6,
+            "y": 1.6,
+            "z": -1.5
+          },
+          "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+          },
+          "scale": {
+            "x": 1.0,
+            "y": 1.0,
+            "z": 1.0
+          }
+        },
+        "Light": {
+          "type": "Point",
+          "color": {
+            "x": 0.35,
+            "y": 0.6,
+            "z": 1.0
+          },
+          "intensity": 16.0,
+          "range": 14.0
+        }
+      }
+    },
+    {
+      "id": 4,
+      "components": {
+        "MeshRenderer": {
+          "meshPath": "engine:plane",
+          "baseColor": {
+            "x": 0.62,
+            "y": 0.63,
+            "z": 0.66
+          },
+          "roughness": 0.75,
+          "metallic": 0.0
+        }
+      }
+    },
+    {
+      "id": 5,
+      "components": {
+        "LocalTransform": {
+          "position": {
+            "x": 0.0,
+            "y": 0.75,
+            "z": 0.0
+          },
+          "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+          },
+          "scale": {
+            "x": 1.5,
+            "y": 1.5,
+            "z": 1.5
+          }
+        },
+        "MeshRenderer": {
+          "meshPath": "engine:cube",
+          "baseColor": {
+            "x": 0.86,
+            "y": 0.34,
+            "z": 0.18
+          },
+          "roughness": 0.32,
+          "metallic": 0.0
+        }
+      }
+    },
+    {
+      "id": 6,
+      "components": {
+        "LocalTransform": {
+          "position": {
+            "x": -2.1,
+            "y": 0.55,
+            "z": 0.9
+          },
+          "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+          },
+          "scale": {
+            "x": 1.1,
+            "y": 1.1,
+            "z": 1.1
+          }
+        },
+        "MeshRenderer": {
+          "meshPath": "engine:cube",
+          "baseColor": {
+            "x": 0.75,
+            "y": 0.78,
+            "z": 0.82
+          },
+          "roughness": 0.18,
+          "metallic": 0.9
+        },
+        "Script": {
+          "scriptName": "Spin"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "components": {
+        "LocalTransform": {
+          "position": {
+            "x": 1.9,
+            "y": 0.4,
+            "z": -0.6
+          },
+          "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+          },
+          "scale": {
+            "x": 0.8,
+            "y": 0.8,
+            "z": 0.8
+          }
+        },
+        "MeshRenderer": {
+          "meshPath": "engine:cube",
+          "baseColor": {
+            "x": 0.24,
+            "y": 0.62,
+            "z": 0.44
+          },
+          "roughness": 0.5,
+          "metallic": 0.0
+        },
+        "Script": {
+          "scriptName": "Bob"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "components": {
+        "LocalTransform": {
+          "position": {
+            "x": 1.1,
+            "y": 0.35,
+            "z": 2.2
+          },
+          "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+          },
+          "scale": {
+            "x": 0.7,
+            "y": 0.7,
+            "z": 0.7
+          }
+        },
+        "MeshRenderer": {
+          "meshPath": "engine:cube",
+          "baseColor": {
+            "x": 0.9,
+            "y": 0.85,
+            "z": 0.3
+          },
+          "roughness": 0.9,
+          "metallic": 0.0
+        }
+      }
+    }
+  ]
+}

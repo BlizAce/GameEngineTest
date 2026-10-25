@@ -462,7 +462,7 @@ TEST_SUITE("Renderer/ShadingEquivalence")
                 if (token.find_first_of(".eE") == std::string::npos)
                 {
                     allLiteralsWellFormed = false;
-                    INFO("bare integer literal in generated GLSL: " << token.c_str());
+                    INFO("bare integer literal in generated GLSL: " << token);
                 }
 
                 searchFrom = end;

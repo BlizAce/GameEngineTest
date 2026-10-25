@@ -325,7 +325,6 @@ Window* Window::Create(const WindowDesc& desc)
     glfwWindowHint(GLFW_RESIZABLE, desc.Resizable ? GLFW_TRUE : GLFW_FALSE);
     glfwWindowHint(GLFW_FOCUSED, desc.Focused ? GLFW_TRUE : GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, desc.Decorated ? GLFW_TRUE : GLFW_FALSE);
-    glfwWindowHint(GLFW_ICONIFIED, desc.Iconified ? GLFW_TRUE : GLFW_FALSE);
     glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, desc.TransparentFramebuffer ? GLFW_TRUE : GLFW_FALSE);
 
     // No client API: the renderer creates its own Vulkan context. Asking GLFW for an OpenGL context would both
@@ -345,6 +344,20 @@ Window* Window::Create(const WindowDesc& desc)
                      desc.Title, error);
         delete impl;
         return nullptr;
+    }
+
+    // Iconification is applied after creation because GLFW has no hint for it: GLFW_ICONIFIED is an *attribute*,
+    // readable through glfwGetWindowAttrib but absent from that function's hint switch, so passing it to
+    // glfwWindowHint falls through to "Invalid window hint 0x00020002". That was not harmless — the error is sticky,
+    // and since this call sat before glfwCreateWindow the clear above could not cover it: every window creation left a
+    // spurious PLATFORM error logged, and on the next create the stale error was cleared and mistaken for nothing at
+    // all.
+    //
+    // Iconifying post-creation is also what the platform actually does: minimising is a compositor request (xdg
+    // set_minimized / libdecor), not a creation-time property, so there is no earlier moment it could honour it.
+    if (desc.Iconified)
+    {
+        glfwIconifyWindow(handle);
     }
 
     impl->Handle = handle;

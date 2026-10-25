@@ -750,11 +750,11 @@ TEST_SUITE("Graphics/Swapchain")
         {
             for (const std::string& line : logs.GetLines())
             {
-                // Single argument on purpose: doctest's MESSAGE with a comma-separated list expands via the comma
-                // operator and prints only the last operand's boolean conversion, i.e. "1" instead of the line being
-                // diagnosed.
+                // A std::string argument, not .c_str(): doctest 2.5.3 stringifies `char[N]` literals but routes any
+                // other char pointer through its bool conversion, so MESSAGE(report.c_str()) prints "1" instead of the
+                // line being diagnosed.
                 const std::string report = "captured: " + line;
-                MESSAGE(report.c_str());
+                MESSAGE(report);
             }
         }
         CHECK(logs.GetErrorCount() == 0);

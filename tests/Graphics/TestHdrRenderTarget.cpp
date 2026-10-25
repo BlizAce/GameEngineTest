@@ -331,7 +331,7 @@ TEST_SUITE("Graphics/HdrRenderTarget")
             std::string failure;
             const float readBack = RenderAndReadBackRed(rhi, sample, failure);
 
-            INFO("wrote " << sample << " read back " << readBack << " failure: " << failure.c_str());
+            INFO("wrote " << sample << " read back " << readBack << " failure: " << failure);
             REQUIRE(failure.empty());
 
             if (sample == 0.0f)
@@ -358,7 +358,7 @@ TEST_SUITE("Graphics/HdrRenderTarget")
         std::string failure;
         const float bright = RenderAndReadBackRed(rhi, 1024.0f, failure);
 
-        INFO("1024 read back as " << bright << " failure: " << failure.c_str());
+        INFO("1024 read back as " << bright << " failure: " << failure);
         CHECK(std::isfinite(bright));
         CHECK(bright == doctest::Approx(1024.0f).epsilon(2.0e-3));
     }

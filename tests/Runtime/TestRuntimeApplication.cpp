@@ -226,12 +226,12 @@ bool CheckNoGraphicsErrors(const Hollowpoint::Test::ScopedLogCapture& logs)
     const std::vector<std::string> errors = GraphicsErrors(logs);
     for (const std::string& error : errors)
     {
-        // One argument, built outside the macro. doctest's MESSAGE stringifies its whole argument list, so the
-        // two-argument form expands through the comma operator and prints the boolean conversion of the last operand —
-        // observed as every line reading literally "1", which is worse than useless when it is the only evidence of a
-        // GPU error.
+        // Pass a std::string, never a char pointer: doctest 2.5.3 stringifies `char[N]` literals through its own
+        // overload but routes any other pointer via its bool conversion — so `MESSAGE(report.c_str())`, and streaming
+        // `.c_str()` with <<, print "1" instead of the message. Measured against doctest 2.5.3 directly; a std::string
+        // argument (or `<< std::string`) prints correctly.
         const std::string report = "unexpected graphics error: " + error;
-        MESSAGE(report.c_str());
+        MESSAGE(report);
     }
     return errors.empty();
 }

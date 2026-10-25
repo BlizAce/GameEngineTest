@@ -359,15 +359,33 @@ TEST_SUITE("Platform/Window")
         WindowDesc desc;
         desc.Iconified = true;  // The harness already forces Visible = false.
 
+        Hollowpoint::Test::ScopedLogCapture logs;
         ScopedWindow window(desc);
 
         CHECK_FALSE(window.Handle->IsVisible());
 
-        // Not asserted: that the window reads back as iconified. Iconification is the compositor's decision, not
-        // ours — a window that was never mapped (Visible = false, forced by the harness) can be reported as not
-        // iconified because there is no taskbar entry to minimise, which is what KDE does here. Asserting it would
-        // encode one compositor's behaviour and break on others. What is deterministic in both directions is that
-        // *restoring* cannot leave a window iconified, so that is the invariant checked below.
+        // Iconification must actually be applied — and this is the regression test for it not being. Window::Create
+        // used to pass GLFW_ICONIFIED to glfwWindowHint, which has no such hint (it is an attribute), so GLFW ignored
+        // the value and logged "Invalid window hint". The result looked like platform behaviour rather than a bug: the
+        // window was simply never iconified, and an earlier version of this case asserted nothing here at all,
+        // explaining that minimising "is the compositor's decision" — a plausible-sounding reason that happened to be
+        // describing our own no-op. On the Null backend (forced for this suite, see GetProcessScope) there is no
+        // compositor in the loop: iconified is plain window state, so it is asserted directly and deterministically.
+        CHECK(window.Handle->IsIconified());
+
+        // And creating a window must not leave a GLFW error behind. Sticky in GLFW, so an invalid hint here would also
+        // be cleared by the *next* creation's error reset and never surface anywhere else — this assertion is the only
+        // place it could be caught.
+        if (logs.GetErrorCount() != 0)
+        {
+            for (const std::string& line : logs.GetLines())
+            {
+                const std::string report = "window creation logged: " + line;
+                MESSAGE(report);
+            }
+        }
+        CHECK(logs.GetErrorCount() == 0);
+
         window.Handle->SetIconified(false);
         CHECK_FALSE(window.Handle->IsIconified());
 

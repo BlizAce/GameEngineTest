@@ -427,6 +427,14 @@ bool RuntimeApplication::HandleResize(UInt32 framebufferWidth, UInt32 framebuffe
     m_SwapchainWidth = m_Swapchain->GetWidth();
     m_SwapchainHeight = m_Swapchain->GetHeight();
 
+    // The host owns viewport-sized resources (an editor renders its scene panel into a texture sized to the panel,
+    // not the window), so it learns about the new extent here rather than polling for it. After the swapchain
+    // succeeded: a host resizing to an extent the swapchain rejected would allocate for a size that never renders.
+    if (m_Host != nullptr)
+    {
+        m_Host->OnResize(m_SwapchainWidth, m_SwapchainHeight);
+    }
+
     // The capture target is sized to the swapchain, so it is dropped rather than resized: recreating on next use costs
     // one texture and keeps this path to a single allocation site. Keeping a stale-extent target would render a
     // stretched image that looks like a projection bug.
@@ -570,7 +578,10 @@ void RuntimeApplication::UpdateAndCollect()
     // --- scripts ------------------------------------------------------------------
     // Before transforms: a script that moves an entity this frame must show up this frame, not next. Running after the
     // transform pass is the classic one-frame-late camera and "physics lags input" bug.
-    if (m_Scripts != nullptr)
+    // A host may pause them (an editor's edit mode: Lua is gameplay, and a world that animates while you place things
+    // is not an editor). Transforms still resolve — entities moved by the inspector must update their children even
+    // with every script stopped.
+    if (m_Scripts != nullptr && (m_Host == nullptr || !m_Host->AreScriptsPaused()))
     {
         m_Scripts->Update(m_World, static_cast<float>(m_Time.GetDeltaSeconds()));
     }
@@ -579,56 +590,65 @@ void RuntimeApplication::UpdateAndCollect()
     m_Transforms.Update(m_World);
 
     // --- camera -------------------------------------------------------------------
+    // A host camera (an editor's fly viewport) wins outright when offered: the scene's own cameras are then data
+    // being edited, not the point of view, and scanning for one would render from inside a lamp post every time an
+    // author leaves a Camera component active. The override is checked first so it also skips the "no active camera"
+    // fallback warning — a hosted loop whose scene has no camera is normal and says nothing worth logging.
+    CameraState cameraState;
+    bool haveCamera = m_Host != nullptr && m_Host->GetCameraOverride(cameraState);
+
     // The first active camera wins, deterministically by entity slot order. An explicit "which camera is live"
     // component is a later feature; until then the rule has to be stated because two cameras in a scene otherwise make
     // the view depend on creation order nobody chose deliberately.
-    const CameraComponent* camera = nullptr;
-    Entity cameraEntity{};
+    if (!haveCamera)
+    {
+        const CameraComponent* camera = nullptr;
+        Entity cameraEntity{};
 
-    m_World.ForEachEntity([&](const Entity& entity) {
+        m_World.ForEachEntity([&](const Entity& entity) {
+            if (camera != nullptr)
+            {
+                return;
+            }
+            const auto* found = m_World.TryGetComponent<CameraComponent>(entity);
+            if (found != nullptr && found->Active)
+            {
+                camera = found;
+                cameraEntity = entity;
+            }
+        });
+
+        // Aspect from the HDR target, which is sized to the swapchain: not from the window's content size, which
+        // differs by the DPI scale factor and would stretch the image on a HiDPI display.
+        const Float32 aspect = (m_SwapchainWidth != 0u && m_SwapchainHeight != 0u)
+                                   ? static_cast<Float32>(m_SwapchainWidth) / static_cast<Float32>(m_SwapchainHeight)
+                                   : 1.0f;
+
         if (camera != nullptr)
         {
-            return;
+            // The hierarchy's Transform overload, not the no-transform one: a camera parented to a moving object (a
+            // vehicle, an editor's orbit rig) must move with it. Passing only the component would render such a
+            // camera stuck at its authored position while the thing carrying it drove away — and in a scene where
+            // every mesh IS parented, that is all of them.
+            const Math::Transform worldTransform = m_Transforms.GetWorldTransform(m_World, cameraEntity);
+            cameraState = ComputeCameraState(*camera, &worldTransform, aspect);
         }
-        const auto* found = m_World.TryGetComponent<CameraComponent>(entity);
-        if (found != nullptr && found->Active)
+        else
         {
-            camera = found;
-            cameraEntity = entity;
-        }
-    });
+            // No camera: a default one pulled back on +Z so an authored scene without a camera still shows its
+            // content rather than rendering nothing. Reported once per startup rather than per frame — after the
+            // first warning the situation is established, and 144 lines a second buries everything else.
+            CameraComponent fallback;
+            fallback.Position = Vec3(0.0f, 1.5f, 6.0f);
+            fallback.Target = Vec3(0.0f, 0.0f, 0.0f);
+            cameraState = ComputeCameraState(fallback, aspect);
 
-    // Aspect from the HDR target, which is sized to the swapchain: not from the window's content size, which differs by
-    // the DPI scale factor and would stretch the image on a HiDPI display.
-    const Float32 aspect = (m_SwapchainWidth != 0u && m_SwapchainHeight != 0u)
-                               ? static_cast<Float32>(m_SwapchainWidth) / static_cast<Float32>(m_SwapchainHeight)
-                               : 1.0f;
-
-    CameraState cameraState;
-    if (camera != nullptr)
-    {
-        // The hierarchy's Transform overload, not the no-transform one: a camera parented to a moving object (a
-        // vehicle, an editor's orbit rig) must move with it. Passing only the component would render such a camera
-        // stuck at its authored position while the thing carrying it drove away — and in a scene where every mesh IS
-        // parented, that is all of them.
-        const Math::Transform worldTransform = m_Transforms.GetWorldTransform(m_World, cameraEntity);
-        cameraState = ComputeCameraState(*camera, &worldTransform, aspect);
-    }
-    else
-    {
-        // No camera: a default one pulled back on +Z so an authored scene without a camera still shows its content
-        // rather than rendering nothing. Reported once per startup rather than per frame — after the first warning the
-        // situation is established, and 144 lines a second buries everything else.
-        CameraComponent fallback;
-        fallback.Position = Vec3(0.0f, 1.5f, 6.0f);
-        fallback.Target = Vec3(0.0f, 0.0f, 0.0f);
-        cameraState = ComputeCameraState(fallback, aspect);
-
-        static bool s_LoggedNoCamera = false;
-        if (!s_LoggedNoCamera)
-        {
-            HP_LOG_WARNING(kLogChannel, "scene has no active CameraComponent; using a default view");
-            s_LoggedNoCamera = true;
+            static bool s_LoggedNoCamera = false;
+            if (!s_LoggedNoCamera)
+            {
+                HP_LOG_WARNING(kLogChannel, "scene has no active CameraComponent; using a default view");
+                s_LoggedNoCamera = true;
+            }
         }
     }
 
@@ -729,6 +749,25 @@ bool RuntimeApplication::RunFrame()
         }
     }
 
+    // Host input routing, after the loop has taken what it owns (resize) and before anything else runs. The host
+    // sees every event exactly once per frame — this is the only drain point — so an embedding editor forwards the
+    // events to its UI toolkit here and ImGui's NewFrame (later, at draw time) processes them in order, which is
+    // precisely how the stock GLFW backend's callbacks work. Events the host consumed are dropped; survivors stay in
+    // m_HostEvents for whoever eats input next — today that is nothing but tests and a future action map, since
+    // "input reaching gameplay" is still on the roadmap (docs/ARCHITECTURE.md). Resize/close are deliberately not
+    // offerable as droppable: resize was recorded above and ShouldClose ends the loop below no matter what the host
+    // returns — a host that swallowed them would hang window management, and "my window stopped resizing" is a bug
+    // with no breadcrumb.
+    m_HostEvents.clear();
+    for (const InputEvent& event : m_Events)
+    {
+        if (m_Host != nullptr && m_Host->ConsumeInputEvent(event))
+        {
+            continue;
+        }
+        m_HostEvents.push_back(event);
+    }
+
     if (m_Window->ShouldClose())
     {
         m_StopReason = StopReason::WindowClosed;
@@ -774,7 +813,6 @@ bool RuntimeApplication::RunFrame()
 
     // --- 3-5. scripts, transforms, collection ----------------------------------------
     UpdateAndCollect();
-
     // --- 6. acquire + render ----------------------------------------------------------
     if (m_FrameRing->BeginFrame(true) != Graphics::FrameQueueStatus::Began)
     {
@@ -839,15 +877,36 @@ bool RuntimeApplication::RunFrame()
     }
 
     const Vec4 background(m_Config.BackgroundRed, m_Config.BackgroundGreen, m_Config.BackgroundBlue, 1.0f);
-    if (!m_Renderer->RenderFrame(m_Plan, *m_HdrTarget, *backBuffer, m_Config.Exposure, slot, background))
+
+    // One owner per frame: a host that takes the frame over draws everything (its scene panel + its UI) into the
+    // back buffer; otherwise the runtime renders its own forward pass and the host may add an overlay on top. The
+    // split is decided once, here, so "who wrote this pixel" always has one answer — see ApplicationHost.h.
+    const FrameContext frameContext{backBuffer, m_SwapchainWidth,         m_SwapchainHeight,
+                                    slot,       m_Time.GetDeltaSeconds(), m_Frames};
+
+    bool frameDrawn = false;
+    if (m_Host != nullptr)
     {
-        // The renderer logs the specific cause (shader, pipeline, buffer). Stopping on the first failure would hide it
-        // under a wall of identical messages if it recurred, and continuing past a device-level failure produces
-        // nothing but errors.
-        HP_LOG_ERROR(kLogChannel, "frame {} failed to render", m_Frames + 1ull);
-        m_FrameRing->EndFrame(slot);
-        m_StopReason = StopReason::DeviceLost;
-        return false;
+        frameDrawn = m_Host->RenderScenePass(frameContext);
+    }
+
+    if (!frameDrawn)
+    {
+        if (!m_Renderer->RenderFrame(m_Plan, *m_HdrTarget, *backBuffer, m_Config.Exposure, slot, background))
+        {
+            // The renderer logs the specific cause (shader, pipeline, buffer). Stopping on the first failure would hide
+            // it under a wall of identical messages if it recurred, and continuing past a device-level failure produces
+            // nothing but errors.
+            HP_LOG_ERROR(kLogChannel, "frame {} failed to render", m_Frames + 1ull);
+            m_FrameRing->EndFrame(slot);
+            m_StopReason = StopReason::DeviceLost;
+            return false;
+        }
+
+        if (m_Host != nullptr)
+        {
+            m_Host->RenderOverlay(frameContext);
+        }
     }
 
     // --- 7. present + end frame -------------------------------------------------------
@@ -949,6 +1008,17 @@ Game::SceneRenderer* RuntimeApplication::GetRenderer() const noexcept
 UInt64 RuntimeApplication::GetFrameCount() const noexcept
 {
     return m_Frames;
+}
+
+const Game::RenderPlan& RuntimeApplication::GetLastRenderPlan() const noexcept
+{
+    return m_Plan;
+}
+
+void RuntimeApplication::GetSwapchainExtent(UInt32& outWidth, UInt32& outHeight) const noexcept
+{
+    outWidth = m_SwapchainWidth;
+    outHeight = m_SwapchainHeight;
 }
 
 UInt64 RuntimeApplication::GetDrawCount() const noexcept

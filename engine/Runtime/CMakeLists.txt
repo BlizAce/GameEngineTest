@@ -17,6 +17,7 @@ target_include_directories(HollowpointRuntime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/Include")
 
 target_sources(HollowpointRuntime PRIVATE
+    Include/Hollowpoint/Runtime/ApplicationHost.h
     Include/Hollowpoint/Runtime/BuiltInMeshes.h
     Include/Hollowpoint/Runtime/RuntimeApplication.h
     Include/Hollowpoint/Runtime/RuntimeConfig.h

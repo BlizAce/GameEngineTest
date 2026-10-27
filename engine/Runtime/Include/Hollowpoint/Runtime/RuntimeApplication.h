@@ -12,6 +12,7 @@
 #include "Hollowpoint/Game/RenderPrimitives.h"
 #include "Hollowpoint/Math/MathCore.h"
 #include "Hollowpoint/Platform/InputEvent.h"
+#include "Hollowpoint/Runtime/ApplicationHost.h"
 #include "Hollowpoint/Runtime/RuntimeConfig.h"
 #include "Hollowpoint/Scene/TransformHierarchy.h"
 
@@ -157,6 +158,19 @@ public:
     //! is the difference between a scene bug and a wiring bug when someone reports a black window.
     [[nodiscard]] UInt64 GetFrameCount() const noexcept;
 
+    //! The render plan produced by the most recent UpdateAndCollect, valid until the next frame updates it — i.e.
+    //! exactly the window an `IApplicationHost::RenderScenePass` implementation runs in. A host that takes the frame
+    //! over must render *this* plan rather than re-collecting from the world: collection resolved the camera override
+    //! and the transform pass, and re-doing either would diverge from what a standalone run shows. Until hosts existed
+    //! the plan had no external consumer and stayed private; exposing it (read-only) is what makes "the host owns
+    //! presentation" implementable without duplicating collection.
+    [[nodiscard]] const Game::RenderPlan& GetLastRenderPlan() const noexcept;
+
+    //! Current swapchain extent in framebuffer pixels, or 0/0 before the swapchain exists. A host allocating its own
+    //! HDR target sizes to this (the same value the runtime's internal target uses), so a takeover frame matches a
+    //! native one pixel for pixel.
+    void GetSwapchainExtent(UInt32& outWidth, UInt32& outHeight) const noexcept;
+
     //! Indexed draws submitted across all frames, forwarded from the renderer. Zero with a non-zero frame count means
     //! the scene collected nothing — the single most common cause of a blank window.
     [[nodiscard]] UInt64 GetDrawCount() const noexcept;
@@ -184,6 +198,32 @@ public:
     bool CaptureScreenshot(const std::string& path);
 
     [[nodiscard]] const RuntimeConfig& GetConfig() const noexcept;
+
+    // -----------------------------------------------------------------------
+    // Editor embedding — see ApplicationHost.h for why each hook exists.
+    // -----------------------------------------------------------------------
+
+    //! Attaches an embedding host (the editor). Call before Start(); the host is then consulted every frame at the
+    //! points documented on RuntimeApplication's frame steps. Passing nullptr detaches and the loop reverts to plain
+    //! standalone behaviour. Not owned: the host must outlive this application — which it does by construction, since
+    //! the editor owns both.
+    void SetEditorHost(IApplicationHost* host) noexcept
+    {
+        m_Host = host;
+    }
+
+    [[nodiscard]] IApplicationHost* GetEditorHost() const noexcept
+    {
+        return m_Host;
+    }
+
+    //! Events drained this frame that the host did not consume, in poll order. Empty without a host (everything
+    //! survives) or after one consumed them all. This is what a future action map / gameplay input layer will eat;
+    //! until then it exists so tests can assert "the host saw exactly these events and dropped exactly those".
+    [[nodiscard]] const std::vector<Platform::InputEvent>& GetUnconsumedEvents() const noexcept
+    {
+        return m_HostEvents;
+    }
 
 private:
     //! The private tone-map target CaptureScreenshot renders into, created on first use at the current swapchain
@@ -226,6 +266,10 @@ private:
 
     // Config first: everything below reads it during Start().
     RuntimeConfig m_Config;
+
+    //! The embedding host (the editor), or null for standalone operation. Never owned — see SetEditorHost. Placed
+    //! before the subsystems it observes so nothing can consult a half-constructed loop.
+    IApplicationHost* m_Host = nullptr;  // not owned
 
     // Owned, in CONSTRUCTION order. Teardown is the reverse, which is what keeps the renderer's pipelines from
     // outliving the render targets they were created against and those from outliving the device.
@@ -277,6 +321,10 @@ private:
     bool m_ResizePending = false;
     UInt32 m_PendingWidth = 0;
     UInt32 m_PendingHeight = 0;
+
+    //! Events drained this frame that no host consumed, kept until something else eats input (see RunFrame step 1).
+    //! Today nothing iterates it beyond tests; a future action map reads it instead of m_Events.
+    std::vector<Platform::InputEvent> m_HostEvents;
 
     //! The private tone-map target CaptureScreenshot renders into, recreated when the extent changes. Held separately
     //! from the HDR target because it is 8-bit display-referred output: allocating it up front would cost a texture per

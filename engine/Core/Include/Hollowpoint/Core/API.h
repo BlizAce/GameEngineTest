@@ -32,6 +32,7 @@
     #define HP_PHYSICS_API
     #define HP_AUDIO_API
     #define HP_SCRIPTING_API
+    #define HP_EDITOR_API
 #else
     #ifdef HP_CORE_EXPORTS
         #define HP_CORE_API HP_DLL_EXPORT
@@ -115,6 +116,12 @@
         #define HP_SCRIPTING_API HP_DLL_EXPORT
     #else
         #define HP_SCRIPTING_API HP_DLL_IMPORT
+    #endif
+
+    #ifdef HP_EDITOR_EXPORTS
+        #define HP_EDITOR_API HP_DLL_EXPORT
+    #else
+        #define HP_EDITOR_API HP_DLL_IMPORT
     #endif
 #endif
 

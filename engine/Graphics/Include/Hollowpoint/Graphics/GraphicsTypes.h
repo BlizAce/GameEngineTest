@@ -89,6 +89,19 @@ enum class CullMode : UInt8
     Front,
 };
 
+//! Colour-target alpha blending. A property of the pipeline like depth state, deliberately not left for call sites to
+//! hand-assemble through the RHI escape hatch: that is how one pass ends up premultiplied and the next straight alpha,
+//! with no shader at fault and a composite that looks almost right.
+//!
+//! Two values rather than NVRHI's full factor/op matrix because every member of a public API is a decision this project
+//! owns (see this header's file comment) and only these two have users: opaque writes, and compositing UI over a
+//! scene. An additive glow pass adds its enumerator when it exists.
+enum class BlendMode : UInt8
+{
+    Disabled,  //!< `out = src`. The forward pass; the engine's historical behaviour.
+    Alpha,     //!< `out = src*srcAlpha + dst*(1-srcAlpha)` — non-premultiplied compositing, i.e. ImGui's output.
+};
+
 //! Depth comparison for the depth-stencil state.
 enum class CompareFunction : UInt8
 {

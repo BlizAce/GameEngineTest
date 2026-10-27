@@ -219,6 +219,18 @@ public:
     //! piece ("no Vulkan-capable adapter found", "driver reports Vulkan 1.1, 1.2 required").
     [[nodiscard]] static const char* GetFailureReason();
 
+    //! The queue family the graphics queue was requested from.
+    /**
+     * Public because a host that records commands into the same queue outside NVRHI — which is exactly what an overlay
+     * UI backend does (Dear ImGui's Vulkan backend needs a command pool, and a VkCommandPool must belong to the family
+     * its queue came from) — cannot recover the number from a VkQueue afterwards. It was private with `friend class
+     * Swapchain` for that single use; promoting it rather than bequeathing friendship keeps the value read-only, which
+     * is not something handing out the VkDevice could guarantee. The spec forbids rediscovering it by calling
+     * vkGetDeviceQueue per family (VUID-vkGetDeviceQueue-queueFamilyIndex-00384 — only the graphics family was passed
+     * to vkCreateDevice), so there is no external way to ask; this is where the chosen value lives.
+     */
+    [[nodiscard]] uint32_t GetVkQueueFamilyIndex() const noexcept;
+
 private:
     GraphicsDevice();
 
@@ -226,16 +238,6 @@ private:
     //! free of Vulkan includes — the whole reason GraphicsDevice.h is cheap to include.
     [[nodiscard]] void* GetNativeVkDevice() const noexcept;
     [[nodiscard]] void* GetNativeVkQueue() const noexcept;
-
-    //! The queue family the graphics queue was requested from. Needed because a VkCommandPool must be created for the
-    //! family a queue actually belongs to, and there is no way to recover that from a VkQueue afterwards.
-    //!
-    //! Swapchain used to discover it by calling vkGetDeviceQueue for every family and comparing handles — which is a
-    //! spec violation: only the graphics family was passed to vkCreateDevice's pQueueCreateInfos, so querying any other
-    //! index is undefined behaviour (validation reports VUID-vkGetDeviceQueue-queueFamilyIndex-00384 once per frame).
-    //! It happened to work because drivers return null rather than faulting. Reading the value from where it was chosen
-    //! removes both the UB and the O(families) probe.
-    [[nodiscard]] uint32_t GetVkQueueFamilyIndex() const noexcept;
 
     //! The surface created by AttachWindow, or null. Owned by this class — Swapchain must never destroy it.
     [[nodiscard]] void* GetNativeVkSurface() const noexcept;

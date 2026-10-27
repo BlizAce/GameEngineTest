@@ -217,7 +217,25 @@ Core::Ref<Pipeline> Pipeline::Create(GraphicsDevice& device, const PipelineDesc&
     depth.depthWriteEnable = desc.IsDepthWriteEnabled;
     depth.depthFunc = ToNvrhi(desc.DepthFunction);
 
-    pipelineDesc.setRenderState(nvrhi::RenderState().setRasterState(raster).setDepthStencilState(depth));
+    // Blend state is only attached when blending is on, so an opaque pipeline's VkPipelineColorBlendState stays exactly
+    // what it was before this field existed — the default-constructed NVRHI state is blend-disabled, and spelling out
+    // "disabled" with explicit factors would be a second way to say the same thing that a driver could disagree with.
+    nvrhi::RenderState renderState;
+    if (desc.Blending == BlendMode::Alpha)
+    {
+        // Non-premultiplied source (ImGui's own convention: it emits straight alpha and its backends configure exactly
+        // these factors). Alpha channel blends independently so a UI layer can keep its own coverage.
+        nvrhi::BlendState blend;
+        blend.setRenderTarget(0, nvrhi::BlendState::RenderTarget()
+                                     .enableBlend()
+                                     .setSrcBlend(nvrhi::BlendFactor::SrcAlpha)
+                                     .setDestBlend(nvrhi::BlendFactor::InvSrcAlpha)
+                                     .setSrcBlendAlpha(nvrhi::BlendFactor::One)
+                                     .setDestBlendAlpha(nvrhi::BlendFactor::InvSrcAlpha));
+        renderState.setBlendState(blend);
+    }
+
+    pipelineDesc.setRenderState(renderState.setRasterState(raster).setDepthStencilState(depth));
 
     // The framebuffer info comes from the target itself (friend access, by design — see RenderTarget.h): a
     // pipeline whose attachment formats disagree with its framebuffer is undefined behaviour Vulkan may or may not

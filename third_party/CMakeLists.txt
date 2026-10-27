@@ -222,6 +222,24 @@ if(HP_ENABLE_AUDIO)
 endif()
 
 # ---------------------------------------------------------------------------
+# Dear ImGui (docking branch) — the editor's immediate-mode UI toolkit.
+#
+# The docking branch rather than master because docs/ARCHITECTURE.md's editor plan is a dockable UE-style layout,
+# and docking exists only on that branch. Pinned to an exact commit of `docking` (the branch moves; no tag exists
+# for it) — re-check with `git ls-remote https://github.com/ocornut/imgui.git docking` when bumping.
+#
+# The library target is created below the Populate section: ImGui ships no CMakeLists, so its sources are compiled
+# into one static library by us — core imgui*.cpp plus exactly the two backends the editor uses (GLFW input, Vulkan
+# rendering). Backends needing a client API or another windowing library are simply not compiled in.
+# ---------------------------------------------------------------------------
+if(HP_BUILD_EDITOR AND HP_ENABLE_VULKAN)
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG d88f238d1d363ef387382b2e29ad12cf96f826ac)   # docking, 2026-10-15
+endif()
+
+# ---------------------------------------------------------------------------
 # Lua + sol2 — gameplay scripting.
 #
 # Lua's upstream repository ships a makefile only, so the sources are compiled into a static library
@@ -342,6 +360,47 @@ endif()
 # Jolt builds a plain `Jolt` target as a subproject; alias the namespaced form used by engine code.
 if(HP_ENABLE_PHYSICS AND TARGET Jolt AND NOT TARGET Jolt::Jolt)
     add_library(Jolt::Jolt ALIAS Jolt)
+endif()
+
+# ---------------------------------------------------------------------------
+# hp_imgui — Dear ImGui core + GLFW/Vulkan backends, compiled as one static library (see the
+# FetchContent declaration above for why: upstream ships no CMakeLists).
+# ---------------------------------------------------------------------------
+if(HP_BUILD_EDITOR AND HP_ENABLE_VULKAN)
+    hp_populate_quietly(imgui)
+
+    add_library(hp_imgui STATIC
+        "${imgui_SOURCE_DIR}/imgui.cpp"
+        "${imgui_SOURCE_DIR}/imgui_demo.cpp"
+        "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+        "${imgui_SOURCE_DIR}/imgui_tables.cpp"
+        "${imgui_SOURCE_DIR}/imgui_widgets.cpp")
+
+    # Neither backend is compiled in, deliberately:
+    #   * imgui_impl_glfw — the editor feeds ImGui from Platform::Window's own queued input events instead
+    #     (Editor/Src/EditorInput.cpp). GLFW callbacks never fire for events injected through Window::InjectEvent,
+    #     the engine's documented seam for agent-driven operation, so a GLFW-fed ImGui would be deaf to exactly the
+    #     automation this editor is required to support. Mapping engine InputEvents also keeps one input path, not two
+    #     that can disagree about ordering.
+    #   * imgui_impl_vulkan — it wants to own its command buffer, render pass and image layout transitions, while the
+    #     editor draws inside a frame NVRHI has been tracking state for all along (two authorities over one image's
+    #     layout is a driver-dependent corruption). Editor/Src/UiRenderer.cpp draws ImGui's draw data through the
+    #     engine's own Pipeline/Buffer/Texture wrappers instead.
+    #
+    # Upstream warnings are not ours to fix (AGENTS.md §2: third-party code is exempt) — same treatment as Lua.
+    # SYSTEM include so ImGui headers do not taint engine translation units.
+    hp_set_third_party_target(hp_imgui)
+
+    target_include_directories(hp_imgui SYSTEM PUBLIC "${imgui_SOURCE_DIR}")
+    target_link_libraries(hp_imgui PUBLIC Vulkan::Headers hp_vulkan_loader)
+
+    # 32-bit index buffer. ImGui's default is 16-bit, which caps a draw list at 65k vertices — an editor UI with a
+    # long outliner or console log reaches that and starts wrapping geometry (ImGui handles it via VtxOffset, which
+    # this renderer does not implement). Widening the type is what the stock Vulkan backends do too. The define must
+    # be visible wherever imgui.h is included, hence PUBLIC; quoted because the replacement contains a space.
+    target_compile_definitions(hp_imgui PUBLIC "ImDrawIdx=unsigned int")
+
+    add_library(Hollowpoint::ImGui ALIAS hp_imgui)
 endif()
 
 # ---------------------------------------------------------------------------

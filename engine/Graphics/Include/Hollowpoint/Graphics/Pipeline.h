@@ -60,6 +60,10 @@ struct PipelineDesc
 
     PrimitiveTopology Topology = PrimitiveTopology::TriangleList;
 
+    //! Alpha blending for the colour target. Default off, which is what every opaque pass wants and what the forward
+    //! renderer has always been — adding this changes no existing pipeline's behaviour. See BlendMode.
+    BlendMode Blending = BlendMode::Disabled;
+
     //! Named TriangleCulling rather than CullMode to avoid shadowing the CullMode enum type inside this struct —
     //! a collision GCC rejects outright (-Wchanges-meaning), which is cheaper than discovering it in a header.
     CullMode TriangleCulling = CullMode::Back;

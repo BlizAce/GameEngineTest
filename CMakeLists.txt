@@ -94,6 +94,13 @@ if(HP_ENABLE_VULKAN)
     add_subdirectory(engine/Runtime)
 endif()
 
+# The editor sits on top of the runtime loop it hosts, so it is added after every module it may use. Requires Vulkan:
+# its whole purpose is hosting a rendered viewport, and building it without a device would produce a library of panels
+# with nothing to draw into (see engine/Editor/CMakeLists.txt).
+if(HP_BUILD_EDITOR AND HP_ENABLE_VULKAN)
+    add_subdirectory(engine/Editor)
+endif()
+
 if(HP_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

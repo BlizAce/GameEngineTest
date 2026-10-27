@@ -275,10 +275,21 @@ if(TARGET HollowpointRenderer)
         LIBS Hollowpoint::Runtime Hollowpoint::Game Hollowpoint::Graphics Hollowpoint::Platform
         NO_LEAK_CHECK)
 
+    # Editor coverage: selection semantics, the console registry, the content browser against a real temp tree, ray
+    # picking, reflection-driven property editing (all CPU-only — no device, no window, no ImGui), plus the GPU cases in
+    # TestEditorApplication.cpp that start the editor for real and assert on its composed frame.
+    if(HP_BUILD_EDITOR)
+        hp_add_module_test(Editor
+            SOURCES
+                Editor/TestEditorModel.cpp
+                Editor/TestEditorApplication.cpp
+            LIBS Hollowpoint::Editor Hollowpoint::Game Hollowpoint::Scene Hollowpoint::MathReflection
+            NO_LEAK_CHECK)
+    endif()
+
     # CPU-only like the other shading references: no RHI, no GPU, full leak checking.
     hp_add_module_test(ImageBasedLighting
         SOURCES
             Renderer/TestImageBasedLighting.cpp
         LIBS Hollowpoint::Renderer)
 endif()
-

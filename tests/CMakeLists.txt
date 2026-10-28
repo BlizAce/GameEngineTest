@@ -293,3 +293,32 @@ if(TARGET HollowpointRenderer)
             Renderer/TestImageBasedLighting.cpp
         LIBS Hollowpoint::Renderer)
 endif()
+
+# ---------------------------------------------------------------------------
+# Launcher tooling (tools/launcher/) — Python, so registered as a ctest command rather than a compiled target.
+#
+# It runs without Qt or a display on purpose: core.py holds every decision the launcher makes (which command an action
+# executes, whether the tree is configured, what a missing tool means) and none of those need a GUI. A machine without
+# python3 skips cleanly instead of failing — the launcher is optional convenience, and a red suite because an optional tool's
+# interpreter is absent would be a false alarm about the engine.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME LauncherTests
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/launcher/test_core.py
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tools/launcher)
+    set_tests_properties(LauncherTests PROPERTIES
+        LABELS "tooling"
+        TIMEOUT 120
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # The launcher's widget wiring (does the card labelled "Rebuild engine" start `cmake --build`?), driven through Qt's
+    # offscreen platform so it needs no compositor. It skips itself with a clear message when PySide6 is absent — an optional
+    # tool's missing dependency must not read as an engine failure — which is why it is registered unconditionally.
+    add_test(NAME LauncherUiTests
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/launcher/test_ui.py
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tools/launcher)
+    set_tests_properties(LauncherUiTests PROPERTIES
+        LABELS "tooling"
+        TIMEOUT 180
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;PYTHONDONTWRITEBYTECODE=1")
+endif()

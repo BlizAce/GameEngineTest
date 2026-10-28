@@ -1787,3 +1787,146 @@ function to replace with a cgltf loader; textures and a GUID/path database behin
 queue is complete and nobody consumes it beyond resize/close); **physics and audio** facing code; an **editor** hosting the same
 `RunFrame`; and golden-image regression, which the screenshot path makes possible — currently the visual assertions are
 structural (non-empty, colour spread, texel spot-checks against the CPU transform) rather than whole-image.
+
+---
+
+## Session 16 — the editor exists: hosting the loop, a backend ImGui never knew about, and a UI that drew exactly one widget
+
+### What this session was for
+
+Session 15 ended with "an **editor** hosting the same `RunFrame`" top of the open list. `HP_BUILD_EDITOR` was accepted by
+CMake and built nothing; `IApplicationHost` existed as an interface with no implementor. The goal: make that true rather than
+adjacent-to-true — an editor that hosts the shipped loop, shows a UE-style docked UI over a live viewport, and can be driven
+entirely from a console line (AGENTS.md §9's scriptability rule).
+
+What landed: `engine/Editor/` (selection, console registry, content browser, picking, reflection-driven property view, ImGui
+backend, panels, `EditorApplication`), the `hollowpoint-editor` executable, `Runtime::IApplicationHost` wired into
+`RunFrame`, 44 C++ cases in `tests/Editor/`, a PySide6 launcher (`run.sh`) with 34 Python cases, and `notes/EDITOR.md`
+recording the ten things the editor deliberately does not do.
+
+### The bug that defined the session: every panel drew, and none appeared
+
+The first composed screenshot contained the main menu bar and nothing else — no outliner, no details, no console, no viewport
+image. Three hours of plausible causes were investigated and eliminated (dockspace id 0, `io.DisplaySize` read before
+`NewFrame`, ImGui 1.93's texture-status model, docking node geometry). None were the cause.
+
+The actual bug was in my own UI renderer. ImGui **numbers vertices per draw list**: the first vertex of every window is index
+0. Concatenating all lists into one vertex buffer and binding it at offset 0 for every draw therefore makes each window redraw
+*the menu bar's* geometry — and then each window's own clip rect hides the result, because that geometry is nowhere near it.
+Symptom: exactly one widget visible at the top of the screen, everything else blank, no validation error, no warning, nothing
+in a log. Fix: bind the vertex buffer at each list's base (`Editor/Src/UiRenderer.cpp`, where the comment now says all of
+this in fewer words).
+
+**Why it survived so long is the lesson.** Every unit test in the editor was green throughout — selection, console, content,
+picking, properties. They tested decisions; the failure was in composition. Nothing asserted on pixels until this session's
+integration case existed, and by then the bug had been fixed by hand. The first version of that assertion was *"the frame must
+have many distinct colours"*, which is wrong: measured on the mutant, the broken frame scored **51** distinct colours (menu
+gradients + anti-aliased text) against the fixed frame's **41**, because large flat panel fills contribute exactly one colour
+each. Coverage of non-background pixels was tried next and also failed — the dockspace paints most of the window, so it stayed
+high with no panels drawn at all. What finally discriminates is **per-region structure**: count distinct colours *inside each
+panel's rectangle*, where broken = 1 and fixed = 3–8 per region. Two plausible metrics measured and rejected with numbers,
+rather than a third guessed.
+
+### `imgui_impl_glfw` was not an option, which decided the whole input design
+
+The obvious implementation (stock GLFW backend) fails for two independent reasons, both fatal:
+
+1. It assumes it owns command buffers, render passes, layout transitions and swapchain images. This engine's renderer does
+   not hand those out.
+2. GLFW callbacks never fire for events delivered through `Window::InjectEvent` — the engine's documented seam for
+   agent-driven operation. A GLFW-fed ImGui would be **deaf to exactly the automation this editor is required to support**, and
+   would be a second input path able to disagree with the first about ordering.
+
+So: `Editor::UiRenderer` draws ImGui's draw data through NVRHI into engine targets, and `Editor::EditorInput` maps
+`Platform::InputEvent` onto ImGui's queued-event API (`io.AddKeyEvent` etc.). Consequences worth remembering because they are
+not obvious from the headers:
+
+* **ImGui 1.93 needs `ImGuiBackendFlags_RendererHasTextures`.** Without it the legacy "build the atlas yourself" path runs and
+  asserts on frame 1 demanding an atlas nobody owns — there is no longer a `GetTextImage`-style call for a backend to build it
+  in. The flag turns that assert into the texture-request loop `RefreshTextures` services.
+* **The engine attaches a *single* binding layout per pipeline** (`Pipeline::createBindingLayout` + one
+  `addBindingLayout`). Constant buffer, texture and sampler therefore must live in **one** descriptor set; binding them as two
+  is `VUID-VkGraphicsPipelineCreateInfo-layout-00756` at PSO creation (validation caught it; the driver would not have). Which
+  means a binding set is per *(texture × rotating constant-buffer slot)*, built lazily — see `TextureEntry::Sets`.
+* **`io.DisplaySize` must come from the window, not from `ImGui::GetMainViewport()`.** With no platform backend ImGui copies
+  DisplaySize into the viewport *during* `NewFrame`, so reading the viewport before it yields 1×1 on frame one and clips every
+  window to nothing.
+
+### A test caught two production bugs before the code shipped
+
+Not after — during. Both are in `engine/Editor/`, both were invisible to review:
+
+1. **`PickRay` transformed only its broad-phase AABB.** Triangles were tested in object space, so any translated mesh was
+   picked at its *original* position. Found because a test aimed a ray at a cube moved by `Mat4::Translate` and missed. The fix
+   transforms vertices per triangle rather than the ray by the inverse — no precondition on matrix invertibility (a
+   scaled-to-zero instance must not assert), same cost class as the eight corner transforms the box test already paid.
+2. **`ContentBrowserModel::CanNavigateUp` compared paths textually.** `root / "."` normalises to `"/proj/"`, which is a
+   different `std::filesystem::path` from the configured `"/proj"` even though they name the same directory — so "Up" never
+   re-disabled after navigating home. Fixed with an explicit trailing-separator trim, documented where it lives.
+
+### Instrumentation that was wrong, and what it cost
+
+Three measurement errors during this session, each of which would have produced a confident wrong conclusion:
+
+* Asserting whole-frame distinct-colour counts (above) — **wrong polarity**, broken scored higher than fixed.
+* Region coverage of non-background pixels — **right polarity, no power**: the dockspace dominates it.
+* Reading panel state from `ImGui::GetDrawData()` inside a scope guard placed *before* `ImGui::Render()`, which returns the
+  **previous** frame's data (it is cleared at `NewFrame`). Every "the draw lists are empty" observation early in the debugging
+  was measuring last frame, so it described a UI one step behind reality. The printf that finally located the real bug counted
+  *vertices per list* and *which vertex buffer offset each draw used* — the two numbers the fix turned on.
+
+**Generalisation:** when a metric contradicts direct observation of the screen, distrust the metric — and prefer a metric whose
+broken and fixed values you have both measured over one that merely seems like it should work.
+
+### Command/console parity was built before the widgets
+
+AGENTS.md §9 requires every editor action to be scriptable. Implemented structurally rather than as an afterthought: panels
+never mutate the world, they call `EditorApplication` methods; those same methods are registered as console commands in
+`RegisterEngineCommands`. One implementation per action, so "the button saves but the command doesn't" is not a state the code
+can be in. `--command "entity.create Cube engine:cube" --frames 1` composes exactly one frame containing the effect, which is
+what makes the capture tests deterministic (commands applied *after* the first frame would depend on how many frames the
+compositor happened to deliver during startup).
+
+### The launcher: verified where it can be, honest where it cannot
+
+`run.sh` + `tools/launcher/` (PySide6 — already installed here, and the only way to get native-feeling translucency without
+writing a compositor client). Split three ways: `core.py` composes commands and reads state (**no Qt import at all**, so its 25
+tests need neither PySide6 nor a display), `ui.py` draws, and `main.py` parses arguments (`--check` works over ssh, where no Qt
+can be constructed at all). The 9 wiring tests in `test_ui.py` do need Qt but force `QT_QPA_PLATFORM=offscreen`, so they run
+without a compositor too — and skip themselves with a reason when PySide6 is absent rather than reporting an engine failure.
+
+Two real defects found by writing the wiring tests: `ui.py` used `Path` without importing it (opening a project would have
+`NameError`d — pyflakes caught it, and no amount of manual reading had), and `TaskRunner` leaked its child's stdout pipe on
+every run (caught as a `ResourceWarning` under `-W error`).
+
+The launcher's own tests deliberately assert on *which command an action requests* rather than on rendered pixels: a button
+wired to nothing, or to the wrong action, passes every command-composition test and is exactly the failure a user hits first.
+That split — decisions tested, appearance eyeballed — is stated in the file so nobody later reads green Python tests as visual
+verification.
+
+### Verification
+
+* `ctest --test-dir build/debug` → **35/35 suites pass** (was 32 at session start; +Editor, +LauncherTests, +LauncherUiTests).
+* Editor binary runs clean under Vulkan validation and writes a composed PNG: `hollowpoint-editor --frames 3 --hidden
+  --screenshot …`.
+* The composed-frame case was **mutation-tested**: removing the per-list vertex offset (the original bug) turns it red with all
+  three panel regions reporting 1 distinct colour. A test that cannot fail is not evidence, and this one demonstrably can.
+* Skip path verified in both directions: with a display the cases run; with `DISPLAY`/`WAYLAND_DISPLAY` unset they print
+  `skipped: no display server` and pass. (Measured first: doctest's `WARN` prints *nothing* in a normal run and stringifies a
+  `.c_str()` argument as `1`, so the idiom several existing suites use would have made "skips with a clear message" untrue — a
+  probe decided this rather than reading the header.)
+* Doc-count checker passes, and was itself controlled: perturbing the Editor number to 99 goes red. It also caught my own
+  off-by-one (45 claimed vs 44 real) caused by the literal token `TEST_CASE` appearing inside a comment it greps — fixed in the
+  source rather than by inflating the doc.
+
+### State at end of session 16
+
+The editor starts, hosts the runtime's own frame loop, shows a docked outliner / viewport / details / content / console layout
+over a live scene, accepts typed input through the engine's event queue, saves and loads `.hpscene` files, edits components
+through reflection (same clamped write path the loader uses), and is drivable end-to-end from `--command` with no interaction.
+
+Open, in cost order — all ten written up in `notes/EDITOR.md`: **no asset importing** (the content browser lists and opens
+scenes/scripts and reports *no importer* for everything else; needs the GUID database first), **no undo/redo** (which is why
+array-of-struct fields are read-only in the inspector rather than dangerous), **edit mode only** (no Play button, deliberately),
+**no layout persistence** (no per-project settings file exists to put one in), viewport extent estimated rather than read from
+the dock node, picking a linear scan with no BVH, implot overlays not integrated, and one viewport per window.

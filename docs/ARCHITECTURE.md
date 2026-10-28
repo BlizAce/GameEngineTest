@@ -34,9 +34,9 @@ both (a drawable component, a per-frame render plan, the class that submits it) 
 scene data in, draw submission out.
 
 ```
-    Editor (planned)
-          │
-          ▼
+    Editor ───────────────────┐
+          │                   │
+          ▼                   │
       Runtime ────────────────┬────────────────┐
           │                   │                │
           ▼                   ▼                ▼
@@ -102,7 +102,7 @@ module yet.
 | Physics | planned | Jolt is fetched and builds (`HP_ENABLE_PHYSICS`); no engine-facing module yet |
 | Audio | planned | miniaudio is fetched and builds (`HP_ENABLE_AUDIO`); no engine-facing module yet |
 | **Runtime** | ✅ application shell + frame loop + executable | `tests/Runtime/` — 12 cases: start-up building every subsystem, draws actually submitted per frame (a non-zero frame count with zero draws is the blank-window bug and fails here), a script named in a `.hpscene` moving an entity through the real loop, screenshot → valid PNG at a plausible extent, missing-scene and stop-policy behaviour. `hollowpoint-runtime` is the standalone executable; `RuntimeApplication::RunFrame` is public so an editor hosts the same loop rather than duplicating it |
-| Editor | planned | embeddable in the runtime (`RunFrame`, the world/device/renderer accessors exist for exactly this); `HP_BUILD_EDITOR` is accepted but builds nothing until the module lands |
+| **Editor** | ✅ editor shell + panels + console; asset pipeline pending | `tests/Editor/` — 44 cases: selection semantics (primary, toggle, dead-entity pruning), the console registry (quoting/escapes in argument splitting, arity refusal before the handler runs, suggestion on a typo), content browser against a real temp tree (ordering, traversal refusal, stale-listing-on-failure), ray picking (transform applied, nearest wins, culling), reflection-driven property editing through the same clamped path the loader uses, and **the composed frame asserted region by region** — each panel must contain structure, which is the only check that caught a UI that drew one menu bar and nothing else. `EditorApplication` implements `Runtime::IApplicationHost`, so a shipped game and an editing session run the same frame loop; `hollowpoint-editor` is the executable |
 
 ## Core (implemented)
 
@@ -199,5 +199,13 @@ materials.
    references, and our component counts are modest; revisit when the renderer needs 100k entities.
 2. **Asset cooking** — cook at import time into a content-addressed store (fast loads, incremental),
    versus cook-on-build in the editor. Not decided; both need the same GUID database first.
-3. **Editor UI** — Dear ImGui + implot for profiling overlays; docking branch. The editor must be fully
-   scriptable, which pushes us to define the command/console API before building widgets.
+3. **Editor UI** — decided and built (session 15). Dear ImGui's docking branch, compiled core-only with **no stock
+   backend**: `imgui_impl_glfw` assumes it owns command buffers, render passes, layout transitions and swapchain images,
+   and is deaf to `Window::InjectEvent` — the engine's documented seam for agent-driven operation. So `Editor::UiRenderer`
+   draws ImGui's draw data through NVRHI into the engine's own targets, and `EditorInput` maps `Platform::InputEvent` onto
+   ImGui's queued-event API. The command/console registry was written before the widgets, as reasoned here: every panel
+   action routes through the same `EditorConsole` a human types into, so "the button works, the command doesn't" cannot
+   happen. implot for profiling overlays is still open — see `notes/EDITOR.md`.
+4. **Asset cooking** — still open (see 2 above): the editor lists and opens `.hpscene`/`.lua` and reports *no importer*
+   for anything else rather than pretending. That boundary is `ContentBrowserModel::OpenEntry`, and it is where a GUID
+   database slots in when cooking is decided.

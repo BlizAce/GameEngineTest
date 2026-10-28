@@ -11,11 +11,13 @@ suites. Run directly (``python3 tools/launcher/test_core.py``) or via ctest as L
 
 from __future__ import annotations
 
+import ctypes.util
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -260,6 +262,144 @@ class FileBrowserCommand(unittest.TestCase):
             command = core.project_explorer_command(Path(tempDir))
             if command:
                 self.assertEqual(command[-1], tempDir)
+
+
+class EditorAvailability(unittest.TestCase):
+    """Whether a configured tree can actually produce `hollowpoint-editor`.
+
+    The launcher offers an editor button unconditionally, so "the tree is configured but has no editor" needs a distinct
+    answer: pressing Rebuild there succeeds and still leaves nothing to open. These are the cases where reading the preset's
+    own CMakeCache (rather than assuming the option defaults) earns its keep."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory(prefix="hp-launcher-editor-")
+        self.root = Path(self._temp.name)
+        self.addCleanup(self._temp.cleanup)
+
+    def _configure(self, cacheBody: str) -> None:
+        cache = self.root / "build/debug"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "CMakeCache.txt").write_text(cacheBody, encoding="utf-8")
+
+    def test_an_unconfigured_tree_is_unknown_rather_than_disabled(self) -> None:
+        """None and False must not be conflated: "unknown" leaves the card offering a build, which is right; "disabled" would
+        tell someone their repository cannot build an editor before they have run configure once."""
+        self.assertIsNone(core.editor_enabled(self.root))
+
+    def test_both_options_on_enables_the_editor(self) -> None:
+        self._configure("HP_BUILD_EDITOR:BOOL=ON\nHP_ENABLE_VULKAN:BOOL=ON\n")
+        self.assertTrue(core.editor_enabled(self.root))
+
+    def test_vulkan_off_disables_the_editor(self) -> None:
+        """The root CMakeLists adds the editor only with HP_ENABLE_VULKAN, so a Vulkan-less tree has no editor target — the
+        exact configuration that would otherwise end in `OSError: No such file or directory` on a button press."""
+        self._configure("HP_BUILD_EDITOR:BOOL=ON\nHP_ENABLE_VULKAN:BOOL=OFF\n")
+        self.assertFalse(core.editor_enabled(self.root))
+
+    def test_editor_option_off_disables_the_editor(self) -> None:
+        self._configure("HP_BUILD_EDITOR:BOOL=OFF\nHP_ENABLE_VULKAN:BOOL=ON\n")
+        self.assertFalse(core.editor_enabled(self.root))
+
+    def test_an_empty_cache_falls_back_to_the_documented_defaults(self) -> None:
+        """A cache with no entry means the option was never overridden, and both default ON. Reading absent as OFF would
+        disable the editor on every normal tree whose cache format changed."""
+        self._configure("")
+        self.assertTrue(core.editor_enabled(self.root))
+
+    def test_cache_comments_and_unrelated_entries_are_ignored(self) -> None:
+        self._configure(
+            "# comment\nHP_ENABLE_VULKAN:BOOL=OFF\nSOMETHING_ELSE:BOOL=ON\nOTHER:FILEPATH=/tmp/equal=path\n"
+        )
+        self.assertFalse(core.editor_enabled(self.root))
+
+    def test_commented_out_entries_never_override_the_live_value(self) -> None:
+        """A hand-edited cache often carries a commented-out alternative next to the real entry. Ordering matters for the test's
+        power: the comment goes AFTER the live line, so any parser that read it as an entry would flip the answer from False to
+        True. (Written in the other order it passes for the wrong reason — last-write-wins hides the bug.) It cannot win as things
+        stand: a commented key keeps its `//` through the split and stops naming a flag, which is why no explicit comment guard
+        exists — removing one changed no test result."""
+        self._configure("HP_ENABLE_VULKAN:BOOL=OFF\n//HP_ENABLE_VULKAN:BOOL=ON\n# comment = with equals\n")
+        self.assertFalse(core.editor_enabled(self.root))
+
+    def test_a_cache_that_cannot_be_read_is_unknown(self) -> None:
+        """An unreadable cache yields None — offer the action and let cmake fail loudly — rather than a confident "disabled"
+        that contradicts what is on disk. read_text is patched because getting `.is_file()` to pass while a read fails needs
+        either root or a race, and the branch under test is the except handler itself."""
+        self._configure("HP_ENABLE_VULKAN:BOOL=OFF\n")
+        with mock.patch.object(Path, "read_text", side_effect=OSError("EIO")):
+            self.assertIsNone(core.editor_enabled(self.root))
+
+
+class VulkanLoader(unittest.TestCase):
+    def test_detection_returns_a_boolean(self) -> None:
+        self.assertIsInstance(core.vulkan_loader_present(), bool)
+
+    def test_the_real_host_reports_consistently_with_its_own_loader(self) -> None:
+        """Whatever this machine has, the check must agree with it — asserted against the file the loader would resolve to,
+        so the test fails if find_library ever stops seeing `.so.1`-only installations (the common case, and the one the engine's
+        own CMake comment says broke find_package)."""
+        found = core.vulkan_loader_present()
+        resolved = ctypes.util.find_library("vulkan")
+        self.assertEqual(found, resolved is not None)
+
+
+class UsageText(unittest.TestCase):
+    """`--help` and the headless entry path. main() is imported lazily inside each test so this module stays importable
+    without PySide6, matching core.py's own Qt-free rule."""
+
+    def test_documents_every_flag_the_entry_point_accepts(self) -> None:
+        """Help that omits a flag is worse than no help. Asserted against the flags main.py actually matches, so adding one
+        without documenting it fails here."""
+        text = core.usage()
+        for flag in ("--help", "--check"):
+            self.assertIn(flag, text)
+
+    def test_names_the_direct_build_command_as_an_escape_hatch(self) -> None:
+        """The launcher is optional; the help has to say how to build without it, or a machine with no PySide6 is stuck."""
+        text = core.usage()
+        self.assertIn("cmake --preset", text)
+        self.assertIn("ctest", text)
+
+    def test_the_entry_point_answers_help_without_touching_gui_code(self) -> None:
+        """End-to-end through main(), because the defect this guards was exactly a documented flag falling through to the GUI:
+        `--help` opened a launcher window. Patching gui() proves help never reaches it; importing main with PySide6 hidden
+        proves the same path works on a machine that has no Qt at all."""
+        import io
+        import contextlib
+
+        import main as launcher_main
+
+        for flag in ("--help", "-h"):
+            buffer = io.StringIO()
+            with mock.patch.object(launcher_main, "gui", side_effect=AssertionError("gui reached")):
+                with contextlib.redirect_stdout(buffer):
+                    rc = launcher_main.main([flag])
+            self.assertEqual(rc, 0, flag)
+            self.assertIn("usage:", buffer.getvalue(), flag)
+
+    def test_help_works_with_pyside6_absent(self) -> None:
+        """The claim in the help text is that --check/--help work over ssh without PySide6. Enforced by blocking the import,
+        not by hoping this host happens to have Qt installed."""
+        import builtins
+        import io
+        import contextlib
+
+        import main as launcher_main
+
+        realImport = builtins.__import__
+
+        def noQt(name: str, *args, **kwargs):  # noqa: ANN001, N803 - mirrors builtins.__import__
+            if name.split(".")[0] == "PySide6":
+                raise ImportError("blocked by test: PySide6 must not be needed for --help")
+            return realImport(name, *args, **kwargs)
+
+        buffer = io.StringIO()
+        with mock.patch.object(builtins, "__import__", noQt):
+            with contextlib.redirect_stdout(buffer):
+                rc = launcher_main.main(["--help"])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("usage:", buffer.getvalue())
 
 
 if __name__ == "__main__":

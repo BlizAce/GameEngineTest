@@ -417,11 +417,19 @@ class LauncherWindow(QWidget):
             ACCENT if configured else QColor(240, 210, 130),
         )
 
-        self._openEditorButton.set_enabled_action(built and not self._runner.is_running)
-        self._openEditorButton.set_state(
-            str(core.editor_binary(self._repo).name) if built else "build the engine first",
-            ACCENT if built else QColor(240, 210, 130),
-        )
+        editorAvailable = core.editor_enabled(self._repo)
+        # Three states, not two: "build the engine first", "this tree cannot build an editor at all", and ready. Collapsing
+        # the middle one into "build first" sends the user to press Rebuild, which succeeds and still leaves no editor — the
+        # dead end is in their configure flags, so that is where the message has to point.
+        if editorAvailable is False:
+            self._openEditorButton.set_enabled_action(False)
+            self._openEditorButton.set_state("disabled in this build", WARN)
+        else:
+            self._openEditorButton.set_enabled_action(built and not self._runner.is_running)
+            self._openEditorButton.set_state(
+                str(core.editor_binary(self._repo).name) if built else "build the engine first",
+                ACCENT if built else QColor(240, 210, 130),
+            )
 
         missing = [requirement.name for requirement, present in core.check_toolchain() if not present]
         if missing:

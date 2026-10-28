@@ -11,6 +11,7 @@ invocation is a second source of truth about how to build the engine — and the
 
 from __future__ import annotations
 
+import ctypes.util
 import dataclasses
 import os
 import platform
@@ -162,6 +163,79 @@ def dependencies_installed() -> bool:
     if not DEPENDENCY_CACHE.is_dir():
         return False
     return any(entry.is_dir() for entry in DEPENDENCY_CACHE.iterdir())
+
+
+def vulkan_loader_present() -> bool:
+    """True when the Vulkan userspace loader (`libvulkan.so.1`) can be found.
+
+    The build fetches headers, volk and glslang on its own, so configure proceeds without a system Vulkan package — but it
+    hard-fails later (third_party/CMakeLists.txt: `find_library(HP_VULKAN_LOADER …)` → FATAL_ERROR) and the editor cannot run
+    without the loader. That check sits *after* `FetchContent_MakeAvailable`, so on an unprepared machine nothing says "no Vulkan"
+    until every dependency has been downloaded and built; naming it up front is the whole point. `find_library` consults the
+    loader cache/soname links rather than a fixed path, matching how the linker resolves `-lvulkan` (`.so.1` alone counts — most
+    distributions ship no `libvulkan.so` symlink, which is why the engine cannot use find_package(Vulkan) either)."""
+    return ctypes.util.find_library("vulkan") is not None
+
+
+def editor_enabled(repo_root: Path, preset: str = "linux-debug") -> bool | None:
+    """Whether the configured tree actually contains the editor module; None when it cannot be known yet.
+
+    `HP_BUILD_EDITOR` defaults ON, but the editor is added only with `HP_ENABLE_VULKAN` too (root CMakeLists.txt), so a tree
+    configured `-DHP_ENABLE_VULKAN=OFF` configures cleanly and then has no `hollowpoint-editor` to build — a launcher button
+    that dies with a bare OSError. The answer is read from the preset's own CMakeCache rather than mirrored here, because a
+    second copy of the rule drifts from the first: an option renamed in CMake would leave this reporting a confident wrong
+    answer forever. Returns None for an unconfigured tree (unknown — not "disabled"), and treats an absent cache entry as the
+    option's default (ON), so a renamed option reads as enabled rather than raising a false alarm.
+    """
+    if not is_configured(repo_root, preset):
+        return None
+    cache = repo_root / PRESETS.get(preset, PRESETS["linux-debug"]) / "CMakeCache.txt"
+    flags = {"HP_BUILD_EDITOR": True, "HP_ENABLE_VULKAN": True}
+    try:
+        text = cache.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        # Keys carry their type: `HP_ENABLE_VULKAN:BOOL=OFF`. Splitting on the colon is required — comparing the left of `=` against
+        # the bare option name matches nothing, which made every tree (Vulkan-less included) report enabled. Caught by
+        # test_vulkan_off_disables_the_editor, which was red until this line existed.
+        #
+        # No comment handling is written, and none is needed, for two separate reasons: a CMake help comment has no `=` so the
+        # partition above already skips it, and a commented-out entry keeps its `//` through this split (`//HP_ENABLE_VULKAN:BOOL`),
+        # which is not a flag name. Both halves were probed against real caches rather than assumed, and an explicit
+        # `startswith("//")` guard was removed after mutation showed no test could fail with it absent — code that nothing can break
+        # is only cost for the next reader. The behaviour itself stays pinned by
+        # test_commented_out_entries_never_override_the_live_value.
+        name = key.split(":", 1)[0].strip()
+        if name in flags:
+            # Cache booleans are written "ON"/"OFF"; anything unparseable leaves the default rather than guessing False.
+            flags[name] = value.strip().upper() in ("ON", "TRUE", "1", "YES", "Y")
+    return flags["HP_BUILD_EDITOR"] and flags["HP_ENABLE_VULKAN"]
+
+
+def usage() -> str:
+    """The launcher's own help text — one source for run.sh, `--help` and the docstrings.
+
+    Kept in core (not shell) so it is testable and cannot contradict what the launcher actually accepts: an argument list
+    maintained in a comment is documentation, this is behaviour."""
+    return "\n".join(
+        (
+            "hollowpoint launcher — a front door for the repository",
+            "",
+            "usage:",
+            "  ./run.sh              open the graphical launcher (needs PySide6)",
+            "  ./run.sh --help       this text",
+            "  ./run.sh --check      toolchain and build status, no window (works over ssh, without PySide6)",
+            "",
+            "the launcher window runs the repository's own commands (fetch dependencies, configure,",
+            "build, test, open the editor on a project); it stores no state of its own, so every action",
+            "here has an equivalent command line. Build directly instead:",
+            "  cmake --preset linux-debug && cmake --build build/debug -j && ctest --test-dir build/debug",
+        )
+    )
 
 
 class TaskRunner:

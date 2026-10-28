@@ -7,6 +7,7 @@ there without a display.
 
 Usage:
   python3 tools/launcher/main.py             open the launcher window
+  python3 tools/launcher/main.py --help      usage, without importing Qt or opening a window
   python3 tools/launcher/main.py --check     print toolchain/build status and exit (no Qt, no window)
 """
 
@@ -38,6 +39,12 @@ def check() -> int:
             line += f"\n         install: {requirement.install_hint()}"
         print(line)
 
+    # The Vulkan loader is reported separately from the build toolchain: configure fetches its own headers and passes without
+    # it, so this fails later and in a way that reads as a broken repository rather than a missing package. Advisory (it does
+    # not gate the exit code) because a machine that only ever builds tests needs no loader either.
+    loaderMark = "ok  " if core.vulkan_loader_present() else "MISS"
+    print(f"  [{loaderMark}] {'Vulkan loader':16s} libvulkan.so.1, needed to run the editor (not to build a headless tree)")
+
     depsMark = "ok  " if core.dependencies_installed() else "MISS"
     print(f"  [{depsMark}] {'dependencies':16s} {core.DEPENDENCY_CACHE}")
 
@@ -45,6 +52,9 @@ def check() -> int:
         state = "configured" if core.is_configured(REPO_ROOT, preset) else "not configured"
         if core.is_built(REPO_ROOT, preset):
             state += ", built"
+        if core.editor_enabled(REPO_ROOT, preset) is False:
+            # Name the reason rather than leaving "configured" to imply an editor that will not be built.
+            state += ", editor disabled (HP_BUILD_EDITOR/HP_ENABLE_VULKAN off)"
         print(f"  [    ] {preset:16s} {state}")
 
     projects = core.discover_projects(REPO_ROOT / "projects")
@@ -71,6 +81,11 @@ def gui() -> int:
 
 
 def main(argv: list[str]) -> int:
+    # --help is matched before anything else, including the PySide6 probe in run.sh: asking for usage must never require an
+    # optional GUI dependency or open a window. Both spellings are accepted because -h is what muscle memory types.
+    if "--help" in argv or "-h" in argv:
+        print(core.usage())
+        return 0
     if "--check" in argv:
         return check()
     try:

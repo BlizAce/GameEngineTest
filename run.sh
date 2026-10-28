@@ -25,6 +25,12 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+# --help is answered here rather than by Python so it works with no PySide6 (and no argument reaching Qt, which would open a
+# window). -h is accepted too; both are forwarded to the launcher's own handler, which owns the text.
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    exec python3 "$LAUNCHER" --help
+fi
+
 if [[ "${1:-}" == "--check" ]]; then
     # Same checks the launcher shows on startup, without needing a display — this is what CI and ssh sessions use.
     exec python3 "$LAUNCHER" --check "$@"

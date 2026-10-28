@@ -26,6 +26,7 @@ sys.path.insert(0, str(REPO / "tools" / "launcher"))
 try:
     from PySide6.QtWidgets import QApplication
 
+    import core
     import ui  # noqa: F401 - imported by name so the skip check below covers it too
 except ImportError as error:  # pragma: no cover - environment-dependent
     ui = None
@@ -93,6 +94,20 @@ class LauncherUiTest(unittest.TestCase):
             self.assertTrue(status.startswith("missing:"), status)
         else:
             self.assertEqual(status, "ready")
+
+    def test_a_vulkan_less_tree_marks_the_editor_disabled_instead_of_misleading(self) -> None:
+        """With HP_ENABLE_VULKAN off the tree configures fine but has no editor target. The card must say so on its own
+        state line — "build the engine first" would send the user into a Rebuild that succeeds and still opens nothing."""
+        from unittest import mock
+
+        with mock.patch.object(core, "editor_enabled", return_value=False):
+            self.window.refresh_state()
+
+        state = self.window._openEditorButton._state.text()
+        self.assertIn("disabled", state)
+        # _enabled_for_state, not isEnabled(): the card deliberately stays a responsive widget so its state line can explain
+        # itself (see set_enabled_action); the flag is what carries "pressing this would do nothing".
+        self.assertFalse(self.window._openEditorButton._enabled_for_state)
 
     def test_rebuild_card_starts_the_documented_build_command(self) -> None:
         """Pressing the card must run `cmake --build build/debug -j`, observed through the output panel.

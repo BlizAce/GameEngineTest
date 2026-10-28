@@ -1930,3 +1930,61 @@ scenes/scripts and reports *no importer* for everything else; needs the GUID dat
 array-of-struct fields are read-only in the inspector rather than dangerous), **edit mode only** (no Play button, deliberately),
 **no layout persistence** (no per-project settings file exists to put one in), viewport extent estimated rather than read from
 the dock node, picking a linear scan with no BVH, implot overlays not integrated, and one viewport per window.
+
+## Session 16 (cont.) — launcher verification found two shipped defects, and my first fix was wrong twice
+
+### Hypothesis
+
+The launcher (`run.sh`, `tools/launcher/`) was committed with its own suites green, so it works. Verification means *running the
+documented interface*, not re-running the suite that describes it.
+
+### What was actually wrong
+
+`./run.sh --help` is advertised on line 6 of run.sh and was never implemented: nothing intercepted it, so it fell through to the
+PySide6 probe and `exec main.py --help`, which opened a window (or exited 1 with no Qt). It hung my verification shell for 300 s
+doing that — which is how I found it. A flag documented in a comment is documentation; a flag matched in code is behaviour, and the
+two drift exactly as comments do.
+
+Second: `--check` advertises "verify the toolchain" while omitting the editor's only non-obvious prerequisite. The editor module is
+added only when `HP_BUILD_EDITOR AND HP_ENABLE_VULKAN` (root CMakeLists.txt), so a tree configured `-DHP_ENABLE_VULKAN=OFF`
+configures cleanly, reports all-green, offers an enabled "Open editor" card, and dies with a bare `OSError`. Configure itself cannot
+catch this — it fetches its own headers and never looks for the loader until link time.
+
+### Two ways my own fix was wrong, both caught by tests written before running them
+
+1. **`editor_enabled` matched nothing.** CMake cache keys carry their type (`HP_ENABLE_VULKAN:BOOL=OFF`), so comparing
+   `line.partition("=")[0]` against the bare option name never matched and every tree — including a Vulkan-less one — was reported
+   enabled. A check that always answers "yes" is worse than no check, because it now has the authority of a green tick. Split on the
+   colon; test asserts `False` for `HP_ENABLE_VULKAN:BOOL=OFF`.
+2. **`vulkan_loader_present` crashed outside the suite.** `import ctypes` does not bind `ctypes.util`, so calling it raised
+   `AttributeError`. The unit tests passed because test_core.py imports `ctypes.util` itself, and that side effect happened to make
+   the attribute exist — a green suite hiding a crash in the exact function it claims to cover. Fixed by importing the submodule in
+   core.py; the lesson generalises: if a test file's imports can change production behaviour, the tests are not independent.
+
+Also worth recording: while writing the fixture I claimed CMake caches precede each entry with a `//` help line *containing the option's
+own name*, and "fixed" a comment-parsing bug on the strength of that. `grep -B2 '^HP_BUILD_EDITOR:' build/debug/CMakeCache.txt` says
+otherwise — the real comment is its help string, no `=` in it, so it could never have been parsed as an entry. There was one bug (the
+colon), and I invented a second mechanism for the same symptom; the defensive comment-skip I wrote from that story was then mutation-tested
+and found to be dead code, since a commented key keeps its `//` through the split and stops being a flag name. Both halves are probed now, and
+the note in `core.py` says what the probes showed instead of what I assumed.
+
+### Design notes
+
+The decision lives in `core.py`, not shell or Qt, so both `--check` and the window consume one answer and both are testable without
+a display. `editor_enabled` returns **three** states — `True`, `False`, `None` for "tree not configured yet" — because collapsing
+unknown into disabled would tell someone their repository cannot build an editor before they have run configure once. The cache is
+*read* rather than the rule being mirrored in Python: a duplicated rule drifts silently, whereas reading CMakeCache stays correct if
+the option's meaning or default changes (an absent entry falls back to the documented ON default for that reason).
+
+The window gained a third card state — "disabled in this build" on the editor card itself. The status line was the other candidate,
+but it already has one contract ("ready" vs "missing: …") asserted in test_ui.py, and a per-action reason belongs with the action
+that cannot be taken.
+
+### Result
+
+`run.sh --help`/`-h` print usage with no Qt import and no window, ahead of the PySide6 probe; `--check` reports the Vulkan loader and
+flags editor-disabled presets by name. 36 core tests + 10 UI tests, full suite 35/35 on a from-scratch configure+build (build dir
+deleted first, so nothing passed on stale artifacts). Format and doc-count checkers green.
+
+The new UI test was controlled rather than trusted: replacing the three-state branch with the old two-state code turns it red, and
+restoring it turns it green — the same mutation discipline used for the C++ suites in session 16.

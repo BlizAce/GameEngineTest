@@ -30,6 +30,10 @@ compile_commands.json
 # Executables produced into /bin
 /bin/
 
+# Python bytecode from the launcher tooling (tools/launcher/)
+__pycache__/
+*.py[cod]
+
 # Logs and captures
 *.log
 *.cmp.png

@@ -238,9 +238,32 @@ int main(int argc, char** argv)
     // Commands run before the loop starts, so `--frames 1 --command "entity.create ..."` composes exactly one frame
     // containing their effect. Running them after the first frame instead would make automated captures depend on how
     // many frames the compositor happened to deliver during startup.
-    for (const std::string& command : commandsToRun)
+    //
+    // Each command's outcome goes to stdout as `> command` / its reply, because without it a scripted run cannot tell a
+    // command that worked from one that was rejected: RunStartupCommand's bool is discarded here and the transcript lives
+    // only in the panel, so `--command layout.report` produced output no one could read. That gap is what forced every
+    // automated check of this editor to be inferred from screenshot pixels instead of read from the tool.
+    if (!commandsToRun.empty())
     {
-        editor.RunStartupCommand(command);
+        for (const std::string& command : commandsToRun)
+        {
+            // The transcript is the single source of truth: UiState::Run appends "> command", the reply and any error, so
+            // printing everything it added shows all three faithfully. Echoing the command here as well would duplicate it
+            // for every command that produces no reply (editor.quit), and reading a *second* return channel could disagree
+            // with what the panel shows.
+            const Editor::UiState* state = editor.GetUiState();
+            if (state == nullptr)
+            {
+                break;
+            }
+
+            const auto logBefore = state->Log.size();
+            static_cast<void>(editor.RunStartupCommand(command));
+            for (auto index = logBefore; index < state->Log.size(); ++index)
+            {
+                std::printf("%s\n", state->Log[index].c_str());
+            }
+        }
     }
 
     const EditorStopReason reason = editor.Run();

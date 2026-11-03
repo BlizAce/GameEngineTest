@@ -11,10 +11,12 @@
 #include "Hollowpoint/Editor/EditorInput.h"
 #include "Hollowpoint/Editor/EditorPanels.h"
 #include "Hollowpoint/Editor/EditorSelection.h"
+#include "Hollowpoint/Editor/EditorStyle.h"
 #include "Hollowpoint/Editor/EntityName.h"
 #include "Hollowpoint/Editor/Picking.h"
 #include "Hollowpoint/Editor/PropertyView.h"
 #include "Hollowpoint/Editor/UiRenderer.h"
+#include "Hollowpoint/Editor/ViewCamera.h"
 #include "Hollowpoint/Game/MeshRenderer.h"
 #include "Hollowpoint/Game/SceneRenderer.h"
 #include "Hollowpoint/Graphics/RenderTarget.h"
@@ -485,6 +487,18 @@ bool EditorApplication::Start()
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
     io.IniFilename = nullptr;  // no layout file yet: persistence needs per-project settings (notes/EDITOR.md §3)
 
+    // Look and font, before the first NewFrame. ImGui's defaults are a debug style — a 13 px un-antialiased bitmap font
+    // and saturated blue title bars — which is most of why the editor read as an unfinished demo rather than a tool;
+    // EditorStyle.cpp explains the palette's logic (neutral grey chrome, one accent reserved for interaction) and why the
+    // metrics scale as a set. Font loading cannot fail the editor: with no readable TTF it falls back to ImGui's embedded
+    // vector font and says so in the log rather than refusing to open.
+    const EditorStyleInfo styleInfo = ApplyEditorTheme(1.0f);
+    std::string fontName;
+    if (LoadEditorFonts(fontName))
+    {
+        HP_LOG_INFO(kLogChannel, "ui font {} at {:.0f}px", fontName, static_cast<double>(styleInfo.FontSizePixels));
+    }
+
     m_Ui = UiRenderer::Create(*m_Application->GetDevice());
     if (m_Ui == nullptr)
     {
@@ -493,6 +507,10 @@ bool EditorApplication::Start()
     }
 
     m_State = std::make_unique<UiState>();
+    // From here the state owns the scale (ui.scale writes it, the frame loop applies it). Routed through the same entry
+    // point a later change uses so exactly one code path mutates the style; at this point both are 1.0, which is why
+    // routing it matters more than the call itself.
+    ApplyUiScale();
 
     // Content root defaults to the working directory so the browser shows something when launched without --project. A
     // configured path that does not exist is reported and leaves the panel empty rather than failing the whole start:
@@ -512,6 +530,22 @@ bool EditorApplication::Start()
 
     m_Started = true;
     return true;
+}
+
+void EditorApplication::ApplyUiScale()
+{
+    if (m_ImGuiContext == nullptr || m_State == nullptr)
+    {
+        return;
+    }
+
+    // Only the style is re-applied — not the font. ImGui 1.93 bakes glyphs on demand at FontSizeBase x
+    // DisplayFramebufferScale, so changing the base size makes it produce a new bake by itself; calling LoadEditorFonts
+    // again here would add a *second* copy of the same face to the atlas every scale change (AddFont appends), which is a
+    // slow leak of atlas space and, worse, changes which font GetDefaultFont() returns.
+    ImGui::SetCurrentContext(m_ImGuiContext);
+    static_cast<void>(ApplyEditorTheme(m_State->UiScale));
+    m_State->RequestStyleApply = false;
 }
 
 bool EditorApplication::RunStartupCommand(const std::string& line)
@@ -905,8 +939,18 @@ Entity EditorApplication::PickAtViewportPixel(float x, float y)
 
     // Pixel → NDC. ImGui coordinates and Platform mouse positions are both content-space with y down; the flip into
     // NDC's y-up happens here and nowhere else, which is the convention Picking.h asks its caller to own once.
-    const float ndcX = (x / static_cast<float>(m_ViewportWidth)) * 2.0f - 1.0f;
-    const float ndcY = 1.0f - (y / static_cast<float>(m_ViewportHeight)) * 2.0f;
+    //
+    // The divisor is the *displayed* extent when one has been measured, not the render target's, because x arrives in
+    // display pixels: dividing by target pixels would scale every pick by the framebuffer factor and push it towards the
+    // bottom-right — tens of pixels on a HiDPI laptop, which reads as "picking is off by a bit". The two extents differ
+    // only by the viewport's quantisation step (measured 900x565 displayed against an 896x560 target at 1600x900), i.e.
+    // under half a quantum of bias, which is sub-pixel for a pick; using the display extent removes even that.
+    const float referenceWidth = m_ViewportDisplayWidth > 1.0f ? m_ViewportDisplayWidth : static_cast<float>(m_ViewportWidth);
+    const float referenceHeight =
+        m_ViewportDisplayHeight > 1.0f ? m_ViewportDisplayHeight : static_cast<float>(m_ViewportHeight);
+
+    const float ndcX = (x / referenceWidth) * 2.0f - 1.0f;
+    const float ndcY = 1.0f - (y / referenceHeight) * 2.0f;
 
     CameraState camera =
         BuildViewportCamera(static_cast<float>(m_ViewportWidth) / static_cast<float>(std::max(1u, m_ViewportHeight)));
@@ -1081,15 +1125,73 @@ bool EditorApplication::RenderScenePass(const FrameContext& context)
     FeedImGuiFrameState(contentWidth, contentHeight, static_cast<float>(std::max(0.0001, context.DeltaSeconds)),
                         m_WindowFocused);
 
-    // --- 2. size the viewport target ---------------------------------------------------
-    // Estimated from the main viewport rather than read from the panel: on the first frame ImGui has no layout yet, and
-    // reading a panel rect before NewFrame returns last frame's (zero on frame one). The estimate leaves room for two
-    // side panels and a bottom dock; once docking settles, the Image widget is drawn at exactly the target size so the
-    // scene and its panel cannot drift apart by an accumulating rounding term.
-    const UInt32 desiredWidth = Quantise(static_cast<UInt32>(
-        std::max(static_cast<float>(kMinimumViewportExtent), contentWidth > 700.0f ? contentWidth - 660.0f : 480.0f)));
+    // --- 2. apply the navigation the panels recorded last frame -------------------------
+    // Deliberately one frame late and deliberately here rather than in the widget: panels never touch engine state, they
+    // record intent (EditorPanels.h states the rule). Camera motion is the one place where a frame of latency is
+    // imperceptible, so it is where the rule costs nothing.
+    if (m_State->RequestStyleApply)
+    {
+        ApplyUiScale();
+    }
+
+    ViewportInteraction& interaction = m_State->Viewport;
+    const Float32 deltaSeconds = static_cast<Float32>(std::clamp(context.DeltaSeconds, 0.0, 0.1));
+    if (interaction.PointerOverImage)
+    {
+        FlyView(m_Camera.Position, m_Camera.Target, interaction.Fly, deltaSeconds, m_State->Navigation);
+        OrbitView(m_Camera.Position, m_Camera.Target, interaction.OrbitPixelsX, interaction.OrbitPixelsY,
+                  m_State->Navigation);
+        PanView(m_Camera.Position, m_Camera.Target, interaction.PanPixelsX, interaction.PanPixelsY,
+                interaction.ImageHeight, m_Camera.VerticalFieldOfViewRadians);
+        DollyView(m_Camera.Position, m_Camera.Target, interaction.DollyNotches, m_State->Navigation);
+    }
+
+    // Reset the per-frame accumulators whether or not the pointer was over the viewport: a key released while the cursor
+    // was elsewhere must not leave the camera drifting forever.
+    interaction.Fly = {};
+    interaction.OrbitPixelsX = 0.0f;
+    interaction.OrbitPixelsY = 0.0f;
+    interaction.PanPixelsX = 0.0f;
+    interaction.PanPixelsY = 0.0f;
+    interaction.DollyNotches = 0.0f;
+
+    if (interaction.RequestFrameSelection)
+    {
+        static_cast<void>(FrameSelectionInView());
+        interaction.RequestFrameSelection = false;
+    }
+
+    // Frame rate, smoothed over half a second. The status bar shows this rather than 1/dt because an instantaneous value
+    // jitters between 58 and 62 on a locked editor and reads as a stutter that is not happening.
+    m_FpsWindowSeconds += deltaSeconds;
+    ++m_FpsWindowFrames;
+    if (m_FpsWindowSeconds >= 0.5f)
+    {
+        m_FramesPerSecond = static_cast<float>(static_cast<double>(m_FpsWindowFrames) / m_FpsWindowSeconds);
+        m_FpsWindowSeconds = 0.0f;
+        m_FpsWindowFrames = 0u;
+    }
+
+    // --- 3. size the viewport target ---------------------------------------------------
+    // From the *measured* image area, not an arithmetic guess about what the panels take. The previous estimate
+    // (window minus fixed panel allowances) overshot the panel's content area by ~130 px at 1600x900: ImGui clipped the
+    // image and added two scrollbars, and the scene was projected at an aspect ratio nobody could see. Measuring is a
+    // frame late — on frame one there is no layout to measure, so the first frame uses a conservative default and every
+    // frame after that tracks the real dock node, including while a splitter is dragged.
+    //
+    // Multiplying by the framebuffer scale maps target texels to *physical* pixels 1:1, so the image is neither resampled
+    // (blurry) nor cropped. The projection keeps using the target's own aspect ratio (GetCameraOverride), which equals the
+    // displayed aspect within half a quantisation step — under 1% at typical sizes, against the ~6% error the old estimate
+    // produced while also cropping.
+    const float measuredWidth = m_ViewportDisplayWidth > 1.0f ? m_ViewportDisplayWidth : std::max(320.0f, contentWidth - 700.0f);
+    const float measuredHeight = m_ViewportDisplayHeight > 1.0f ? m_ViewportDisplayHeight : std::max(240.0f, contentHeight - 300.0f);
+    const float pixelScaleX = io.DisplayFramebufferScale.x > 0.0f ? io.DisplayFramebufferScale.x : 1.0f;
+    const float pixelScaleY = io.DisplayFramebufferScale.y > 0.0f ? io.DisplayFramebufferScale.y : 1.0f;
+
+    const UInt32 desiredWidth = Quantise(static_cast<UInt32>(std::max(
+        static_cast<float>(kMinimumViewportExtent), measuredWidth * pixelScaleX)));
     const UInt32 desiredHeight = Quantise(static_cast<UInt32>(std::max(
-        static_cast<float>(kMinimumViewportExtent), contentHeight > 400.0f ? contentHeight - 260.0f : 320.0f)));
+        static_cast<float>(kMinimumViewportExtent), measuredHeight * pixelScaleY)));
 
     if (!EnsureViewportTargets(desiredWidth, desiredHeight))
     {
@@ -1097,7 +1199,7 @@ bool EditorApplication::RenderScenePass(const FrameContext& context)
         return false;
     }
 
-    // --- 3. the scene, at the panel's extent -------------------------------------------
+    // --- 4. the scene, at the panel's extent -------------------------------------------
     Game::SceneRenderer* renderer = m_Application->GetRenderer();
     if (renderer == nullptr)
     {
@@ -1127,16 +1229,33 @@ bool EditorApplication::RenderScenePass(const FrameContext& context)
     panelContext.Application = this;
     panelContext.Console = &m_State->Console;
     panelContext.ViewportTextureId = m_ViewportTextureId;
-    panelContext.ViewportWidth = static_cast<float>(m_ViewportWidth);
-    panelContext.ViewportHeight = static_cast<float>(m_ViewportHeight);
+    panelContext.RenderedWidth = static_cast<float>(m_ViewportWidth);
+    panelContext.RenderedHeight = static_cast<float>(m_ViewportHeight);
     panelContext.FrameCount = context.FrameIndex;
     panelContext.SceneDrawCalls = renderer->GetDrawCount();
     panelContext.ContentWidth = contentWidth;
     panelContext.ContentHeight = contentHeight;
+    panelContext.CameraPosition = m_Camera.Position;
+    panelContext.CameraTarget = m_Camera.Target;
+    panelContext.ViewportHintVisible = m_State->Viewport.PointerOverImage || m_State->Viewport.Navigating;
+    panelContext.ActiveSceneName = ActiveSceneDisplayName();
+    panelContext.FramesPerSecond = m_FramesPerSecond;
+    panelContext.DeltaSeconds = deltaSeconds;
+
+    // Reported back for `layout.report`, which sees only UiState: render extent next to displayed extent is the one
+    // pairing that makes a crop or a stretch legible without measuring a screenshot by hand.
+    m_State->ReportedRenderWidth = panelContext.RenderedWidth;
+    m_State->ReportedRenderHeight = panelContext.RenderedHeight;
 
     DrawEditorPanels(*m_State, panelContext);
 
     ImGui::Render();
+
+    // The image area the panels just measured becomes this frame's... no: *next* frame's target size (the scene has
+    // already been rendered by now). Stored here rather than read back later because ImGui's layout is only valid
+    // between NewFrame and Render.
+    m_ViewportDisplayWidth = m_State->Viewport.ImageWidth;
+    m_ViewportDisplayHeight = m_State->Viewport.ImageHeight;
 
 
     m_LastBackBufferWidth = context.BackBuffer->GetWidth();
@@ -1200,6 +1319,98 @@ void EditorApplication::OnResize(UInt32 framebufferWidth, UInt32 framebufferHeig
 // ---------------------------------------------------------------------------
 // Viewport targets
 // ---------------------------------------------------------------------------
+
+std::string EditorApplication::ActiveSceneDisplayName() const
+{
+    if (m_ActiveScenePath.empty())
+    {
+        return {};
+    }
+    // Base name only: the status bar has a few tens of pixels for this, and an absolute path would push every other
+    // number off the strip. The full path is available from `editor.info` and the scene commands' replies.
+    const std::filesystem::path path(m_ActiveScenePath);
+    return path.filename().string();
+}
+
+bool EditorApplication::FrameSelectionInView()
+{
+    if (m_Application == nullptr || m_State == nullptr)
+    {
+        return false;
+    }
+
+    // Bounds come from the same geometry resolver the renderer drew with, so what gets framed is what is on screen: an
+    // independent bound computation would drift the first time a mesh failed to load and quietly framed nothing.
+    const Runtime::BuiltInMeshes& meshes = Runtime::BuiltInMeshes::GetSingleton();
+    World& world = m_Application->GetWorld();
+
+    const bool frameSelection = !m_State->Selection.IsEmpty();
+
+    Vec3 minBounds(1e18f, 1e18f, 1e18f);
+    Vec3 maxBounds(-1e18f, -1e18f, -1e18f);
+    bool any = false;
+
+    auto accumulate = [&](const Entity& entity, const Game::MeshRenderer& renderer) {
+        if (!renderer.IsDrawable())
+        {
+            return;
+        }
+        if (frameSelection && !m_State->Selection.IsSelected(entity))
+        {
+            return;
+        }
+
+        const Renderer::GeometryData* geometry = meshes.Lookup(renderer.MeshPath);
+        if (geometry == nullptr)
+        {
+            return;
+        }
+
+        const Math::AxisAlignedBox local = geometry->ComputeBounds();
+        Mat4 transform = Mat4::Identity();
+        if (const Scene::LocalTransform* localTransform = world.TryGetComponent<Scene::LocalTransform>(entity);
+            localTransform != nullptr)
+        {
+            transform = localTransform->ToTransform().ToMatrix();
+        }
+
+        // Transform the eight corners rather than the box: rotating an AABB by a matrix and re-fitting (the cheap wrong
+        // version) inflates bounds for any rotated object, so framing would back off further each time you pressed F.
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            const Vec3 localCorner((corner & 1) ? local.Max.X : local.Min.X,
+                                   (corner & 2) ? local.Max.Y : local.Min.Y,
+                                   (corner & 4) ? local.Max.Z : local.Min.Z);
+            const Vec3 worldCorner = transform.TransformPoint(localCorner);
+            minBounds.X = std::min(minBounds.X, worldCorner.X);
+            minBounds.Y = std::min(minBounds.Y, worldCorner.Y);
+            minBounds.Z = std::min(minBounds.Z, worldCorner.Z);
+            maxBounds.X = std::max(maxBounds.X, worldCorner.X);
+            maxBounds.Y = std::max(maxBounds.Y, worldCorner.Y);
+            maxBounds.Z = std::max(maxBounds.Z, worldCorner.Z);
+            any = true;
+        }
+    };
+
+    world.ForEach<Game::MeshRenderer>([&](const Entity& entity, const Game::MeshRenderer& renderer) {
+        accumulate(entity, renderer);
+    });
+
+    if (!any)
+    {
+        return false;
+    }
+
+    const Vec3 centre((minBounds.X + maxBounds.X) * 0.5f, (minBounds.Y + maxBounds.Y) * 0.5f,
+                      (minBounds.Z + maxBounds.Z) * 0.5f);
+    const Vec3 extent(maxBounds.X - minBounds.X, maxBounds.Y - minBounds.Y, maxBounds.Z - minBounds.Z);
+    // Half the space diagonal bounds any orientation of the selection; using the largest single axis instead lets a long
+    // thin object poke out of frame when viewed along its length.
+    const Float32 radius = std::max(0.05f, 0.5f * std::sqrt(extent.X * extent.X + extent.Y * extent.Y
+                                                            + extent.Z * extent.Z));
+
+    return FrameBounds(m_Camera.Position, m_Camera.Target, centre, radius, m_Camera.VerticalFieldOfViewRadians);
+}
 
 CameraState EditorApplication::BuildViewportCamera(Float32 aspectRatio) const
 {
@@ -1317,8 +1528,11 @@ bool EditorApplication::EnsureViewportTargets(UInt32 width, UInt32 height)
     // PanelContext in this same frame, so there is no frame where they could sample the dead one.
     m_ViewportTextureId = m_Ui != nullptr ? m_Ui->RegisterTexture(colour) : 0ull;
 
-    HP_LOG_INFO(kLogChannel, "viewport targets: {}x{}", width, height);
-    return true;
+    // Logged on every reallocation. The measured display extent is included because the pair is what makes a sizing bug
+    // legible in a log file: "896x560 (measured 1382x845)" says the panel and the target have come apart, which is the
+    // failure this code path exists to prevent and which otherwise shows only as a cropped viewport someone has to measure.
+    HP_LOG_INFO(kLogChannel, "viewport targets: {}x{} (measured {:.0f}x{:.0f})", width, height,
+                static_cast<double>(m_ViewportDisplayWidth), static_cast<double>(m_ViewportDisplayHeight)); return true;
 }
 
 bool EditorApplication::EnsureCaptureTargets(UInt32 width, UInt32 height)

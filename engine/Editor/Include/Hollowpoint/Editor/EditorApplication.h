@@ -225,6 +225,34 @@ public:
 
     void SetViewportCamera(const Math::Vec3& eye, const Math::Vec3& target) noexcept;
 
+    //! The viewport camera, for tests and status reporting. Navigation mutates it through the frame loop only.
+    [[nodiscard]] Math::Vec3 GetViewportCameraPosition() const noexcept
+    {
+        return m_Camera.Position;
+    }
+
+    [[nodiscard]] Math::Vec3 GetViewportCameraTarget() const noexcept
+    {
+        return m_Camera.Target;
+    }
+
+    //! Reports the viewport's rendered extent (pixels) next to its measured display extent (content units).
+    /**
+     * The two must agree within one quantisation step — that invariant is what "the scene fills its panel and is not
+     * cropped" means in numbers, and it was violated by ~130 px before the layout was measured instead of estimated.
+     * Exposed as a getter rather than asserted from inside the frame loop because the check belongs to the observer: the
+     * editor cannot know whether a test considers a given difference acceptable, and hard-asserting in the renderer
+     * would turn a diagnostic into a crash.
+     */
+    void GetViewportExtent(UInt32& outRenderedWidth, UInt32& outRenderedHeight, float& outDisplayWidth,
+                           float& outDisplayHeight) const noexcept
+    {
+        outRenderedWidth = m_ViewportWidth;
+        outRenderedHeight = m_ViewportHeight;
+        outDisplayWidth = m_ViewportDisplayWidth;
+        outDisplayHeight = m_ViewportDisplayHeight;
+    }
+
     //! Selects whatever is under a viewport-image pixel (origin at the image's top-left, content units). Returns the
     //! hit
     //  entity or a null handle when nothing was hit.
@@ -241,6 +269,32 @@ public:
     {
         return m_ImGuiContext;
     }
+
+    //! The panels' state, including the per-frame PanelGeometry snapshot.
+    /**
+     * Read-only by intent: a test asserts on layout through this rather than reaching into the editor's internals, and
+     * production code that wanted to mutate it would be breaking the rule that only the panels themselves own their state.
+     * Returns null before Start() (there is no UiState until the context exists).
+     */
+    [[nodiscard]] const UiState* GetUiState() const noexcept
+    {
+        return m_State.get();
+    }
+
+    //! Base name of the scene being edited, for the status bar; empty when nothing has been loaded or saved.
+    [[nodiscard]] std::string ActiveSceneDisplayName() const;
+
+    //! Re-applies the editor theme at `m_State->UiScale`. Safe mid-session: ImGui re-bakes glyphs on demand.
+    //  Called once during Start and again whenever a `ui.scale` command set RequestStyleApply.
+    void ApplyUiScale();
+
+    //! Frames the selection (or the whole world when nothing is selected) by moving the viewport camera.
+    /**
+     * Bounds come from the same geometry resolver the renderer drew with, so what gets framed is what is on screen — an
+     * independent bound computation would drift the first time a mesh failed to load. Returns false, leaving the camera
+     * alone, when there is no drawable geometry to frame.
+     */
+    bool FrameSelectionInView();
 
     // --- IApplicationHost --------------------------------------------------------------
 
@@ -296,6 +350,20 @@ private:
 
     UInt32 m_ViewportWidth = 0;
     UInt32 m_ViewportHeight = 0;
+
+    //! The image's measured extent in content units — what the author actually sees, as opposed to the quantised pixel
+    //  extent the scene is rendered at. Projection and picking use *this*, so the perspective matches the framed image:
+    //  rendering at a target aspect and displaying at a different one is precisely the distortion that made the old
+    //  viewport's geometry disagree with itself. Falls back to the target extent before the first measurement exists.
+    float m_ViewportDisplayWidth = 0.0f;
+    float m_ViewportDisplayHeight = 0.0f;
+
+    //! Frames-per-second shown in the status bar, smoothed over a half-second window. An instantaneous 1/dt reads as
+    //  noise: a locked 60 looks like it is stuttering, which sends someone looking for a performance problem that is
+    //  not there.
+    float m_FramesPerSecond = 0.0f;
+    float m_FpsWindowSeconds = 0.0f;
+    UInt32 m_FpsWindowFrames = 0;
 
     //! The viewport's fly camera. Default looks at the origin from a three-quarter angle, which frames the built-in
     //! demo

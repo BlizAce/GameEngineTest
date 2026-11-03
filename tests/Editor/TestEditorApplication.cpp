@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <doctest/doctest.h>
@@ -158,56 +160,48 @@ using Platform::PlatformScope;
     return static_cast<float>(different) / static_cast<float>(pixels);
 }
 
-//! Counts distinct colours inside a fractional rectangle of a captured frame.
+//! Per-panel assertions operate on docked-window geometry (FindPanelRect), not on sampled pixel regions.
 /**
- * The per-panel check that makes "did the editor draw its UI" a real assertion. Measured on this suite's own regression
- * (ImGui numbers vertices per draw list, so concatenating them without a per-list binding offset made every window
- * redraw the menu bar's geometry and clip it away): each panel region held exactly **1** distinct colour while broken
- * and 4–8 when drawn.
- *
- * Why not whole-frame statistics:
- *   * distinct colours overall — a frame with only a menu bar scores *higher* (gradients plus anti-aliased text) than
- * one whose large panels are flat fills: 51 broken against 41 fixed;
- *   * coverage of non-background — the dockspace itself paints most of the window, so it stays high even when no panel
- *     draws.
- * Both looked like they should work and neither discriminates. Region-local structure does.
+ * This file used to assert "did a panel draw" by counting distinct colours inside a fractional rectangle of the frame,
+ * which worked while panels were free-floating windows placed by arithmetic. Docked panels tile the window, so a region
+ * can be satisfied by a neighbour's fill or by the dock background: making DrawOutlinerPanel return immediately left
+ * every one of those assertions green (measured, not assumed — see notes/EDITOR_UI_REVIEW.md §2, which records the whole-frame
+ * statistics that were tried first and also fail to discriminate). A docked window's rectangle is unambiguous and reads
+ * 0x0 when the panel did not draw, so that is what the layout tests assert; the "is there any UI at all" signal survives
+ * as the scene-fraction check inside the viewport's own rectangle.
  */
-struct FractionalRegion
-{
-    float X0 = 0.0f;
-    float Y0 = 0.0f;
-    float X1 = 0.0f;
-    float Y1 = 0.0f;
-};
 
+//! Counts distinct colours inside an explicit pixel rectangle.
+/**
+ * Take a panel's *measured* rectangle (CollectPanelRectangles) rather than a fractional guess, and the count means what
+ * it appears to mean: structure drawn by that panel. The old version of this helper took hardcoded fractions, which was
+ * sound while panels were free-floating windows placed by arithmetic and meaningless once they tile — see the note above
+ * FindPanelRect. Colour buckets are 5 bits per channel so a panel's fill and its border land in different buckets while
+ * anti-aliasing along one glyph edge does not add a bucket per pixel.
+ */
 [[nodiscard]] Size CountDistinctColours(const std::vector<unsigned char>& rgba, UInt32 imageWidth, UInt32 imageHeight,
-                                        const FractionalRegion& region)
+                                        UInt32 x0, UInt32 y0, UInt32 width, UInt32 height)
 {
-    if (rgba.empty() || imageWidth == 0u || imageHeight == 0u)
+    if (rgba.empty() || imageWidth == 0u || imageHeight == 0u || width == 0u || height == 0u)
     {
         return 0u;
     }
 
-    // 5 bits per channel: a panel's fill and its border land in different buckets, while anti-aliasing along one glyph
-    // edge does not add a new bucket per pixel.
     std::vector<bool> seen(1 << 15, false);
     Size distinct = 0;
 
-    const auto x0 = static_cast<UInt32>(region.X0 * static_cast<float>(imageWidth));
-    const auto x1 = static_cast<UInt32>(region.X1 * static_cast<float>(imageWidth));
-    const auto y0 = static_cast<UInt32>(region.Y0 * static_cast<float>(imageHeight));
-    const auto y1 = static_cast<UInt32>(region.Y1 * static_cast<float>(imageHeight));
+    const UInt32 xEnd = std::min(x0 + width, imageWidth);
+    const UInt32 yEnd = std::min(y0 + height, imageHeight);
 
-    for (UInt32 y = y0; y < y1 && y < imageHeight; ++y)
+    for (UInt32 y = y0; y < yEnd; ++y)
     {
-        for (UInt32 x = x0; x < x1 && x < imageWidth; ++x)
+        for (UInt32 x = x0; x < xEnd; ++x)
         {
             const Size base = (static_cast<Size>(y) * imageWidth + x) * 4u;
             if (base + 3u >= rgba.size())
             {
                 continue;
             }
-
             const Size key = ((rgba[base] >> 3) << 10) | ((rgba[base + 1] >> 3) << 5) | (rgba[base + 2] >> 3);
             if (!seen[key])
             {
@@ -220,11 +214,35 @@ struct FractionalRegion
     return distinct;
 }
 
-//! Where the default layout puts each panel, as fractions of the window. See PlaceInitially in EditorPanels.cpp: these
-//  are the same proportions, sampled well inside each rectangle so a neighbouring panel's border cannot satisfy it.
-const FractionalRegion kOutlinerRegion{0.01f, 0.15f, 0.20f, 0.75f};
-const FractionalRegion kDetailsRegion{0.80f, 0.15f, 0.98f, 0.70f};
-const FractionalRegion kConsoleRegion{0.30f, 0.78f, 0.95f, 0.97f};
+//! Finds one panel's snapshotted rectangle by title.
+/**
+ * The replacement for fractional-region pixel sampling. Docked panels tile the window, so a region of the frame cannot
+ * be attributed to a panel — but every panel is a real ImGui window with a real rectangle, and EditorPanels snapshots
+ * those per frame. Asserting on the rectangle is what makes "the outliner did not draw" fail loudly: a hidden or
+ * zero-sized panel reports 0x0 rather than being silently absent from the sample.
+ */
+[[nodiscard]] const Editor::PanelRect* FindPanelRect(const Editor::UiState* state, std::string_view title)
+{
+    if (state == nullptr)
+    {
+        return nullptr;
+    }
+    for (const Editor::PanelRect& rect : state->PanelGeometry)
+    {
+        if (rect.Name == title)
+        {
+            return &rect;
+        }
+    }
+    return nullptr;
+}
+
+//! The panel titles the default layout docks, matching the constants in EditorPanels.cpp.
+constexpr const char* kViewportTitle = "Viewport";
+constexpr const char* kOutlinerTitle = "Outliner";
+constexpr const char* kDetailsTitle = "Details";
+constexpr const char* kContentTitle = "Content Browser";
+constexpr const char* kConsoleTitle = "Console";
 
 }  // namespace
 
@@ -339,54 +357,243 @@ TEST_SUITE("EditorApplication")
         std::filesystem::remove_all(project);
     }
 
-    TEST_CASE("The composed frame contains the UI, and editing the scene changes the viewport")
+    TEST_CASE("Every panel docks with real geometry, and the viewport fills its node without cropping")
     {
+        // The layout invariant this whole change exists for. Asserted on geometry rather than pixels because docked
+        // panels tile the window: a fractional pixel region cannot tell one panel from another (see CountDistinctColours),
+        // whereas a docked window's rectangle is unambiguous and reports 0x0 when the panel did not draw at all.
         SKIP_WITHOUT_DISPLAY();
 
-        const std::filesystem::path project = ScratchPath("composed");
+        const std::filesystem::path project = ScratchPath("layout");
+        std::filesystem::remove_all(project);
         std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+        static_cast<void>(editor.CreateEntity("Alpha", "engine:cube"));
+
+        // Docking settles over the first few frames (frame one has no layout to measure), so capture after it converges.
+        for (int frame = 0; frame < 8; ++frame)
+        {
+            REQUIRE(editor.Frame());
+        }
+
+        const Editor::UiState* state = editor.GetUiState();
+        REQUIRE(state != nullptr);
 
         UInt32 width = 0;
         UInt32 height = 0;
-        UInt32 afterWidth = 0;
-        UInt32 afterHeight = 0;
+        const std::vector<unsigned char> pixels = Capture(editor, width, height);
+        const float windowWidth = static_cast<float>(width);
+        const float windowHeight = static_cast<float>(height);
+
+        // --- every panel exists, is docked, and has real area ---------------------------------
+        for (const char* title : {kOutlinerTitle, kDetailsTitle, kContentTitle, kConsoleTitle, kViewportTitle})
+        {
+            const Editor::PanelRect* rect = FindPanelRect(state, title);
+            REQUIRE_MESSAGE(rect != nullptr, "no geometry snapshot entry for " << title);
+            CHECK_MESSAGE(rect->Width > 80.0f, title << " is " << rect->Width << " wide; it did not dock");
+            CHECK_MESSAGE(rect->Height > 60.0f, title << " is " << rect->Height << " tall; it did not dock");
+
+            // Inside the window: a panel positioned off-screen docks with a valid size yet shows nothing.
+            CHECK(rect->X >= -1.0f);
+            CHECK(rect->Y >= -1.0f);
+            CHECK(rect->X + rect->Width <= windowWidth + 2.0f);
+            CHECK(rect->Y + rect->Height <= windowHeight + 2.0f);
+        }
+
+        // --- the viewport is the largest region, and panels do not overlap it -------------------
+        const Editor::PanelRect* viewport = FindPanelRect(state, kViewportTitle);
+        REQUIRE(viewport != nullptr);
+        const float windowArea = windowWidth * windowHeight;
+        CHECK_MESSAGE(viewport->Area() > 0.18f * windowArea,
+                      "viewport holds only " << viewport->Area() / windowArea * 100.0f << "% of the window");
+
+        for (const char* title : {kOutlinerTitle, kDetailsTitle, kContentTitle})
+        {
+            const Editor::PanelRect* rect = FindPanelRect(state, title);
+            REQUIRE(rect != nullptr);
+            // Docked siblings share an edge but must not cover one another: any real overlap means the tree was built
+            // wrong (two windows in one node, or a split that did not subtract).
+            const float overlapX = std::min(viewport->X + viewport->Width, rect->X + rect->Width)
+                                   - std::max(viewport->X, rect->X);
+            const float overlapY = std::min(viewport->Y + viewport->Height, rect->Y + rect->Height)
+                                   - std::max(viewport->Y, rect->Y);
+            // Hoisted to a named bool: doctest's assertion macro cannot parse `a || b` ("Expression Too Complex"), so
+            // the condition is computed first and the message carries the numbers that explain a failure.
+            const bool sharesEdgeOnly = overlapX <= 2.0f || overlapY <= 2.0f;
+            CHECK_MESSAGE(sharesEdgeOnly, title << " overlaps the viewport by " << overlapX << "x" << overlapY);
+        }
+
+        // --- the scene image is not cropped: rendered extent matches displayed extent ------------
+        // This is the regression that motivated the change: the target used to be sized from an arithmetic estimate that
+        // overshot the panel by ~130 px, so ImGui clipped the image and drew two scrollbars over it.
+        UInt32 renderedWidth = 0;
+        UInt32 renderedHeight = 0;
+        float displayWidth = 0.0f;
+        float displayHeight = 0.0f;
+        editor.GetViewportExtent(renderedWidth, renderedHeight, displayWidth, displayHeight);
+
+        REQUIRE(renderedWidth > 0u);
+        // kViewportExtentQuantum is the tolerance the renderer itself admits: the target is quantised to that step, so
+        // the two differ by at most one step and never by a panel's worth.
+        CHECK(std::abs(static_cast<float>(renderedWidth) - displayWidth) <= 17.0f);
+        CHECK(std::abs(static_cast<float>(renderedHeight) - displayHeight) <= 17.0f);
+
+        // --- the viewport's rectangle contains drawn content, not a flat fill -------------------
+        // Deliberately *not* "is it sky-blue": the test config paints the scene background magenta (MakeTestConfig), so
+        // a colour heuristic that passed against the default project fails here — which is exactly the kind of assertion
+        // that passes for the wrong reason. What is unambiguous is structure: a rendered scene has gradients, an entity
+        // and tone-mapped edges, so its rectangle cannot be one or two colours. Attributed to the panel by geometry, so
+        // a neighbour's content cannot satisfy it.
+        const Size viewportColours = CountDistinctColours(pixels, width, height, static_cast<UInt32>(viewport->X),
+                                                          static_cast<UInt32>(viewport->Y),
+                                                          static_cast<UInt32>(viewport->Width),
+                                                          static_cast<UInt32>(viewport->Height));
+        CHECK_MESSAGE(viewportColours >= 8u,
+                      "the viewport rectangle holds only " << viewportColours
+                                                           << " colours; nothing was rendered into it");
+
+        // And the other panels draw their widgets: a docked panel that rendered nothing is a flat fill of its own
+        // background, which is one bucket however large the panel is.
+        for (const char* title : {kOutlinerTitle, kDetailsTitle, kConsoleTitle})
+        {
+            const Editor::PanelRect* rect = FindPanelRect(state, title);
+            REQUIRE(rect != nullptr);
+            const Size colours = CountDistinctColours(pixels, width, height, static_cast<UInt32>(rect->X),
+                                                      static_cast<UInt32>(rect->Y), static_cast<UInt32>(rect->Width),
+                                                      static_cast<UInt32>(rect->Height));
+            CHECK_MESSAGE(colours >= 3u, title << " holds only " << colours << " colours; its contents did not draw");
+        }
+
+        std::filesystem::remove_all(project);
+    }
+
+    TEST_CASE("layout.reset rebuilds the docked tree after panels are hidden")
+    {
+        // Reset Layout is the command every UE user reaches for first, and before it existed a scattered layout was
+        // permanent. The test hides a panel through the same flag the Window menu toggles, resets, and requires the panel
+        // back at real size — which fails if reset forgets to clear visibility or rebuild the tree.
+        SKIP_WITHOUT_DISPLAY();
+
+        const std::filesystem::path project = ScratchPath("reset");
+        std::filesystem::remove_all(project);
+        std::filesystem::create_directories(project);
 
         EditorConfig config = MakeTestConfig(project);
         EditorApplication editor(config);
         REQUIRE(editor.Start());
 
-        // One entity up front so every panel has something to draw: an empty Details panel is legitimately flat fill,
-        // and asserting "structure" on it would test the placeholder rather than the panel.
+        for (int frame = 0; frame < 6; ++frame)
+        {
+            REQUIRE(editor.Frame());
+        }
+
+        const Editor::UiState* state = editor.GetUiState();
+        REQUIRE(state != nullptr);
+        REQUIRE(FindPanelRect(state, kOutlinerTitle) != nullptr);
+        CHECK(FindPanelRect(state, kOutlinerTitle)->Width > 80.0f);
+
+        // Hide it the way the menu does. Assert on the visibility flag itself: ImGui keeps a hidden window's last
+        // rectangle, so a geometry-only check here would pass whether or not anything was actually hidden — which is
+        // exactly how an earlier revision of this test managed to be green while proving nothing.
+        REQUIRE(editor.RunStartupCommand("panels.show outliner 0"));
+        for (int frame = 0; frame < 3; ++frame)
+        {
+            REQUIRE(editor.Frame());
+        }
+        CHECK_FALSE(state->ShowOutliner);
+
+        // A hidden panel reports no geometry at all, so the snapshot distinguishes "hidden" from "docked at size".
+        const Editor::PanelRect* hidden = FindPanelRect(state, kOutlinerTitle);
+        REQUIRE(hidden != nullptr);
+        CHECK_MESSAGE(hidden->Area() == 0.0f,
+                      "a hidden panel still reports " << hidden->Width << "x" << hidden->Height);
+
+        // Reset restores it: visible again, and docked with real area.
+        REQUIRE(editor.RunStartupCommand("layout.reset"));
+        for (int frame = 0; frame < 4; ++frame)
+        {
+            REQUIRE(editor.Frame());
+        }
+
+        CHECK(state->ShowOutliner);
+        const Editor::PanelRect* restored = FindPanelRect(state, kOutlinerTitle);
+        REQUIRE(restored != nullptr);
+        CHECK_MESSAGE(restored->Width > 80.0f, "after layout.reset the outliner is " << restored->Width << " wide");
+        CHECK_MESSAGE(restored->Height > 60.0f, "after layout.reset the outliner is " << restored->Height << " tall");
+
+        std::filesystem::remove_all(project);
+    }
+
+    TEST_CASE("Navigation commands move the viewport camera; a bad argument leaves it alone")
+    {
+        SKIP_WITHOUT_DISPLAY();
+
+        const std::filesystem::path project = ScratchPath("navigate");
+        std::filesystem::remove_all(project);
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+
+        CHECK(editor.RunStartupCommand("viewport.camera 10 2 3"));
+        const Math::Vec3 after = editor.GetViewportCameraPosition();
+        // doctest's CHECK cannot parse a chained call on the right of `==`, so the comparator is built first; that is a
+        // macro limitation, not a style choice — writing it inline fails to compile with "Expression Too Complex".
+        const doctest::Approx ten(10.0);
+        const doctest::Approx two(2.0);
+        const doctest::Approx three(3.0);
+        CHECK(after.X == ten);
+        CHECK(after.Y == two);
+        CHECK(after.Z == three);
+
+        // A rejected command must not move anything: "it printed an error but still moved" is the failure mode that makes
+        // people distrust every error message the editor prints.
+        const Math::Vec3 anchored = editor.GetViewportCameraPosition();
+        CHECK_FALSE(editor.RunStartupCommand("viewport.camera not a number"));
+        CHECK(editor.GetViewportCameraPosition().X == doctest::Approx(anchored.X).epsilon(0.001));
+
+        // view.speed and ui.scale are clamped, so a mistyped value cannot produce an unusable editor.
+        CHECK(editor.RunStartupCommand("view.speed 0.0001"));
+        CHECK_FALSE(editor.RunStartupCommand("view.speed -5"));
+
+        std::filesystem::remove_all(project);
+    }
+
+    TEST_CASE("Adding an entity changes the composed frame: the viewport shows the world it edits")
+    {
+        // Kept from the original suite, which this replaced only in its per-panel assertions. If nothing moves when the
+        // world changes, the viewport is not showing the world the editor edits — the two-sources-of-truth bug the whole
+        // host exists to prevent, and worth an assertion independent of how the panels are arranged.
+        SKIP_WITHOUT_DISPLAY();
+
+        const std::filesystem::path project = ScratchPath("composed");
+        std::filesystem::remove_all(project);
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+
         static_cast<void>(editor.CreateEntity("Alpha", ""));
 
-        // Two frames before the first capture: frame one allocates the viewport targets, and ImGui's first layout pass
-        // has no rectangles to place panels in, so capturing then would assert on a half-built UI.
-        REQUIRE(editor.Frame());
-        REQUIRE(editor.Frame());
+        for (int frame = 0; frame < 6; ++frame)
+        {
+            REQUIRE(editor.Frame());
+        }
+
+        UInt32 width = 0;
+        UInt32 height = 0;
         const std::vector<unsigned char> beforePixels = Capture(editor, width, height);
         CHECK(width == 1280u);
         CHECK(height == 720u);
 
-        // Each panel region must contain structure — a fill, a border and text, not one flat colour. See
-        // CountDistinctColours for why whole-frame statistics were tried first and do not discriminate. The names are
-        // written out per check rather than looped: doctest renders a `const char*` member in a message as 1 (it binds
-        // through the bool conversion), which turns a precise failure into "the 1 region" — exactly when precision
-        // matters.
-        CHECK_MESSAGE(CountDistinctColours(beforePixels, width, height, kOutlinerRegion) >= 3u,
-                      "the outliner region is flat; that panel did not draw its contents");
-        CHECK_MESSAGE(CountDistinctColours(beforePixels, width, height, kDetailsRegion) >= 3u,
-                      "the details region is flat; that panel did not draw its contents");
-        CHECK_MESSAGE(CountDistinctColours(beforePixels, width, height, kConsoleRegion) >= 3u,
-                      "the console region is flat; that panel did not draw its contents");
-
-        // Now change the scene and confirm pixels change with it. Adding a mesh to an empty world must alter the image:
-        // if nothing moved, the viewport is not showing the world the editor edits — the two-sources-of-truth bug this
-        // host exists to prevent.
         static_cast<void>(editor.CreateEntity("Cube", "engine:cube"));
         REQUIRE(editor.Frame());
-        const std::vector<unsigned char> afterPixels = Capture(editor, afterWidth, afterHeight);
-        CHECK(afterWidth == width);
-        CHECK(afterHeight == height);
+        const std::vector<unsigned char> afterPixels = Capture(editor, width, height);
 
         const float changed = DifferenceFraction(beforePixels, afterPixels);
         CHECK_MESSAGE(changed > 0.0005f,

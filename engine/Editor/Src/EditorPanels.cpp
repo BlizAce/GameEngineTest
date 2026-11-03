@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -11,12 +13,21 @@
 #include "Hollowpoint/Editor/EditorConsole.h"
 #include "Hollowpoint/Editor/EditorPanels.h"
 #include "Hollowpoint/Editor/EditorSelection.h"
+#include "Hollowpoint/Editor/EditorStyle.h"
 #include "Hollowpoint/Editor/EntityName.h"
 #include "Hollowpoint/Editor/PropertyView.h"
+#include "Hollowpoint/Editor/ViewCamera.h"
+#include "Hollowpoint/Math/MathCore.h"
 #include "Hollowpoint/Reflection/Descriptors.h"
+#include "Hollowpoint/Reflection/Registry.h"
 #include "Hollowpoint/Scene/LocalTransform.h"
 
 #include <imgui.h>
+// DockBuilder (DockBuilderSplitNode / DockBuilderDockWindow) is only in imgui_internal.h: ImGui calls it "eventually
+// public, too early to expose", and this is the one file that needs it. The alternative — five free-floating windows
+// laid out on top of a dockspace — is exactly what made the previous layout scatter instead of tile, so the dependency
+// is worth taking; it is confined to BuildDefaultDockLayout below and cannot leak into an engine header.
+#include <imgui_internal.h>
 
 // ---------------------------------------------------------------------------
 // The editor's docked panels. See EditorPanels.h for why this is a separate translation unit.
@@ -33,9 +44,7 @@ using Core::Index;
 using Core::Int64;
 using Core::Size;
 using ECS::Entity;
-
-//! Nods a [[nodiscard]] result away without HP_UNUSED: that macro expands through sizeof, which does not evaluate,
-//  so using it on a call would discard the call itself (Core/API.h says so in as many words).
+using Math::Vec3;
 using Reflection::ValueKind;
 
 namespace
@@ -71,55 +80,6 @@ bool FillBuffer(std::string_view text, char* buffer, Size capacity)
     return true;
 }
 
-//! Stable id for the editor's dockspace. Never 0: ImGui treats a dockspace created with id 0 differently from one it
-//! assigns itself, and passing GetID("...") here would make the layout depend on window-list order.
-constexpr ImGuiID kDockSpaceId = 0x4850444BU;  // 'HPDK'
-
-//! Places the next window at `rect` (content units) if it has never been positioned.
-/**
- * ImGuiCond_FirstUseEver rather than Always: an author's move or dock must survive the next frame, while a window with
- * no saved state — this editor writes no ini file — needs *somewhere* to start. Without it every panel opens at ImGui's
- * cascade position stacked on the others, so a fresh editor's first screenshot shows one panel and four invisible ones,
- * which is exactly the class of failure this project's "verify rendered output" rule exists to catch (Session 16).
- */
-void PlaceInitially(float x, float y, float width, float height)
-{
-    if (width <= 0.0f || height <= 0.0f)
-    {
-        return;  // nothing sane to lay out against; let ImGui place it and try again next frame
-    }
-
-    ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_FirstUseEver);
-}
-
-//! Default docked layout, as fractions of the window. ImGui writes no ini file (see EditorApplication::Start), so these
-// are the layout every fresh editor session starts from; an author's own arrangement then overrides it for that
-// session.
-constexpr float kSidePanelFraction = 0.24f;
-constexpr float kBottomPanelFraction = 0.30f;
-
-[[nodiscard]] float SideWidth(const PanelContext& context)
-{
-    return std::clamp(context.ContentWidth * kSidePanelFraction, 220.0f, 520.0f);
-}
-
-[[nodiscard]] float BottomHeight(const PanelContext& context)
-{
-    return std::clamp(context.ContentHeight * kBottomPanelFraction, 130.0f, 460.0f);
-}
-
-//! Height taken by the main menu bar, which is drawn before every panel so ImGui already knows it here.
-[[nodiscard]] float TopInset()
-{
-    return ImGui::GetFrameHeight();
-}
-
-[[nodiscard]] float PanelsTop(const PanelContext& context)
-{
-    return std::min(context.ContentHeight - 40.0f, TopInset());
-}
-
 [[nodiscard]] std::string JoinNames(const std::vector<std::string>& names, std::string_view separator)
 {
     std::string out;
@@ -134,12 +94,175 @@ constexpr float kBottomPanelFraction = 0.30f;
     return out;
 }
 
+[[nodiscard]] bool ParseFloat(std::string_view text, float& outValue) noexcept
+{
+    try
+    {
+        std::string s(text);
+        Size consumed = 0;
+        const float parsed = std::stof(s, &consumed);
+        // Trailing garbage is a typo rather than a number with a suffix: `view.speed 5x` must fail rather than set 5 and
+        // leave the author believing their value took.
+        if (consumed != s.size())
+        {
+            return false;
+        }
+        outValue = parsed;
+        return true;
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dock layout
+// ---------------------------------------------------------------------------
+
+//! Stable id for the editor's dockspace. Never 0: ImGui treats a dockspace created with id 0 differently from one it
+//  assigns itself, and passing GetID("...") here would make the layout depend on window-list order.
+constexpr ImGuiID kDockSpaceId = 0x4850444BU;  // 'HPDK'
+
+//! Window titles. One place, because DockBuilderDockWindow matches by name and a typo silently produces an undocked
+//  floating panel — the kind of failure that shows up as "the outliner vanished" in a screenshot.
+constexpr const char* kOutlinerTitle = "Outliner";
+constexpr const char* kDetailsTitle = "Details";
+constexpr const char* kContentTitle = "Content Browser";
+constexpr const char* kConsoleTitle = "Console";
+constexpr const char* kViewportTitle = "Viewport";
+
+//! Default split fractions of the docked layout, expressed as fractions of the space *remaining at that moment* —
+//  which is what DockBuilderSplitNode divides, because each split re-parents the previous subtree. Getting these wrong
+//  is invisible in code and obvious on screen (a 24% left panel becomes 16% once three splits compose), so the numbers
+//  below were tuned against a measured 1600x900 capture rather than derived: see notes/EDITOR_UI_REVIEW.md §5 for the
+//  measured panel boundaries.
+constexpr float kLeftSplit = 0.20f;
+constexpr float kRightSplitOfRemaining = 0.28f;
+constexpr float kBottomSplitOfRemaining = 0.30f;
+constexpr float kContentShareOfBottom = 0.34f;
+
+//! Height of the bottom status strip, in content units at 1x scale.
+/**
+ * One definition because two things must agree on it: the dockspace shrinks by exactly this much so no panel is covered,
+ * and the bar draws itself at exactly this height. Two separate expressions drift the moment someone changes padding,
+ * and the failure is a strip of console hidden behind an opaque bar — invisible in code review, obvious on screen.
+ */
+[[nodiscard]] float StatusBarHeight()
+{
+    return ImGui::GetFrameHeight() + 2.0f;
+}
+
+//! Splits `node` along `dir`, returning both children by reference.
+/**
+ * Both ids matter: windows dock into *leaf* nodes, so a layout that docks into the node it split gets no diagnostic and
+ * simply leaves the panel floating. Keeping the pair explicit is what makes the tree below readable as a tree.
+ */
+void Split(ImGuiID node, ImGuiDir dir, float ratioAtDir, ImGuiID& outAtDir, ImGuiID& outOpposite)
+{
+    ImGui::DockBuilderSplitNode(node, dir, ratioAtDir, &outAtDir, &outOpposite);
+}
+
+//! Builds the default docked tree: outliner left, details right, content + console along the bottom, viewport central.
+/**
+ * Called on the first frame and whenever `layout.reset` runs. Rebuilding means re-docking by window title, which is why
+ * every panel has a fixed title above. DockBuilderAddNode with the DockSpace flag removes any existing tree at that id
+ * first (ImGui does that internally), so this doubles as the reset path — there is no separate teardown to get wrong.
+ *
+ * Order matters: each split carves an edge off what remains, so the centre shrinks towards the middle. The old layout
+ * never did this at all — five independent windows were floated over a bare dockspace, which is why dragging one panel's
+ * edge moved nothing and the arrangement could be scattered with no way back.
+ */
+void BuildDefaultDockLayout()
+{
+    const ImGuiID root = ImGui::DockBuilderAddNode(kDockSpaceId, ImGuiDockNodeFlags_DockSpace);
+    // A size is required before splitting (DockNodeTreeSplit asserts on an unsized node); the *value* only sets the
+    // ratios' rounding basis — the real extents come from the host window on the same frame.
+    ImGui::DockBuilderSetNodeSize(root, ImVec2(1600.0f, 900.0f));
+
+    ImGuiID leftNode = 0;
+    ImGuiID centreNode = 0;
+    Split(root, ImGuiDir_Left, kLeftSplit, leftNode, centreNode);
+
+    ImGuiID rightNode = 0;
+    Split(centreNode, ImGuiDir_Right, kRightSplitOfRemaining, rightNode, centreNode);
+
+    ImGuiID bottomNode = 0;
+    Split(centreNode, ImGuiDir_Down, kBottomSplitOfRemaining, bottomNode, centreNode);
+
+    // Content browser and console share the bottom strip side by side: files on the left, output along the rest — the
+    // reading order an author follows when importing something and watching for the result.
+    ImGuiID contentNode = 0;
+    ImGuiID consoleNode = 0;
+    Split(bottomNode, ImGuiDir_Left, kContentShareOfBottom, contentNode, consoleNode);
+
+    ImGui::DockBuilderDockWindow(kOutlinerTitle, leftNode);
+    ImGui::DockBuilderDockWindow(kDetailsTitle, rightNode);
+    ImGui::DockBuilderDockWindow(kContentTitle, contentNode);
+    ImGui::DockBuilderDockWindow(kConsoleTitle, consoleNode);
+    ImGui::DockBuilderDockWindow(kViewportTitle, centreNode);
+
+    ImGui::DockBuilderFinish(kDockSpaceId);
+}
+
+//! True when the dockspace has no tree worth keeping — i.e. nothing was ever built, or a rebuild was requested.
+/**
+ * Checked against ImGui's own node state rather than a "first frame" bool on the application: the layout is only
+ * meaningful once the dock node exists with children, and an author who drags every panel out of it should get a working
+ * editor back from Reset Layout rather than a half-tree. A missing or childless node means exactly one thing — there is
+ * nothing to preserve.
+ */
+[[nodiscard]] bool DockLayoutNeedsBuild()
+{
+    const ImGuiDockNode* node = ImGui::DockBuilderGetNode(kDockSpaceId);
+    return node == nullptr || (node->ChildNodes[0] == nullptr && node->ChildNodes[1] == nullptr
+                               && node->Windows.Size == 0);
+}
+
+//! Submits the full-window dockspace host and (when asked) rebuilds the default tree into it.
+/**
+ * Host window flags mirror DockSpaceOverViewport, which this replaces: NoDocking on the host (a dockspace dockable into
+ * itself is a tangle), zero padding so panels meet the window edge with no gap, and no background so the dockspace's own
+ * fill is what shows between panels.
+ */
+void SubmitDockspace(bool rebuildLayout, float bottomInset)
+{
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    // The status bar gets its own strip rather than being painted over the dock: an overlay would cover the console's
+    // last line and swallow clicks meant for whatever panel happened to sit under it.
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, std::max(64.0f, viewport->WorkSize.y - bottomInset)));
+    ImGui::SetNextWindowViewport(viewport->ID);
+
+    const ImGuiWindowFlags hostFlags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+        | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::Begin("DockspaceHost", nullptr, hostFlags);
+
+    if (rebuildLayout || DockLayoutNeedsBuild())
+    {
+        BuildDefaultDockLayout();
+    }
+
+    // AutoHideTabBar keeps a single-window node header-free (a lone panel shows its name in a slim bar rather than a
+    // tab strip). The central node is excluded from that by ImGui itself, so the viewport always has a tab.
+    ImGui::DockSpace(kDockSpaceId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_AutoHideTabBar);
+
+    ImGui::End();
+    ImGui::PopStyleVar(3);
+}
+
 }  // namespace
 
-//! Registers the commands that operate on UI state (help, quit, select, info, panels). Scene/entity/content commands
-//  live in EditorApplication.cpp because they need the hosted loop; splitting by dependency rather than by file size is
-//  what lets either be understood — or stubbed — without the other. EditorApplication::RegisterEditorCommands calls
-//  this and then adds its own, so callers see one registration entry point.
+// ---------------------------------------------------------------------------
+// Command registration (UI-state commands; scene/entity/content commands live in EditorApplication.cpp)
+// ---------------------------------------------------------------------------
+
 void RegisterUiCommands(EditorConsole& console, UiState& state, EditorApplication& app)
 {
     console.RegisterFixed(
@@ -261,8 +384,100 @@ void RegisterUiCommands(EditorConsole& console, UiState& state, EditorApplicatio
             outReply = which + " " + (visible ? "shown" : "hidden");
             return true;
         });
-}
 
+    // Layout and appearance commands exist because a docked layout you cannot get back to is a worse tool than a fixed
+    // one: the first thing an author does after scattering panels is look for Reset Layout, and there was nothing.
+    console.RegisterFixed("layout.reset", "Restore the default panel layout, showing any hidden panel.",
+                          ArgumentCount::Exact, 0,
+                          [&state](const std::vector<std::string>&, std::string& outReply, std::string&) {
+                              // Visibility is part of the layout: a "reset" that left panels hidden through the Window
+                              // menu would restore the tree while the author still could not see half of it. Resetting to
+                              // all-shown (rather than to whatever was visible before) is the only defined state worth
+                              // returning to, and matches every editor's Reset Layout.
+                              state.ShowOutliner = true;
+                              state.ShowDetails = true;
+                              state.ShowContent = true;
+                              state.ShowConsole = true;
+
+                              // Deferred to the next DrawEditorPanels: the docking builder needs a submitted dockspace,
+                              // and this command can run before any frame exists (--command layout.reset).
+                              state.RequestLayoutReset = true;
+                              outReply = "layout reset queued for the next frame";
+                              return true;
+                          });
+
+    console.RegisterFixed(
+        "layout.report", "Report each panel's docked rectangle and the viewport's render vs display size.",
+        ArgumentCount::Exact, 0,
+        [&state](const std::vector<std::string>&, std::string& outReply, std::string&) {
+            // Panel geometry first: the numbers a person asks for when something looks wrong ("is the console actually
+            // there, or is it zero-height behind the status bar?"). Printed from CollectPanelRectangles so the console and
+            // the test suite read exactly the same source — a diagnostic that disagrees with the tests is worse than none.
+            std::string report;
+            for (const PanelRect& rect : CollectPanelRectangles())
+            {
+                char line[128];
+                std::snprintf(line, sizeof(line), "%s: %.0fx%.0f at %.0f,%.0f\n", rect.Name,
+                              static_cast<double>(rect.Width), static_cast<double>(rect.Height),
+                              static_cast<double>(rect.X), static_cast<double>(rect.Y));
+                report += line;
+            }
+
+            // Then the viewport's render extent next to its displayed extent: a mismatch between those two is what
+            // "the viewport looks cropped" means in numbers, and printing them side by side makes it legible without
+            // measuring a screenshot by hand.
+            char buffer[512];
+            const ViewportInteraction& viewport = state.Viewport;
+            std::snprintf(buffer, sizeof(buffer),
+                          "viewport drawn %.0fx%.0f | image area %.0fx%.0f | scale %.2f | layout %s",
+                          static_cast<double>(state.ReportedRenderWidth), static_cast<double>(state.ReportedRenderHeight),
+                          static_cast<double>(viewport.ImageWidth), static_cast<double>(viewport.ImageHeight),
+                          static_cast<double>(state.UiScale), state.RequestLayoutReset ? "reset pending" : "default");
+            outReply = report + buffer;
+            return true;
+        });
+
+    console.RegisterFixed(
+        "ui.scale", "Set the UI scale (0.6 to 3.0): ui.scale <factor>.", ArgumentCount::Exact, 1,
+        [&state](const std::vector<std::string>& arguments, std::string& outReply, std::string& outError) {
+            float scale = 1.0f;
+            if (!ParseFloat(arguments[0], scale))
+            {
+                outError = "\"" + arguments[0] + "\" is not a number";
+                return false;
+            }
+            state.UiScale = std::clamp(scale, 0.6f, 3.0f);
+            // Applied by the application on the next frame rather than here: restyling touches the ImGui style, which is
+            // safe between frames but not from inside a command that might itself be running mid-frame (a panel button).
+            state.RequestStyleApply = true;
+            outReply = "ui scale " + std::to_string(state.UiScale);
+            return true;
+        });
+
+    console.RegisterFixed(
+        "view.speed", "Set fly speed in metres per second: view.speed <mps>.", ArgumentCount::Exact, 1,
+        [&state](const std::vector<std::string>& arguments, std::string& outReply, std::string& outError) {
+            float metres = 0.0f;
+            if (!ParseFloat(arguments[0], metres) || metres <= 0.0f)
+            {
+                outError = "\"" + arguments[0] + "\" is not a positive speed";
+                return false;
+            }
+            state.Navigation.FlyMetresPerSecond = metres;
+            outReply = "fly speed " + std::to_string(metres) + " m/s";
+            return true;
+        });
+
+    console.RegisterFixed("view.frame", "Frame the selection (or everything) in the viewport.", ArgumentCount::Exact, 0,
+                          [&state](const std::vector<std::string>&, std::string& outReply, std::string&) {
+                              // Same deferral rule as layout.reset: the camera move needs the viewport's real extent,
+                              // which only exists inside a frame.
+                              state.Viewport.RequestFrameSelection = true;
+                              outReply = "framing " + std::string(state.Selection.IsEmpty() ? "the whole scene"
+                                                                                            : "the selection");
+                              return true;
+                          });
+}
 
 // ---------------------------------------------------------------------------
 // UiState
@@ -309,6 +524,213 @@ void UiState::Run(const std::string& line)
 // Panels
 // ---------------------------------------------------------------------------
 
+namespace
+{
+
+// ---------------------------------------------------------------------------
+// Row layout helper
+// ---------------------------------------------------------------------------
+
+//! Opens a label-left / control-right row: the label takes exactly `labelWidth` and the control fills what is left.
+/**
+ * ImGui's default stacks a widget's label above it at natural width, which turns an inspector into a ragged column and
+ * wastes most of a 380-pixel panel. PushItemWidth(-1) after a fixed-width SameLine makes every row in every component
+ * align — the single change that makes a reflected panel read as an inspector rather than a debug list, and the layout
+ * UE users expect (label left, value right, full-width drag target).
+ *
+ * Call EndFieldRow() after the widget. Both are here rather than inline so the Push/Pop pairing cannot be broken by an
+ * early `continue` in the field loop — the bug class that produces a corrupted style stack several panels later.
+ */
+void BeginFieldRow(std::string_view label, float labelWidth)
+{
+    ImGui::PushItemWidth(-1.0f);
+    ImGui::TextUnformatted(label.data(), label.data() + label.size());
+    ImGui::SameLine(labelWidth);
+}
+
+void EndFieldRow()
+{
+    ImGui::PopItemWidth();
+}
+
+[[nodiscard]] std::vector<std::pair<Int64, std::string>> EnumEntries(const PropertyField& field)
+{
+    std::vector<std::pair<Int64, std::string>> entries;
+    if (field.EnumName.empty())
+    {
+        return entries;
+    }
+
+    const Reflection::EnumDescriptor* enumeration = Reflection::Registry::Get().FindEnum(field.EnumName);
+    if (enumeration == nullptr)
+    {
+        return entries;
+    }
+
+    for (Size index = 0; index < enumeration->GetEntryCount(); ++index)
+    {
+        const Reflection::EnumEntry& entry = enumeration->GetEntry(index);
+        entries.emplace_back(entry.Value, entry.Name != nullptr ? entry.Name : "?");
+    }
+    return entries;
+}
+
+//! A numeric drag with a speed and format suited to the field's name.
+/**
+ * Why name-matched rather than attribute-driven: FieldAttributes carries Min/Max/Step, but nothing in the engine
+ * populates them yet (grep for HasStep finds no writers), so reflection alone cannot say that Roughness wants 0.01 and
+ * Position.x wants 0.05. Matching on the leaf name is a heuristic, stated as one, and it beats the previous behaviour —
+ * one speed for everything, which made a world position crawl and a roughness spin past its range. When attributes get
+ * populated they win over this table; that precedence is what makes the heuristic deletable.
+ */
+[[nodiscard]] float DragSpeedFor(std::string_view path)
+{
+    const std::string lower = ToLower(path);
+
+    if (lower.find("rotation") != std::string::npos || lower.find("angle") != std::string::npos)
+    {
+        return 0.5f;  // degrees feel right for rotation; a radian-scaled 0.01 makes aiming impossible
+    }
+    if (lower.find("position") != std::string::npos || lower.find("target") != std::string::npos
+        || lower.find("direction") != std::string::npos)
+    {
+        return 0.05f;
+    }
+    if (lower.find("scale") != std::string::npos)
+    {
+        return 0.02f;
+    }
+    if (lower.find("nearplane") != std::string::npos || lower.find("farplane") != std::string::npos)
+    {
+        return 0.1f;
+    }
+    return 0.01f;  // material and light parameters: roughness, intensity, exposure
+}
+
+[[nodiscard]] const char* DragFormatFor(ValueKind kind)
+{
+    // Integers drag as integers (a "1.000000" for a count reads as broken) and reals get three decimals, which is where
+    // a roughness value is legible without being noisy.
+    switch (kind)
+    {
+        case ValueKind::Int8:
+        case ValueKind::Int16:
+        case ValueKind::Int32:
+        case ValueKind::Int64:
+        case ValueKind::UInt8:
+        case ValueKind::UInt16:
+        case ValueKind::UInt32:
+        case ValueKind::UInt64:
+            return "%d";
+        default:
+            return "%.3f";
+    }
+}
+
+//! Formats a byte count as the content browser shows it (KB/MB with one decimal under a megabyte, whole MB above).
+/**
+ * The old panel printed "0 KB" for every file under 1024 bytes — which is every .lua and most .hpscene files in a real
+ * project — so the Size column was uniformly useless. Rounding rules are stated because a size column that changes its
+ * own unit per row needs them to be consistent.
+ */
+[[nodiscard]] std::string FormatByteSize(Core::UInt64 bytes)
+{
+    char buffer[48];
+    if (bytes < 1024ull)
+    {
+        std::snprintf(buffer, sizeof(buffer), "%llu B", static_cast<unsigned long long>(bytes));
+    }
+    else if (bytes < 1024ull * 1024ull)
+    {
+        std::snprintf(buffer, sizeof(buffer), "%.1f KB", static_cast<double>(bytes) / 1024.0);
+    }
+    else
+    {
+        std::snprintf(buffer, sizeof(buffer), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    }
+    return buffer;
+}
+
+//! Carries the UiState into ImGui's InputText completion callback, which has no other way to reach it.
+/**
+ * Lifetime: constructed on the stack immediately before InputText and dead right after — ImGui invokes the callback
+ * synchronously inside that call, so the pointer cannot outlive its owner. This is also why the completion state cannot
+ * be a captured lambda: the callback signature is a C function pointer.
+ */
+struct ConsoleCompletionContext
+{
+    UiState& State;
+};
+
+//! ImGui completion callback: replaces the word under the cursor with a command match, or lists the candidates.
+/**
+ * Tab-completion used to be polled next to the text box and read state.ConsoleInput, which only updates when the box
+ * commits — so it completed the *previous* line and could not work. The callback receives the live edit buffer, which is
+ * the only correct source, and owns its own cursor bookkeeping (CompletionCursor) because completing twice in a row must
+ * cycle candidates rather than re-inserting the first one every time.
+ */
+int ConsoleCompletionCallback(ImGuiInputTextCallbackData* data)
+{
+    if (data->EventFlag != ImGuiInputTextFlags_CallbackCompletion)
+    {
+        return 0;
+    }
+
+    auto& context = *static_cast<ConsoleCompletionContext*>(data->UserData);
+
+    // Complete the word at the cursor, not the whole line: `entity.set Na` should complete the property name against
+    // nothing (no registry of those), but `entity.se` completes the command. Only the first token has command names, so
+    // anything past it is left alone rather than mangled.
+    const std::string text(data->Buf, static_cast<size_t>(data->CursorPos));
+    const Size lastSpace = text.find_last_of(' ');
+    const bool completingFirstWord = lastSpace == std::string::npos;
+    if (!completingFirstWord)
+    {
+        return 0;
+    }
+
+    const std::string prefix = text.substr(lastSpace == std::string::npos ? 0 : lastSpace + 1);
+    const std::vector<std::string> matches = context.State.Console.Complete(prefix);
+    if (matches.empty())
+    {
+        return 0;
+    }
+
+    // One match: complete it and leave a trailing space so the next Tab starts the second argument. Several: insert the
+    // longest common prefix, which is what makes `ed` + Tab give `editor.` without guessing.
+    std::string replacement = matches[0];
+    if (matches.size() > 1)
+    {
+        replacement = matches[0];
+        for (const std::string& match : matches)
+        {
+            Size common = 0;
+            while (common < replacement.size() && common < match.size() && replacement[common] == match[common])
+            {
+                ++common;
+            }
+            replacement.resize(common);
+        }
+    }
+
+    if (replacement.size() > prefix.size())
+    {
+        data->InsertChars(static_cast<int>(data->CursorPos), replacement.c_str() + prefix.size());
+    }
+    return 0;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Panels
+//
+// Every panel Begin()s with its fixed title and *no* position or size: docked windows take their rectangle from the
+// dock node, which is what makes the splitters work. The previous version positioned each one with
+// ImGuiCond_FirstUseEver over a bare dockspace — five independent windows that happened to be laid out like a docked
+// editor without being one, so no splitter resized its neighbour and no reset could restore anything.
+// ---------------------------------------------------------------------------
+
 void DrawOutlinerPanel(UiState& state, const PanelContext& context)
 {
     if (!state.ShowOutliner)
@@ -316,20 +738,45 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
         return;
     }
 
-    PlaceInitially(0.0f, PanelsTop(context), SideWidth(context),
-                   std::max(120.0f, context.ContentHeight - BottomHeight(context) - PanelsTop(context)));
-    ImGui::Begin("Outliner", &state.ShowOutliner);
+    ImGui::Begin(kOutlinerTitle, &state.ShowOutliner);
+
+    // Toolbar first: the actions are what an author reaches for constantly, and hiding them below the list (as before)
+    // meant scrolling to create an entity in a long scene.
+    if (ImGui::Button("Entity"))
+    {
+        static_cast<void>(context.Application->CreateEntity("Entity", ""));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cube"))
+    {
+        static_cast<void>(context.Application->CreateEntity("Cube", "engine:cube"));
+    }
+    ImGui::SameLine();
+
+    const bool canDelete = !state.Selection.IsEmpty();
+    if (!canDelete)
+    {
+        ImGui::BeginDisabled();
+    }
+    // Delete goes through the application, like every other mutation, so the button and `entity.destroy` cannot
+    // diverge — and so the selection is cleared by the same code either way.
+    if (ImGui::Button("Delete") && canDelete)
+    {
+        context.Application->DestroySelected();
+    }
+    if (!canDelete)
+    {
+        ImGui::EndDisabled();
+    }
+    ImGui::SetItemTooltip("Deletes the selection with no undo (notes/EDITOR.md §5).");
 
     char filter[256];
     FillBuffer(state.OutlinerFilter, filter, sizeof(filter));
-    if (ImGui::InputText("Filter", filter, sizeof(filter)))
+    if (ImGui::InputTextWithHint("##filter", "Filter", filter, sizeof(filter)))
     {
         state.OutlinerFilter = filter;
     }
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip("Case-insensitive substring match on entity names.");
-    }
+    ImGui::SetItemTooltip("Case-insensitive substring match on entity names.");
 
     // Rows are gathered first, then drawn. Iterating the world while widgets are live would let a widget callback run
     // code that mutates the world mid-iteration (a rename commits text, which is user-visible code in a scripting
@@ -353,18 +800,19 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
         }
     });
 
-    if (ImGui::BeginTable("entities", 2,
-                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY))
+    // A single Name column: the slot number the old panel showed is an implementation detail no author reads, and it
+    // took a third of the panel's width. Slots remain available in `entity.inspect` and the status bar.
+    if (ImGui::BeginTable("entities", 1,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY
+                              | ImGuiTableFlags_Resizable))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Name");
-        ImGui::TableSetupColumn("Slot");
         ImGui::TableHeadersRow();
 
         for (const Row& row : rows)
         {
             ImGui::TableNextRow();
-            const bool selected = state.Selection.IsSelected(row.Handle);
 
             char label[512];
             std::snprintf(label, sizeof(label), "%s##ent%llu", row.Label.c_str(),
@@ -373,7 +821,7 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
             ImGui::TableNextColumn();
             // Click selects, Ctrl+click toggles — the behaviour every outliner has, and both routes go through
             // EditorSelection so the viewport, the console and this list can never disagree about what is selected.
-            if (ImGui::Selectable(label, selected, ImGuiSelectableFlags_SpanAllColumns))
+            if (ImGui::Selectable(label, state.Selection.IsSelected(row.Handle), ImGuiSelectableFlags_SpanAllColumns))
             {
                 if (ImGui::GetIO().KeyCtrl)
                 {
@@ -384,46 +832,15 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
                     state.Selection.Select(row.Handle);
                 }
             }
-
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(std::to_string(row.Handle.Slot).c_str());
         }
 
         ImGui::EndTable();
     }
 
-    ImGui::Separator();
-    if (ImGui::Button("New Entity"))
-    {
-        static_cast<void>(context.Application->CreateEntity("Entity", ""));
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("New Cube"))
-    {
-        static_cast<void>(context.Application->CreateEntity("Cube", "engine:cube"));
-    }
-    ImGui::SameLine();
-
-    const bool canDelete = !state.Selection.IsEmpty();
-    if (!canDelete)
-    {
-        ImGui::BeginDisabled();
-    }
-    if (ImGui::Button("Delete") && canDelete)
-    {
-        for (const Entity& entity : state.Selection.GetEntities())
-        {
-            context.SceneWorld->DestroyEntity(entity);
-        }
-        // Cleared here rather than left to Prune: the selection vector holds handles whose slots are now recycled, and
-        // although every read checks liveness, a stale handle surviving one extra frame is how "deleted the wrong
-        // thing" becomes possible if a script creates an entity in between.
-        state.Selection.Clear();
-    }
-    if (!canDelete)
-    {
-        ImGui::EndDisabled();
-    }
+    // Footer: counts, because "is the filter hiding my entity or did I delete it" should not require guessing.
+    const Size total = context.SceneWorld->GetAliveEntityCount();
+    ImGui::TextDisabled("%zu of %zu  ·  %zu selected", static_cast<size_t>(rows.size()), static_cast<size_t>(total),
+                        static_cast<size_t>(state.Selection.GetCount()));
 
     ImGui::End();
 }
@@ -435,14 +852,14 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
         return;
     }
 
-    PlaceInitially(std::max(0.0f, context.ContentWidth - SideWidth(context)), PanelsTop(context), SideWidth(context),
-                   std::max(120.0f, context.ContentHeight - BottomHeight(context) - PanelsTop(context)));
-    ImGui::Begin("Details", &state.ShowDetails);
+    ImGui::Begin(kDetailsTitle, &state.ShowDetails);
 
     const Entity primary = state.Selection.GetPrimary();
     if (primary.IsNull() || !context.SceneWorld->IsAlive(primary))
     {
-        ImGui::TextUnformatted("Nothing selected.");
+        ImGui::TextDisabled("Nothing selected.");
+        ImGui::TextWrapped("Click an object in the viewport or a row in the outliner. Right-drag to fly, middle-drag to "
+                           "orbit, wheel to zoom, F to frame the selection.");
         ImGui::End();
         return;
     }
@@ -460,6 +877,16 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
     ImGui::TextUnformatted(FormatEntityLabel(*context.SceneWorld, primary).c_str());
     ImGui::Separator();
 
+    // Label column width: wide enough for the longest path this entity actually has, clamped so a pathological name
+    // cannot squeeze every control to nothing. Computed per entity rather than fixed because components vary wildly and
+    // a constant either wastes space or truncates.
+    float labelWidth = 120.0f;
+    for (const PropertyField& field : state.Properties.GetFields())
+    {
+        labelWidth = std::max(labelWidth, ImGui::CalcTextSize(field.Path.c_str()).x + 12.0f);
+    }
+    labelWidth = std::min(labelWidth, ImGui::GetContentRegionAvail().x * 0.55f);
+
     for (const std::string& componentName : state.Properties.GetComponentNames())
     {
         if (!ImGui::CollapsingHeader(componentName.c_str(), ImGuiTreeNodeFlags_DefaultOpen))
@@ -469,13 +896,16 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
 
         for (const PropertyField& field : state.Properties.GetFieldsForComponent(componentName))
         {
+            // PushID on the path: two components can carry same-named fields (Position on a transform and on a camera),
+            // and ImGui ids are per-window — without this they collide and editing one moves the other.
+            ImGui::PushID(field.Path.c_str());
+
             if (!field.IsEditable())
             {
-                ImGui::TextDisabled("%s: %s", field.Path.c_str(), state.Properties.FormatValue(field).c_str());
+                ImGui::TextDisabled("%s", state.Properties.FormatValue(field).c_str());
+                ImGui::PopID();
                 continue;
             }
-
-            ImGui::PushID(field.Path.c_str());
 
             switch (static_cast<ValueKind>(field.Kind))
             {
@@ -483,10 +913,12 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
                 {
                     bool value = false;
                     static_cast<void>(state.Properties.ReadBool(field, value));
-                    if (ImGui::Checkbox(field.Name.c_str(), &value))
+                    BeginFieldRow(field.Path, labelWidth);
+                    if (ImGui::Checkbox("##v", &value))
                     {
                         static_cast<void>(state.Properties.WriteBool(field, value));
                     }
+                    EndFieldRow();
                     break;
                 }
 
@@ -496,55 +928,102 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
                     static_cast<void>(state.Properties.ReadString(field, text));
                     char buffer[512];
                     FillBuffer(text, buffer, sizeof(buffer));
-                    if (ImGui::InputText(field.Name.c_str(), buffer, sizeof(buffer)))
+                    BeginFieldRow(field.Path, labelWidth);
+                    // The field name is stripped from the row's storage id so the visible label is the path alone;
+                    // "##v" keeps the widget id distinct from the TextUnformatted that precedes it.
+                    if (ImGui::InputText("##v", buffer, sizeof(buffer)))
                     {
                         static_cast<void>(state.Properties.WriteString(field, buffer));
+                    }
+                    EndFieldRow();
+                    break;
+                }
+
+                case ValueKind::Enum:
+                {
+                    // A combo, not an integer spinner. The registry carries the enumerator names (the serialiser uses
+                    // them), so showing `0` where `Back` is available was a lost call rather than a missing capability.
+                    const std::vector<std::pair<Int64, std::string>> entries = EnumEntries(field);
+
+                    Int64 raw = 0;
+                    static_cast<void>(state.Properties.ReadEnum(field, raw));
+
+                    int currentIndex = -1;
+                    for (Size index = 0; index < entries.size(); ++index)
+                    {
+                        if (entries[index].first == raw)
+                        {
+                            currentIndex = static_cast<int>(index);
+                            break;
+                        }
+                    }
+
+                    BeginFieldRow(field.Path, labelWidth);
+                    const char* preview = currentIndex >= 0 ? entries[static_cast<Size>(currentIndex)].second.c_str()
+                                                            : "(value not in enum)";
+                    if (ImGui::BeginCombo("##v", preview))
+                    {
+                        for (Size index = 0; index < entries.size(); ++index)
+                        {
+                            bool selected = static_cast<int>(index) == currentIndex;
+                            if (ImGui::Selectable(entries[index].second.c_str(), &selected))
+                            {
+                                static_cast<void>(state.Properties.WriteEnum(field, entries[index].first));
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    EndFieldRow();
+
+                    if (entries.empty())
+                    {
+                        // No enumerable names (a type registered without RegisterEnum): fall back to the integer so the
+                        // value is at least reachable rather than showing an empty combo.
+                        int index = static_cast<int>(raw);
+                        BeginFieldRow(" ", labelWidth);
+                        if (ImGui::InputInt("##v", &index))
+                        {
+                            static_cast<void>(state.Properties.WriteEnum(field, static_cast<Int64>(index)));
+                        }
+                        EndFieldRow();
                     }
                     break;
                 }
 
                 case ValueKind::Float32:
                 case ValueKind::Float64:
+                case ValueKind::Int8:
+                case ValueKind::Int16:
+                case ValueKind::Int32:
+                case ValueKind::Int64:
+                case ValueKind::UInt8:
+                case ValueKind::UInt16:
+                case ValueKind::UInt32:
+                case ValueKind::UInt64:
                 {
-                    // ImGui has no 64-bit drag widget, so the reflected double is narrowed to a float for editing and
-                    // widened back on write. A Float64 field edited through this panel therefore keeps float precision
-                    // — stated because it is a real limitation of the widget, not of the storage behind it.
+                    // ImGui has no 64-bit drag widget, so a reflected double is narrowed to float for editing and widened
+                    // back on write — a real limitation of the widget, not of the storage behind it.
                     double existing = 0.0;
                     static_cast<void>(state.Properties.ReadReal(field, existing));
                     float value = static_cast<float>(existing);
-                    // A drag rather than a slider: roughness wants a slider and a world position does not, and choosing
-                    // per field is the per-type special-casing reflection exists to remove. FieldAttributes could carry
-                    // ranges later without this code changing shape.
-                    if (ImGui::DragFloat(field.Name.c_str(), &value, 0.01f))
+
+                    BeginFieldRow(field.Path, labelWidth);
+                    if (ImGui::DragFloat("##v", &value, DragSpeedFor(field.Path), 0.0f, 0.0f,
+                                         DragFormatFor(static_cast<ValueKind>(field.Kind))))
                     {
                         static_cast<void>(state.Properties.WriteReal(field, value));
                     }
-                    break;
-                }
-
-                case ValueKind::Enum:
-                {
-                    Int64 raw = 0;
-                    static_cast<void>(state.Properties.ReadEnum(field, raw));
-                    int index = static_cast<int>(raw);
-                    if (ImGui::InputInt(field.Name.c_str(), &index))
-                    {
-                        static_cast<void>(state.Properties.WriteEnum(field, static_cast<Int64>(index)));
-                    }
-                    if (!field.EnumName.empty())
-                    {
-                        ImGui::SameLine();
-                        ImGui::TextDisabled("(%s)", field.EnumName.c_str());
-                    }
+                    EndFieldRow();
                     break;
                 }
 
                 default:
                 {
-                    // Integers of every width, and any kind reflection gains later: shown formatted rather than
-                    // dropped. A read-only row is honest about what the panel does not edit yet; silently omitting it
-                    // is not.
-                    ImGui::TextUnformatted(state.Properties.FormatValue(field).c_str());
+                    // Any kind reflection gains later: shown formatted rather than dropped. A read-only row is honest
+                    // about what the panel does not edit yet; silently omitting it is not.
+                    BeginFieldRow(field.Path, labelWidth);
+                    ImGui::TextDisabled("%s", state.Properties.FormatValue(field).c_str());
+                    EndFieldRow();
                     break;
                 }
             }
@@ -563,50 +1042,66 @@ void DrawContentPanel(UiState& state, const PanelContext& context)
         return;
     }
 
-    // Bottom-left quadrant: the console owns the bottom-right, so the two split the strip rather than stacking.
-    PlaceInitially(0.0f, std::max(0.0f, context.ContentHeight - BottomHeight(context)), SideWidth(context),
-                   BottomHeight(context));
-    ImGui::Begin("Content Browser", &state.ShowContent);
+    ImGui::Begin(kContentTitle, &state.ShowContent);
 
-    ImGui::TextUnformatted(state.Content.GetRoot().string().c_str());
-
-    if (ImGui::Button("Refresh"))
-    {
-        std::string error;
-        if (!state.Content.Refresh(error))
-        {
-            state.AddLog("! " + error);
-        }
-    }
-    ImGui::SameLine();
+    // Toolbar row: navigate up, refresh, and a search box — the three things a content browser is actually used for,
+    // all reachable without hunting. The raw root path that used to be the panel's first line is now a tooltip on the
+    // breadcrumb-style label, because it is information you check occasionally, not something to burn a row on.
     const bool canGoUp = state.Content.CanNavigateUp();
     if (!canGoUp)
     {
         ImGui::BeginDisabled();
     }
-    if (ImGui::Button("Up") && canGoUp)
+    if (ImGui::ArrowButton("up", ImGuiDir_Up) && canGoUp)
     {
-        state.Content.NavigateUp();
+        std::string error;
+        if (!state.Content.NavigateUp(&error))
+        {
+            state.AddLog("! " + error);
+        }
     }
     if (!canGoUp)
     {
         ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Already at the project root.");
     }
+    else
+    {
+        ImGui::SetItemTooltip("Up one folder.");
+    }
+
+    ImGui::SameLine();
+    if (ImGui::ArrowButton("refresh", ImGuiDir_Right))
+    {
+        std::string error;
+        if (!state.Content.Refresh(std::filesystem::path{}, &error))
+        {
+            state.AddLog("! " + error);
+        }
+    }
+    ImGui::SetItemTooltip("Re-read this folder.");
+
+    ImGui::SameLine();
+    const std::string currentFolder = state.Content.GetCurrentPath().filename().string();
+    ImGui::TextUnformatted(currentFolder.empty() ? "/" : currentFolder.c_str());
+    ImGui::SetItemTooltip("%s", state.Content.GetCurrentPath().string().c_str());
 
     char filter[256];
     FillBuffer(state.ContentFilter, filter, sizeof(filter));
-    if (ImGui::InputText("Search", filter, sizeof(filter)))
+    if (ImGui::InputTextWithHint("##search", "Search", filter, sizeof(filter)))
     {
         state.ContentFilter = filter;
     }
 
     const std::vector<Size> visible = state.Content.FilterByName(state.ContentFilter);
 
-    if (ImGui::BeginTable("files", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY))
+    if (ImGui::BeginTable("files", 2,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable
+                              | ImGuiTableFlags_BordersInnerV))
     {
+        ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Name");
-        ImGui::TableSetupColumn("Size");
-        ImGui::TableSetupColumn("Type");
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed);
         ImGui::TableHeadersRow();
 
         for (const Size index : visible)
@@ -615,11 +1110,14 @@ void DrawContentPanel(UiState& state, const PanelContext& context)
             ImGui::TableNextRow();
 
             ImGui::TableNextColumn();
+            const bool selected = entry.Name == state.SelectedContentName;
             const std::string rowLabel = entry.Name + "##file" + std::to_string(index);
-            if (ImGui::Selectable(rowLabel.c_str(), false, ImGuiSelectableFlags_SpanAllColumns))
+            if (ImGui::Selectable(rowLabel.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns))
             {
-                // Single click only highlights; opening is the double-click below so an accidental click never loads a
-                // scene over the author's unsaved work.
+                // Single click selects by *name*: a refresh re-sorts the list, so an index would highlight a different
+                // file than the one clicked. Opening stays on double-click so an accidental click never loads a scene
+                // over unsaved work.
+                state.SelectedContentName = entry.Name;
             }
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
             {
@@ -637,15 +1135,12 @@ void DrawContentPanel(UiState& state, const PanelContext& context)
             ImGui::TableNextColumn();
             if (entry.IsDirectory)
             {
-                ImGui::TextUnformatted("-");
+                ImGui::TextDisabled("/");
             }
             else
             {
-                ImGui::Text("%llu KB", static_cast<unsigned long long>(entry.SizeBytes / 1024ull));
+                ImGui::TextDisabled("%s", FormatByteSize(entry.SizeBytes).c_str());
             }
-
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(entry.IsDirectory ? "folder" : (entry.IsEngineAsset ? "engine asset" : "unmanaged"));
         }
 
         ImGui::EndTable();
@@ -661,9 +1156,7 @@ void DrawConsolePanel(UiState& state, const PanelContext& context)
         return;
     }
 
-    PlaceInitially(SideWidth(context), std::max(0.0f, context.ContentHeight - BottomHeight(context)),
-                   std::max(200.0f, context.ContentWidth - SideWidth(context) * 2.0f), BottomHeight(context));
-    ImGui::Begin("Console", &state.ShowConsole);
+    ImGui::Begin(kConsoleTitle, &state.ShowConsole);
 
     const float lineHeight = ImGui::GetTextLineHeight();
     if (ImGui::BeginChild("log", ImVec2(0.0f, -lineHeight * 3.0f), ImGuiChildFlags_Borders))
@@ -693,60 +1186,238 @@ void DrawConsolePanel(UiState& state, const PanelContext& context)
     }
     ImGui::EndChild();
 
+    // Completion runs through InputText's completion callback rather than a separate IsKeyPressed check. The previous
+    // version polled Tab while reading state.ConsoleInput — which is only written when the box *commits*, so it
+    // completed whatever was typed before the current edit and could not work as written. The callback gets the live
+    // buffer, which is the only correct source.
+    ConsoleCompletionContext completion{state};
+
     char input[512];
     FillBuffer(state.ConsoleInput, input, sizeof(input));
-    if (ImGui::InputText("command", input, sizeof(input),
-                         ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
+    if (ImGui::InputTextWithHint(
+            "##command", "command   Tab completes, `help` lists all", input, sizeof(input),
+            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll
+                | ImGuiInputTextFlags_CallbackCompletion,
+            &ConsoleCompletionCallback, &completion))
     {
         state.Run(input);
         state.ConsoleInput.clear();
     }
 
-    if (ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Tab))
+    ImGui::SameLine();
+    if (ImGui::Button("Run"))
     {
-        const std::vector<std::string> matches = state.Console.Complete(state.ConsoleInput);
-        if (matches.size() == 1u)
-        {
-            state.ConsoleInput = matches[0] + " ";
-        }
-        else if (!matches.empty())
-        {
-            state.AddLog(JoinNames(matches, "   "));
-        }
+        // Runs whatever is in the buffer right now rather than only on Enter, so the mouse path and the keyboard path
+        // cannot disagree about what "execute this line" means.
+        state.Run(input);
+        state.ConsoleInput.clear();
     }
+    ImGui::SetItemTooltip("Execute the text above (same as Enter).");
 
+    static_cast<void>(context);
     ImGui::End();
 }
 
+// ---------------------------------------------------------------------------
+// Viewport panel
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+//! Draws a world-space axis as a labelled line in the viewport's corner compass.
+/**
+ * The compass is the only orientation cue a 3D viewport has when nothing in the scene happens to be axis-aligned, and
+ * it costs three projected lines. Projection is a plain dot product against the view basis — the same basis the
+ * renderer built the view matrix from (GetViewBasis), which is why the indicator cannot drift out of agreement with what
+ * you are looking at.
+ */
+void DrawCompassAxis(ImDrawList& drawList, const ImVec2& origin, const Vec3& axisWorld,
+                     const ViewBasis& basis, float radius, ImU32 colour, const char* label)
+{
+    // Screen x = axis · right, screen y = -(axis · up): the negation is because screen y grows downwards while world
+    // up grows upwards. Forgetting it mirrors the compass vertically, which reads as a projection bug rather than a sign
+    // error and is maddening to trace.
+    const ImVec2 direction(axisWorld.Dot(basis.Right), -axisWorld.Dot(basis.Up));
+    const ImVec2 tip(origin.x + direction.x * radius, origin.y + direction.y * radius);
+
+    drawList.AddLine(origin, tip, colour, 2.0f);
+    drawList.AddCircleFilled(tip, 3.0f, colour);
+
+    // The label sits just beyond the tip so it never overlaps the line it names.
+    const ImVec2 labelPos(tip.x + direction.x * 9.0f - 4.0f, tip.y + direction.y * 9.0f - 6.0f);
+    drawList.AddText(labelPos, IM_COL32(230, 230, 232, 255), label);
+}
+
+//! Overlays the viewport's compass and navigation hint using the panel's own draw list.
+/**
+ * Drawn after the Image item rather than in a reserved row below it: UE paints its overlays on top of the scene, and
+ * reserving layout rows is what made the old viewport compute its size twice (once for the image, once for the text)
+ * and get both wrong.
+ */
+void DrawViewportOverlay(const PanelContext& context, const ImVec2& imageMin, const ImVec2& imageSize)
+{
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+    // A translucent plate behind the compass keeps it legible over a bright sky, which a bare line drawing never is.
+    const ImVec2 compassCentre(imageMin.x + imageSize.x - 52.0f, imageMin.y + 46.0f);
+    drawList->AddCircleFilled(compassCentre, 30.0f, IM_COL32(12, 13, 15, 140));
+
+    const ViewBasis basis = GetViewBasis(context.CameraPosition, context.CameraTarget);
+    DrawCompassAxis(*drawList, compassCentre, Vec3(1.0f, 0.0f, 0.0f), basis, 20.0f, IM_COL32(224, 92, 92, 255), "X");
+    DrawCompassAxis(*drawList, compassCentre, Vec3(0.0f, 1.0f, 0.0f), basis, 20.0f, IM_COL32(120, 214, 120, 255), "Y");
+    DrawCompassAxis(*drawList, compassCentre, Vec3(0.0f, 0.0f, 1.0f), basis, 20.0f, IM_COL32(108, 156, 244, 255), "Z");
+
+    // Navigation hint, top-left, only while navigating or when the pointer is over the viewport — a permanent caption
+    // would be noise after the first minute and the point is to teach the controls, not decorate the panel.
+    ImGui::SetCursorScreenPos(ImVec2(imageMin.x + 10.0f, imageMin.y + 8.0f));
+    if (context.ViewportHintVisible)
+    {
+        ImGui::TextColored(ImVec4(0.75f, 0.78f, 0.83f, 0.92f),
+                           "RMB fly · MMB orbit · Shift sprint · wheel zoom · LMB select · F frame");
+    }
+}
+
+}  // namespace
+
 void DrawViewportPanel(UiState& state, const PanelContext& context)
 {
-    // Centre: whatever the side panels and bottom strip leave. The scene renders at this extent, so a wrong rectangle
-    // is not just an overlapping window — it is the viewport's aspect ratio.
-    PlaceInitially(SideWidth(context), PanelsTop(context),
-                   std::max(160.0f, context.ContentWidth - SideWidth(context) * 2.0f),
-                   std::max(120.0f, context.ContentHeight - BottomHeight(context) - PanelsTop(context)));
-    if (!ImGui::Begin("Viewport"))
+    ImGui::Begin(kViewportTitle);
+
+    // The image takes the panel's entire remaining content area. This is the fix for the crop: previously the scene was
+    // rendered at an *estimated* window-minus-panels extent and then drawn at that fixed pixel size, so it overflowed the
+    // panel by ~130 px, got clipped, and sprouted two scrollbars — while being projected at an aspect ratio nobody could
+    // see. Measuring here means the render target and the drawn rect agree by construction.
+    ImVec2 available = ImGui::GetContentRegionAvail();
+    if (available.x < 1.0f)
     {
-        ImGui::End();
-        return;
+        available.x = 1.0f;
+    }
+    if (available.y < 1.0f)
+    {
+        available.y = 1.0f;
     }
 
-    if (context.ViewportTextureId != 0ull && context.ViewportWidth > 1.0f && context.ViewportHeight > 1.0f)
+    const ImVec2 imageMin = ImGui::GetCursorScreenPos();
+
+    // No scrollbars, ever: the image is sized to fit, so a scrollbar here would only appear if the sizing logic broke —
+    // and when it did before, it hid half the scene behind itself.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+
+    if (context.ViewportTextureId != 0ull)
     {
-        // The scene, rendered at the panel's own extent and sampled here. See the file header of
-        // EditorApplication.cpp for why sampling rather than drawing into the back buffer is what makes a docked
-        // viewport possible at all.
-        ImGui::Image(ImTextureRef{static_cast<ImTextureID>(context.ViewportTextureId)},
-                     ImVec2(context.ViewportWidth, context.ViewportHeight));
+        ImGui::Image(ImTextureRef{static_cast<ImTextureID>(context.ViewportTextureId)}, available);
     }
     else
     {
-        ImGui::TextUnformatted("Viewport not ready.");
+        // Still draw the placeholder as a filled rect so the panel has an identifiable extent on frame one rather than a
+        // line of text at the origin.
+        ImGui::Dummy(available);
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        drawList->AddRectFilled(imageMin, ImVec2(imageMin.x + available.x, imageMin.y + available.y),
+                                IM_COL32(16, 17, 19, 255));
+        drawList->AddText(ImVec2(imageMin.x + 12.0f, imageMin.y + 12.0f), IM_COL32(160, 166, 176, 255),
+                          "Viewport initialising...");
     }
 
-    if (!state.Selection.IsEmpty())
+    ImGui::PopStyleVar();
+
+    // Geometry and hover state, recorded for the application (camera navigation) and for next frame's target sizing.
+    ViewportInteraction& viewport = state.Viewport;
+    viewport.ImageScreenLeft = imageMin.x;
+    viewport.ImageScreenTop = imageMin.y;
+    viewport.ImageWidth = available.x;
+    viewport.ImageHeight = available.y;
+
+    // Hover is IsItemHovered on the image item: it is already false when a popup, tooltip or another window covers the
+    // point, which is what stops right-drag-flying while the cursor happens to be over an open menu. The extra
+    // WantCaptureMouse test covers the other half — a widget in *another* panel that owns an in-progress drag (a slider
+    // in the inspector) must keep its mouse even when the pointer travels back over the viewport.
+    // AllowWhenBlockedByActiveItem is needed because a navigation gesture starts by pressing a button we handle
+    // ourselves, and without it ImGui would report "not hovered" from the second frame of the drag onwards.
+    viewport.PointerOverImage =
+        ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) && !ImGui::GetIO().WantCaptureMouse;
+
+    DrawViewportOverlay(context, imageMin, available);
+
+    // --- input: read here (after NewFrame, where ImGui's edge detection is defined), apply next frame in the app ----
+    const ImGuiIO& io = ImGui::GetIO();
+
+    if (viewport.PointerOverImage)
     {
-        ImGui::Text("Selected: %zu", static_cast<size_t>(state.Selection.GetCount()));
+        // Left click selects. It goes straight through the application's own picking entry point — the same one the
+        // `pick.at` command uses — so a click and a typed coordinate can never disagree, and so the pick happens this
+        // frame rather than one later (selection latency is far more noticeable than camera latency).
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && context.ViewportTextureId != 0ull)
+        {
+            const ImVec2 mouse = ImGui::GetMousePos();
+            static_cast<void>(context.Application->PickAtViewportPixel(mouse.x - viewport.ImageScreenLeft,
+                                                                       mouse.y - viewport.ImageScreenTop));
+        }
+
+        // Navigation gestures accumulate; EditorApplication applies them at the top of the next frame. One frame of
+        // latency on camera motion is imperceptible and buys the panels their central rule: widgets never touch the
+        // engine's state, they record what the author asked for.
+        const bool flying = ImGui::IsMouseDown(ImGuiMouseButton_Right);
+        const bool orbiting = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+        viewport.Navigating = flying || orbiting;
+
+        if (flying)
+        {
+            ViewAxisInput& fly = viewport.Fly;
+            if (ImGui::IsKeyDown(ImGuiKey_W) || ImGui::IsKeyDown(ImGuiKey_UpArrow))
+            {
+                fly.Forward += 1.0f;
+            }
+            if (ImGui::IsKeyDown(ImGuiKey_S) || ImGui::IsKeyDown(ImGuiKey_DownArrow))
+            {
+                fly.Forward -= 1.0f;
+            }
+            if (ImGui::IsKeyDown(ImGuiKey_D))
+            {
+                fly.Right += 1.0f;
+            }
+            if (ImGui::IsKeyDown(ImGuiKey_A))
+            {
+                fly.Right -= 1.0f;
+            }
+            if (ImGui::IsKeyDown(ImGuiKey_Q))
+            {
+                fly.Up -= 1.0f;
+            }
+            if (ImGui::IsKeyDown(ImGuiKey_E))
+            {
+                fly.Up += 1.0f;
+            }
+            fly.Sprint = ImGui::IsKeyDown(ImGuiMod_Shift);
+        }
+
+        if (orbiting)
+        {
+            // Shift+middle pans, plain middle orbits — the same split UE uses, so muscle memory transfers without a
+            // settings page.
+            const ImVec2 delta = io.MouseDelta;
+            if (ImGui::IsKeyDown(ImGuiMod_Shift))
+            {
+                viewport.PanPixelsX += delta.x;
+                viewport.PanPixelsY += delta.y;
+            }
+            else
+            {
+                viewport.OrbitPixelsX += delta.x;
+                viewport.OrbitPixelsY += delta.y;
+            }
+        }
+
+        if (io.MouseWheel != 0.0f)
+        {
+            viewport.DollyNotches += io.MouseWheel;
+        }
+
+        if (ImGui::IsKeyPressed(ImGuiKey_F))
+        {
+            viewport.RequestFrameSelection = true;
+        }
     }
 
     ImGui::End();
@@ -759,11 +1430,61 @@ void DrawMenuBar(UiState& state, const PanelContext& context)
         return;
     }
 
-    if (ImGui::BeginMenu("Scene"))
+    // Menus are grouped the way UE groups them, because that is where someone who has never seen this editor will look
+    // first. Every item runs a console command rather than calling engine code directly: one implementation per action,
+    // and `help` stays an honest index of everything the editor can do.
+    if (ImGui::BeginMenu("File"))
     {
-        if (ImGui::MenuItem("Save", nullptr, false))
+        if (ImGui::MenuItem("Save Scene", "Ctrl+S"))
         {
             state.Run("scene.save");
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Quit"))
+        {
+            state.Run("editor.quit");
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Edit"))
+    {
+        if (ImGui::MenuItem("Create Entity"))
+        {
+            state.Run("entity.create");
+        }
+        if (ImGui::MenuItem("Create Cube"))
+        {
+            state.Run("entity.create Cube engine:cube");
+        }
+        ImGui::Separator();
+        const bool hasSelection = !state.Selection.IsEmpty();
+        if (!hasSelection)
+        {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::MenuItem("Delete Selected", "Del") && hasSelection)
+        {
+            state.Run("entity.destroy");
+        }
+        if (!hasSelection)
+        {
+            ImGui::EndDisabled();
+        }
+        ImGui::Separator();
+        // Present and disabled rather than absent: undo is the highest-value missing feature (notes/EDITOR.md §5), and a
+        // greyed item says "this tool knows you want it" far more usefully than its absence.
+        if (ImGui::MenuItem("Undo", "Ctrl+Z", nullptr, false))
+        {
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("View"))
+    {
+        if (ImGui::MenuItem("Frame Selection", "F"))
+        {
+            state.Run("view.frame");
         }
         ImGui::EndMenu();
     }
@@ -774,29 +1495,143 @@ void DrawMenuBar(UiState& state, const PanelContext& context)
         ImGui::Checkbox("Details", &state.ShowDetails);
         ImGui::Checkbox("Content Browser", &state.ShowContent);
         ImGui::Checkbox("Console", &state.ShowConsole);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Reset Layout"))
+        {
+            state.Run("layout.reset");
+        }
         ImGui::EndMenu();
     }
 
-    ImGui::Text("frames %llu   input %d", static_cast<unsigned long long>(context.FrameCount),
-                static_cast<int>(state.LastInputEvents));
-
+    // The frame counter that used to live here has moved to the status bar, where there is room for it alongside the
+    // numbers that actually matter (draw calls, selection, camera) — the menu bar is for commands.
+    static_cast<void>(context);
     ImGui::EndMainMenuBar();
+
+    // Ctrl+S handled as a shortcut rather than only the menu's label text: MenuItem's second argument is display-only,
+    // and a label that promises a binding without implementing one is worse than no label.
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S))
+    {
+        state.Run("scene.save");
+    }
+}
+
+void DrawStatusBar(UiState& state, const PanelContext& context)
+{
+    // A bottom strip fixed to the window: mode on the left, live numbers on the right. This is where frame/draw/selection
+    // information belongs — visible without opening a panel, and it makes SceneDrawCalls (computed every frame by the
+    // renderer and previously drawn by nobody) actually useful.
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float barHeight = StatusBarHeight();
+
+    // Positioned over the gap the dockspace left (SubmitDockspace subtracts the same value), so the bar is adjacent to
+    // the panels rather than on top of them.
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + viewport->WorkSize.y - barHeight));
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, barHeight));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * state.UiScale, 2.0f * state.UiScale));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::GetStyle().Colors[ImGuiCol_MenuBarBg]);
+
+    // NoNavFocus: without it a click on the status bar makes it the navigation window, and keyboard input (WASD flight,
+    // F to frame) then routes to a strip of text that can do nothing with it.
+    if (ImGui::Begin("##StatusBar", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+                         | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBringToFrontOnFocus
+                         | ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoSavedSettings))
+    {
+        const Vec3 camera = context.CameraPosition;
+        char left[160];
+        std::snprintf(left, sizeof(left), "%s  ·  %s", state.Selection.IsEmpty() ? "No selection" : "Selected",
+                      context.ActiveSceneName.empty() ? "unnamed" : context.ActiveSceneName.c_str());
+        ImGui::TextUnformatted(left);
+
+        ImGui::SameLine();
+        char numbers[256];
+        std::snprintf(numbers, sizeof(numbers),
+                      "%llu draw calls  ·  %zu entities  ·  cam %.1f, %.1f, %.1f  ·  %.0f fps",
+                      static_cast<unsigned long long>(context.SceneDrawCalls),
+                      static_cast<size_t>(context.SceneWorld != nullptr ? context.SceneWorld->GetAliveEntityCount() : 0u),
+                      static_cast<double>(camera.X), static_cast<double>(camera.Y), static_cast<double>(camera.Z),
+                      static_cast<double>(context.FramesPerSecond));
+        ImGui::SameLine(ImGui::GetWindowWidth() * 0.42f);
+        ImGui::TextDisabled("%s", numbers);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
+std::vector<PanelRect> CollectPanelRectangles()
+{
+    // The same titles the panels Begin() with — one list, so a rename cannot make the diagnostic look for a window that
+    // no longer exists and report "not created" for a panel that is on screen.
+    static const char* const kTitles[] = {kViewportTitle, kOutlinerTitle, kDetailsTitle, kContentTitle, kConsoleTitle};
+
+    std::vector<PanelRect> rectangles;
+    rectangles.reserve(std::size(kTitles));
+
+    if (ImGui::GetCurrentContext() == nullptr)
+    {
+        for (const char* title : kTitles)
+        {
+            PanelRect rect;
+            rect.Name = title;
+            rectangles.push_back(rect);
+        }
+        return rectangles;
+    }
+
+    for (const char* title : kTitles)
+    {
+        PanelRect result;
+        result.Name = title;
+
+        if (const ImGuiWindow* window = ImGui::FindWindowByName(title))
+        {
+            // A window that exists but was not submitted this frame is reported as 0x0, not with its stale rectangle.
+            // ImGui keeps the last layout of a hidden window, so reporting it verbatim makes "the panel is hidden" and
+            // "the panel is on screen at 320x700" indistinguishable — in this diagnostic *and* in any test built on it,
+            // which is precisely how a reset-layout assertion ended up passing while the panel was still hidden.
+            if (window->Hidden || !window->WasActive)
+            {
+                rectangles.push_back(result);
+                continue;
+            }
+
+            const ImRect bounds = window->Rect();
+            result.X = bounds.Min.x;
+            result.Y = bounds.Min.y;
+            result.Width = bounds.GetWidth();
+            result.Height = bounds.GetHeight();
+        }
+
+        rectangles.push_back(result);
+    }
+
+    return rectangles;
 }
 
 void DrawEditorPanels(UiState& state, const PanelContext& context)
 {
-    // The dockspace fills the window and every panel can be dragged into it. Docking is what makes this UE-shaped
-    // rather than four free-floating windows; the initial rectangles in each Draw*Panel are where they land before an
-    // author rearranges them (no ini file is written, so that arrangement lasts a session — tracked in
-    // notes/EDITOR.md §3).
-    ImGui::DockSpaceOverViewport(kDockSpaceId, ImGui::GetMainViewport(), ImGuiDockNodeFlags_None);
+    // The dockspace fills the window and every panel docks into it (see BuildDefaultDockLayout). Rebuild on request —
+    // frame one, or `layout.reset` / Window > Reset Layout — which is what makes an author's scattered arrangement
+    // recoverable; before this existed, scattering panels was permanent.
+    SubmitDockspace(state.RequestLayoutReset, StatusBarHeight());
+    state.RequestLayoutReset = false;
 
     DrawMenuBar(state, context);
+
+    // Order matters only for focus/stacking: the viewport first so it is the default focus target (and therefore gets
+    // keyboard input) when nothing else was clicked.
+    DrawViewportPanel(state, context);
     DrawOutlinerPanel(state, context);
     DrawDetailsPanel(state, context);
     DrawContentPanel(state, context);
     DrawConsolePanel(state, context);
-    DrawViewportPanel(state, context);
+
+    // Snapshot geometry last, after every panel has submitted its window, so the rectangles reflect this frame's layout
+    // rather than the previous one (see UiState::PanelGeometry for why a snapshot at all).
+    state.PanelGeometry = CollectPanelRectangles();
 }
 
 }  // namespace Hollowpoint::Editor

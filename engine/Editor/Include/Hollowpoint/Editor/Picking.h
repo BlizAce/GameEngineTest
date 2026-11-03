@@ -130,8 +130,9 @@ struct WorldBounds
 //! NDC point at z=0 for the eye and z=1 for the far plane in Vulkan's [0,1] depth range — using GL's -1 would tilt
 //! every ray slightly and be invisible until someone clicked near the horizon).
 /**
- * \param ndcX,-ndcY Clip-space coordinates in [-1,1]; y is **already flipped** by the caller (screen y grows down,
- *        NDC y grows up), because who flips is exactly the kind of convention that must be stated once.
+ * \param ndcX Clip-space x in [-1,1].
+ * \param ndcY Clip-space y in [-1,1], **already flipped** by the caller (screen y grows down, NDC y grows up), because
+ *        who flips is exactly the kind of convention that must be stated once.
  */
 [[nodiscard]] HP_EDITOR_API Ray ScreenPointToRay(Float32 ndcX, Float32 ndcY,
                                                  const Mat4& inverseViewProjection) noexcept;

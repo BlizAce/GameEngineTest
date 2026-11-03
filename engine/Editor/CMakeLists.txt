@@ -33,20 +33,24 @@ target_sources(HollowpointEditor PRIVATE
     Include/Hollowpoint/Editor/EditorConsole.h
     Include/Hollowpoint/Editor/EditorInput.h
     Include/Hollowpoint/Editor/EditorSelection.h
+    Include/Hollowpoint/Editor/EditorStyle.h
     Include/Hollowpoint/Editor/EntityName.h
     Include/Hollowpoint/Editor/Picking.h
     Include/Hollowpoint/Editor/PropertyView.h
     Include/Hollowpoint/Editor/UiRenderer.h
+    Include/Hollowpoint/Editor/ViewCamera.h
     Src/ContentBrowserModel.cpp
     Src/EditorApplication.cpp
     Src/EditorPanels.cpp
     Src/EditorConsole.cpp
     Src/EditorInput.cpp
     Src/EditorSelection.cpp
+    Src/EditorStyle.cpp
     Src/Picking.cpp
     Src/PropertyView.cpp
     Src/RegisterEditorTypes.cpp
-    Src/UiRenderer.cpp)
+    Src/UiRenderer.cpp
+    Src/ViewCamera.cpp)
 
 target_link_libraries(HollowpointEditor PUBLIC
     Hollowpoint::Core

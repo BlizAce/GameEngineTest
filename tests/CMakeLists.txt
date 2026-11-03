@@ -283,6 +283,7 @@ if(TARGET HollowpointRenderer)
             SOURCES
                 Editor/TestEditorModel.cpp
                 Editor/TestEditorApplication.cpp
+                Editor/TestViewCamera.cpp
             LIBS Hollowpoint::Editor Hollowpoint::Game Hollowpoint::Scene Hollowpoint::MathReflection
             NO_LEAK_CHECK)
     endif()

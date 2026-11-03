@@ -40,8 +40,9 @@ tested as far as "scripts tick", which is honest about its scope.
 
 ## 3. Layout persistence — no ini file
 
-`io.IniFilename = nullptr`. Panel arrangement comes from initial rectangles computed per frame (`PlaceInitially` in
-`EditorPanels.cpp`, `ImGuiCond_FirstUseEver`) and an author's own arrangement lasts the session, then resets.
+`io.IniFilename = nullptr`. Panels dock into a tree built by `BuildDefaultDockLayout()` (`EditorPanels.cpp`) on the first
+frame; an author's arrangement lasts the session and is then lost, but unlike the earlier floating-window layout it is now
+recoverable *within* the session via `Window > Reset Layout` / `layout.reset`.
 
 Why not write ImGui's ini now: it is one global file for every project, so two projects with different scenes fight over one
 layout, and a stale ini referencing a panel that no longer exists is a support question with no good answer. Per-project

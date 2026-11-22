@@ -3,7 +3,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,9 +19,12 @@
 #include "Hollowpoint/Editor/EntityName.h"
 #include "Hollowpoint/Editor/PropertyView.h"
 #include "Hollowpoint/Editor/ViewCamera.h"
+#include "Hollowpoint/Game/MeshRenderer.h"
 #include "Hollowpoint/Math/MathCore.h"
 #include "Hollowpoint/Reflection/Descriptors.h"
 #include "Hollowpoint/Reflection/Registry.h"
+#include "Hollowpoint/Renderer/Camera.h"
+#include "Hollowpoint/Renderer/Lights.h"
 #include "Hollowpoint/Scene/LocalTransform.h"
 
 #include <imgui.h>
@@ -900,53 +902,32 @@ int ConsoleCompletionCallback(ImGuiInputTextCallbackData* data)
 // editor without being one, so no splitter resized its neighbour and no reset could restore anything.
 // ---------------------------------------------------------------------------
 
-//! Type-name -> storage lookup for one frame, so per-row icon decisions cost a hash hit and not a world walk.
-/**
- * Built once per panel frame from ForEachComponentStorage (a handful of storages total: LocalTransform, MeshRenderer,
- * Camera, Light, Script, EntityName). Doing this per row instead — asking the world to find a type by scanning its
- * storages each time — is O(rows x storages) and shows up as outliner lag in exactly the large scenes where an outliner
- * matters. Pointers are borrowed from the world and live only for this frame's draw.
- */
-class ComponentTypeIndex
-{
-public:
-    explicit ComponentTypeIndex(const ECS::World& world)
-    {
-        world.ForEachComponentStorage(
-            [this](const ECS::IComponentStorage& storage) { m_ByType.emplace(storage.GetTypeName(), &storage); });
-    }
-
-    [[nodiscard]] bool Has(std::string_view typeName, Core::Index slot) const
-    {
-        const auto found = m_ByType.find(typeName);
-        return found != m_ByType.end() && found->second->Contains(slot);
-    }
-
-private:
-    std::map<std::string_view, const ECS::IComponentStorage*> m_ByType;
-};
-
 //! The outliner glyph for an entity, from the components it actually has.
 /**
- * Ordered most specific first. Every branch keys off a real component type: guessing from the entity's *name* would
- * mislabel anything the author renamed, and a confidently wrong icon is worse than a generic one because it looks
- * authoritative. Script beats MeshRenderer because a scripted actor is what an author thinks of as "the script".
+ * Type-safe lookups, not name matching: IComponentStorage::GetTypeName() returns whatever registration handed it, and
+ * for these engine components that is a mangled C++ name (N11Hollowpoint4Game12MeshRendererE), so an earlier version
+ * of this function that compared against "MeshRenderer" matched nothing and every row drew the generic glyph — silently,
+ * with no error to follow. World::HasComponent<T> goes through the same storage map by type and cannot drift from a
+ * rename.
+ *
+ * Ordered most specific first. Guessing a type from the entity's *name* would mislabel anything the author renamed, and
+ * a confidently wrong icon is worse than a generic one because it looks authoritative. Script beats MeshRenderer
+ * because a scripted actor is what an author thinks of as "the script".
  */
-[[nodiscard]] const char* OutlinerIconFor(const ComponentTypeIndex& components, const ECS::Entity& entity)
+[[nodiscard]] const char* OutlinerIconFor(const ECS::World& world, const ECS::Entity& entity)
 {
-    if (components.Has("Camera", entity.Slot))
+    if (world.HasComponent<Renderer::CameraComponent>(entity))
     {
         return "actor_camera";
     }
-    if (components.Has("Light", entity.Slot))
+    if (world.HasComponent<Renderer::LightComponent>(entity))
     {
         return "actor_light";
     }
-    if (components.Has("Script", entity.Slot))
-    {
-        return "actor_script";
-    }
-    if (components.Has("MeshRenderer", entity.Slot))
+    // No script glyph: Hollowpoint::Scripting is an optional module (engine/Editor/CMakeLists.txt links it only when the
+    // target exists), so naming ScriptComponent here would break a -DHP_ENABLE_SCRIPTING=OFF build for one icon. The
+    // atlas already has actor_script; wiring it needs a scripting-agnostic way to ask "does this entity have a script".
+    if (world.HasComponent<Game::MeshRenderer>(entity))
     {
         return "actor_cube";
     }
@@ -1011,9 +992,8 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
     };
     std::vector<Row> rows;
 
-    // Built once per frame, before rows are gathered: icon decisions then cost a hash lookup per row.
-    const ComponentTypeIndex componentTypes(*context.SceneWorld);
-
+    // Icon decisions go through typed component lookups; nothing is cached per frame because the world's storage map is
+    // already indexed by type (see OutlinerIconFor for why name matching cannot work here).
     context.SceneWorld->ForEachEntity([&](const Entity& entity) {
         if (!context.SceneWorld->IsAlive(entity))
         {
@@ -1022,7 +1002,7 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
         std::string label = FormatEntityLabel(*context.SceneWorld, entity);
         if (ContainsIgnoreCase(label, state.OutlinerFilter))
         {
-            rows.push_back(Row{entity, std::move(label), OutlinerIconFor(componentTypes, entity)});
+            rows.push_back(Row{entity, std::move(label), OutlinerIconFor(*context.SceneWorld, entity)});
         }
     });
 

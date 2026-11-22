@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -11,6 +12,7 @@
 #include "Hollowpoint/Editor/ContentBrowserModel.h"
 #include "Hollowpoint/Editor/EditorApplication.h"
 #include "Hollowpoint/Editor/EditorConsole.h"
+#include "Hollowpoint/Editor/EditorIcons.h"
 #include "Hollowpoint/Editor/EditorPanels.h"
 #include "Hollowpoint/Editor/EditorSelection.h"
 #include "Hollowpoint/Editor/EditorStyle.h"
@@ -117,6 +119,101 @@ bool FillBuffer(std::string_view text, char* buffer, Size capacity)
 }
 
 // ---------------------------------------------------------------------------
+// Icon widgets
+//
+// One place converts (icon name, size) into a draw call, because every other file in this module must not care whether
+// the atlas loaded. A missing icon draws nothing rather than a placeholder square: UE's chrome is dense with glyphs and
+// a placeholder on every one of them would be noisier than the label beside it. Where an icon carries meaning a label
+// cannot (an eye for visibility), the caller draws a text fallback too — that decision belongs to the caller, which is
+// why it is not baked into these helpers.
+// ---------------------------------------------------------------------------
+
+//! True when `icons` can actually be drawn with. Null and unloaded are the same answer for a widget.
+[[nodiscard]] bool IconsAvailable(const EditorIconSet* icons)
+{
+    return icons != nullptr && icons->IsLoaded();
+}
+
+//! Draws one glyph at `size`, advancing the cursor by exactly that width when it drew.
+/**
+ * Returns false when nothing was drawn, so a caller can fall back to text. The advance matters: an icon followed by
+ * SameLine() with no item is laid out at the previous x, which stacks a label on top of the glyph — visible only as
+ * "the panel looks squashed" in a screenshot.
+ */
+bool DrawIcon(const EditorIconSet* icons, const char* name, float size)
+{
+    IconUvRect uv;
+    if (!IconsAvailable(icons) || !icons->Find(name, uv))
+    {
+        return false;
+    }
+
+    ImGui::Image(ImTextureRef{static_cast<ImTextureID>(icons->GetTextureId())}, ImVec2(size, size),
+                 ImVec2(uv.U0, uv.V0), ImVec2(uv.U1, uv.V1));
+    return true;
+}
+
+//! An icon button: a button-sized frame with the glyph centred in it.
+/**
+ * Built as Button + a draw-list overlay rather than ImageButton-with-the-atlas for two reasons. ImageButton tints its
+ * image with the button colour on hover, which would recolour every glyph when UE's icons keep their own colour and
+ * only the background changes; and passing no texture at all (the no-atlas case) would fall through to this renderer's
+ * white-texture fallback and paint a solid square over the button. A Button submits no textured command beyond the font
+ * atlas, so there is nothing to mis-sample.
+ *
+ * Frame padding is pushed to half the icon size so an empty label yields an exactly size x size frame: rows of these
+ * align with the text row beside them, which is what separates "a toolbar" from "buttons with pictures in".
+ */
+bool IconButton(const EditorIconSet* icons, const char* name, const char* id, const char* tooltip, float size,
+                bool enabled = true)
+{
+    if (!enabled)
+    {
+        ImGui::BeginDisabled();
+    }
+
+    // The label is forced invisible: ImGui::Button draws its label, and passing a human-readable one here produced a
+    // text button with the glyph painted over it — light pixels on light text, i.e. an unreadable smear that also made
+    // the icons look like they were not drawing at all. Prefixing internally means no call site can reintroduce that.
+    const std::string label = std::string("##") + id;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(size * 0.5f, size * 0.5f));
+    const bool clicked = ImGui::Button(label.c_str());
+    ImGui::PopStyleVar();
+    if (tooltip != nullptr && tooltip[0] != '\0')
+    {
+        ImGui::SetItemTooltip("%s", tooltip);
+    }
+
+    if (!enabled)
+    {
+        ImGui::EndDisabled();
+    }
+
+    IconUvRect uv;
+    if (!IconsAvailable(icons) || !icons->Find(name, uv))
+    {
+        return clicked;  // no atlas: the button's label is the fallback, so nothing more to draw
+    }
+
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 frameSize = ImGui::GetItemRectSize();
+    const float offset = (frameSize.x - size) * 0.5f;
+    // Dimmed with the frame when disabled: an icon that stays bright next to a greyed button reads as still clickable.
+    const ImU32 tint = ImGui::GetColorU32(enabled ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+    ImGui::GetWindowDrawList()->AddImage(ImTextureRef{static_cast<ImTextureID>(icons->GetTextureId())},
+                                         ImVec2(min.x + offset, min.y + offset),
+                                         ImVec2(min.x + offset + size, min.y + offset + size), ImVec2(uv.U0, uv.V0),
+                                         ImVec2(uv.U1, uv.V1), tint);
+
+    // Lay the next item on the same row. Doing it here rather than at each call site is what keeps a toolbar from
+    // silently becoming a vertical stack: without it every button drops to a new line, and inside a 29 px strip that
+    // means only the first is ever visible — which looks exactly like "the icons are missing".
+    ImGui::SameLine();
+    return clicked;
+}
+
+// ---------------------------------------------------------------------------
 // Dock layout
 // ---------------------------------------------------------------------------
 
@@ -126,10 +223,10 @@ constexpr ImGuiID kDockSpaceId = 0x4850444BU;  // 'HPDK'
 
 //! Window titles. One place, because DockBuilderDockWindow matches by name and a typo silently produces an undocked
 //  floating panel — the kind of failure that shows up as "the outliner vanished" in a screenshot.
-constexpr const char* kOutlinerTitle = "Outliner";
+constexpr const char* kOutlinerTitle = "World Outliner";
 constexpr const char* kDetailsTitle = "Details";
 constexpr const char* kContentTitle = "Content Browser";
-constexpr const char* kConsoleTitle = "Console";
+constexpr const char* kConsoleTitle = "Output Log";
 constexpr const char* kViewportTitle = "Viewport";
 
 //! Default split fractions of the docked layout, expressed as fractions of the space *remaining at that moment* —
@@ -151,6 +248,49 @@ constexpr float kContentShareOfBottom = 0.34f;
 [[nodiscard]] float StatusBarHeight()
 {
     return ImGui::GetFrameHeight() + 2.0f;
+}
+
+//! Height of the main toolbar strip, in content units at 1x scale.
+/**
+ * Same reason as StatusBarHeight: SubmitDockspace must subtract exactly what the toolbar occupies, or the first panel
+ * row is drawn underneath an opaque strip and its clicks are swallowed — a bug that looks like "the outliner does not
+ * respond" rather than "two numbers disagree". Must match DrawMainToolBar's own height expression; ToolbarHeightFor is
+ * the single definition both use.
+ */
+[[nodiscard]] float ToolbarHeight()
+{
+    return ImGui::GetFrameHeight() + 6.0f;
+}
+
+//! Where the dock area and toolbar begin: directly below the main menu bar, measured from the menu bar itself.
+/**
+ * Deriving this from the menu bar window's real bottom edge — instead of from viewport->WorkPos.y plus a guessed menu
+ * height — is what makes it correct regardless of whether this ImGui build has already folded the menu bar into WorkPos
+ * (it differs between docking/no-decoration configurations, and both readings were tried here: one drew the toolbar over
+ * the menu labels, the other left a 23px gap and covered the first panel row). The expression is self-consistent either
+ * way because it never mixes measured window positions with assumed heights.
+ */
+struct ChromeStrips
+{
+    float BelowMenuBar = 0.0f;  //!< y where the toolbar starts
+    float DockTopInset = 0.0f;  //!< how far below WorkPos.y the dock area must start (menu bar + toolbar)
+};
+
+[[nodiscard]] ChromeStrips MeasureChrome(float toolbarHeight)
+{
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImGuiWindow* menuBar = ImGui::FindWindowByName("##MainMenuBar");
+
+    ChromeStrips strips;
+    strips.BelowMenuBar = menuBar != nullptr ? menuBar->Pos.y + menuBar->Size.y : viewport->WorkPos.y;
+    strips.DockTopInset = (strips.BelowMenuBar - viewport->WorkPos.y) + toolbarHeight;
+    return strips;
+}
+
+//! Icon edge for the current UI scale: glyphs track the text they sit beside so one slider scales both.
+[[nodiscard]] float ToolbarIconSize(const UiState& state)
+{
+    return IconSizeForScale(state.UiScale, 16.0f);
 }
 
 //! Splits `node` along `dir`, returning both children by reference.
@@ -225,14 +365,16 @@ void BuildDefaultDockLayout()
  * itself is a tangle), zero padding so panels meet the window edge with no gap, and no background so the dockspace's own
  * fill is what shows between panels.
  */
-void SubmitDockspace(bool rebuildLayout, float bottomInset)
+void SubmitDockspace(bool rebuildLayout, float bottomInset, float topInset)
 {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
 
-    ImGui::SetNextWindowPos(viewport->WorkPos);
+    // The dock area starts below the menu bar + toolbar and ends above the status bar; both insets are subtracted from
+    // work height so panels never sit under an opaque strip.
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + topInset));
     // The status bar gets its own strip rather than being painted over the dock: an overlay would cover the console's
     // last line and swallow clicks meant for whatever panel happened to sit under it.
-    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, std::max(64.0f, viewport->WorkSize.y - bottomInset)));
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, std::max(64.0f, viewport->WorkSize.y - bottomInset - topInset)));
     ImGui::SetNextWindowViewport(viewport->ID);
 
     const ImGuiWindowFlags hostFlags =
@@ -477,6 +619,32 @@ void RegisterUiCommands(EditorConsole& console, UiState& state, EditorApplicatio
                                                                                             : "the selection");
                               return true;
                           });
+
+    console.RegisterFixed(
+        "editor.scripts.play", "Resume the gameplay script tick (scripts only — no PIE snapshot).",
+        ArgumentCount::Exact, 0,
+        [&app](const std::vector<std::string>&, std::string& outReply, std::string&) {
+            app.SetScriptsPlaying(true);
+            outReply = "scripts running";
+            return true;
+        });
+
+    console.RegisterFixed(
+        "editor.scripts.pause", "Pause the gameplay script tick.", ArgumentCount::Exact, 0,
+        [&app](const std::vector<std::string>&, std::string& outReply, std::string&) {
+            app.SetScriptsPlaying(false);
+            outReply = "scripts paused";
+            return true;
+        });
+
+    console.RegisterFixed(
+        "editor.scripts.stop", "Stop the gameplay script tick. Mutations made while running are kept.",
+        ArgumentCount::Exact, 0,
+        [&app](const std::vector<std::string>&, std::string& outReply, std::string&) {
+            app.SetScriptsPlaying(false);
+            outReply = "scripts stopped";
+            return true;
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +899,59 @@ int ConsoleCompletionCallback(ImGuiInputTextCallbackData* data)
 // editor without being one, so no splitter resized its neighbour and no reset could restore anything.
 // ---------------------------------------------------------------------------
 
+//! Type-name -> storage lookup for one frame, so per-row icon decisions cost a hash hit and not a world walk.
+/**
+ * Built once per panel frame from ForEachComponentStorage (a handful of storages total: LocalTransform, MeshRenderer,
+ * Camera, Light, Script, EntityName). Doing this per row instead — asking the world to find a type by scanning its
+ * storages each time — is O(rows x storages) and shows up as outliner lag in exactly the large scenes where an outliner
+ * matters. Pointers are borrowed from the world and live only for this frame's draw.
+ */
+class ComponentTypeIndex
+{
+public:
+    explicit ComponentTypeIndex(const ECS::World& world)
+    {
+        world.ForEachComponentStorage(
+            [this](const ECS::IComponentStorage& storage) { m_ByType.emplace(storage.GetTypeName(), &storage); });
+    }
+
+    [[nodiscard]] bool Has(std::string_view typeName, Core::Index slot) const
+    {
+        const auto found = m_ByType.find(typeName);
+        return found != m_ByType.end() && found->second->Contains(slot);
+    }
+
+private:
+    std::map<std::string_view, const ECS::IComponentStorage*> m_ByType;
+};
+
+//! The outliner glyph for an entity, from the components it actually has.
+/**
+ * Ordered most specific first. Every branch keys off a real component type: guessing from the entity's *name* would
+ * mislabel anything the author renamed, and a confidently wrong icon is worse than a generic one because it looks
+ * authoritative. Script beats MeshRenderer because a scripted actor is what an author thinks of as "the script".
+ */
+[[nodiscard]] const char* OutlinerIconFor(const ComponentTypeIndex& components, const ECS::Entity& entity)
+{
+    if (components.Has("Camera", entity.Slot))
+    {
+        return "actor_camera";
+    }
+    if (components.Has("Light", entity.Slot))
+    {
+        return "actor_light";
+    }
+    if (components.Has("Script", entity.Slot))
+    {
+        return "actor_script";
+    }
+    if (components.Has("MeshRenderer", entity.Slot))
+    {
+        return "actor_cube";
+    }
+    return "actor_empty";
+}
+
 void DrawOutlinerPanel(UiState& state, const PanelContext& context)
 {
     if (!state.ShowOutliner)
@@ -785,8 +1006,12 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
     {
         Entity Handle;
         std::string Label;
+        const char* Icon = "actor_empty";  //!< atlas glyph for this row's type
     };
     std::vector<Row> rows;
+
+    // Built once per frame, before rows are gathered: icon decisions then cost a hash lookup per row.
+    const ComponentTypeIndex componentTypes(*context.SceneWorld);
 
     context.SceneWorld->ForEachEntity([&](const Entity& entity) {
         if (!context.SceneWorld->IsAlive(entity))
@@ -796,7 +1021,7 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
         std::string label = FormatEntityLabel(*context.SceneWorld, entity);
         if (ContainsIgnoreCase(label, state.OutlinerFilter))
         {
-            rows.push_back(Row{entity, std::move(label)});
+            rows.push_back(Row{entity, std::move(label), OutlinerIconFor(componentTypes, entity)});
         }
     });
 
@@ -819,6 +1044,13 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
                           static_cast<unsigned long long>(row.Handle.Slot));
 
             ImGui::TableNextColumn();
+            // Icon then name, with the selectable spanning both: clicking anywhere on the row selects. The glyph is
+            // drawn as part of the row (not in its own column) so a narrow panel still shows the whole label.
+            const float iconSize = IconSizeForScale(state.UiScale, 14.0f);
+            if (DrawIcon(context.Icons, row.Icon, iconSize))
+            {
+                ImGui::SameLine();
+            }
             // Click selects, Ctrl+click toggles — the behaviour every outliner has, and both routes go through
             // EditorSelection so the viewport, the console and this list can never disagree about what is selected.
             if (ImGui::Selectable(label, state.Selection.IsSelected(row.Handle), ImGuiSelectableFlags_SpanAllColumns))
@@ -1423,6 +1655,117 @@ void DrawViewportPanel(UiState& state, const PanelContext& context)
     ImGui::End();
 }
 
+// ---------------------------------------------------------------------------
+// Main toolbar
+//
+// Only wired actions appear here, deliberately: no New/Open (there is no file dialog and no new-scene command yet), no
+// Lit/Unlit/Wireframe (shading mode is not plumbed through the renderer — notes/EDITOR_UI_REVIEW.md F4). A greyed or
+// dead button in a toolbar is worse than an absent one, because it advertises a feature that will fail when clicked,
+// and this editor's history has exactly one bug of that shape (a Viewport menu whose items all said "pick at"). Each
+// item runs the same console command as its menu twin so there is one implementation per action.
+// ---------------------------------------------------------------------------
+
+void DrawMainToolBar(UiState& state, const PanelContext& context)
+{
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float height = ToolbarHeight();
+    const float iconSize = ToolbarIconSize(state);
+    const EditorIconSet* icons = context.Icons;
+
+    // Positioned from the menu bar window's measured bottom edge — see MeasureChrome, which exists because both
+    // plausible ways of computing this (WorkPos.y alone, or WorkPos.y + GetFrameHeight()) were wrong here in different
+    // directions.
+    const ChromeStrips strips = MeasureChrome(height);
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, strips.BelowMenuBar));
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, height));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * state.UiScale, 3.0f * state.UiScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * state.UiScale, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::GetStyle().Colors[ImGuiCol_MenuBarBg]);
+
+    if (ImGui::Begin("##MainToolBar", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+                         | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings
+                         | ImGuiWindowFlags_NoNavFocus))
+    {
+        // Vertical rule between groups. IconButton already leaves the cursor on the same row, so this must not call
+        // SameLine itself — doing it twice moves the next item past its intended slot.
+        auto separator = []() {
+            ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+            ImGui::SameLine();
+        };
+
+        // --- Edit actions ---------------------------------------------------------------------------
+        if (IconButton(icons, "actor_cube", "create-cube", "Create a cube actor", iconSize))
+        {
+            state.Run("entity.create Cube engine:cube");
+        }
+        const bool hasSelection = !state.Selection.IsEmpty();
+        if (IconButton(icons, "close_x", "delete-selected", "Delete the selection (no undo)", iconSize, hasSelection))
+        {
+            state.Run("entity.destroy");
+        }
+        if (IconButton(icons, "save", "save-scene", "Save the scene (Ctrl+S)", iconSize))
+        {
+            state.Run("scene.save");
+        }
+
+        separator();
+
+        // --- Script play state ----------------------------------------------------------------------
+        // Labels say "scripts" on purpose: this resumes the Lua tick only. There is no PIE snapshot to restore and no
+        // undo boundary, so Stop can leave the world mutated (notes/EDITOR.md §2) — a control that implied otherwise
+        // would be a lie in the most-used button in the window.
+        const bool playing = context.ScriptsPlaying;
+        if (IconButton(icons, playing ? "pause" : "play", "scripts-toggle",
+                  playing ? "Pause the gameplay scripts" : "Run the gameplay scripts (no PIE snapshot)",
+                  iconSize))
+        {
+            state.Run(std::string("editor.scripts.") + (playing ? "pause" : "play"));
+        }
+        if (IconButton(icons, "stop", "scripts-stop", "Stop the scripts; mutations made while running are kept", iconSize, playing))
+        {
+            state.Run("editor.scripts.stop");
+        }
+
+        separator();
+
+        // --- View / layout --------------------------------------------------------------------------
+        if (IconButton(icons, "view_bookmark", "frame-selected", "Frame the selection in the viewport (F)", iconSize, hasSelection))
+        {
+            state.Run("view.frame");
+        }
+        if (IconButton(icons, "settings", "layout-reset", "Restore the default docked layout", iconSize))
+        {
+            state.RequestLayoutReset = true;
+        }
+        if (IconButton(icons, "search", "content-list", "List content browser entries in the Output Log", iconSize))
+        {
+            state.Run("content.list");
+        }
+
+        // --- Right-aligned: UI scale ----------------------------------------------------------------
+        // Scale on the toolbar because it is a per-machine setting people adjust while working; UE puts its equivalent
+        // in Edit > Editor Preferences, which is three menus away from "that text is too small". Plain -/+ buttons: no
+        // glyph in the set means "zoom", and inventing one by reusing an unrelated icon would be worse than text.
+        ImGui::SameLine(viewport->WorkSize.x - 150.0f * state.UiScale);
+        if (ImGui::Button("-"))
+        {
+            state.Run("ui.scale " + std::to_string(std::max(0.75f, state.UiScale - 0.1f)));
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%.2fx", static_cast<double>(state.UiScale));
+        ImGui::SameLine();
+        if (ImGui::Button("+"))
+        {
+            state.Run("ui.scale " + std::to_string(std::min(2.0f, state.UiScale + 0.1f)));
+        }
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
 void DrawMenuBar(UiState& state, const PanelContext& context)
 {
     if (!ImGui::BeginMainMenuBar())
@@ -1491,10 +1834,13 @@ void DrawMenuBar(UiState& state, const PanelContext& context)
 
     if (ImGui::BeginMenu("Window"))
     {
-        ImGui::Checkbox("Outliner", &state.ShowOutliner);
+        // Labels match the window titles exactly: these checkboxes toggle panels by state flag, but a person reading
+        // "Console" in a menu and "Output Log" on a tab has to do the mapping themselves, and gets it wrong often
+        // enough that it reads as two different things.
+        ImGui::Checkbox("World Outliner", &state.ShowOutliner);
         ImGui::Checkbox("Details", &state.ShowDetails);
         ImGui::Checkbox("Content Browser", &state.ShowContent);
-        ImGui::Checkbox("Console", &state.ShowConsole);
+        ImGui::Checkbox("Output Log", &state.ShowConsole);
         ImGui::Separator();
         if (ImGui::MenuItem("Reset Layout"))
         {
@@ -1540,7 +1886,9 @@ void DrawStatusBar(UiState& state, const PanelContext& context)
     {
         const Vec3 camera = context.CameraPosition;
         char left[160];
-        std::snprintf(left, sizeof(left), "%s  ·  %s", state.Selection.IsEmpty() ? "No selection" : "Selected",
+        std::snprintf(left, sizeof(left), "%s  ·  %s  ·  %s",
+                      context.ScriptsPlaying ? "Scripts running" : "Edit mode",
+                      state.Selection.IsEmpty() ? "no selection" : "selected",
                       context.ActiveSceneName.empty() ? "unnamed" : context.ActiveSceneName.c_str());
         ImGui::TextUnformatted(left);
 
@@ -1616,10 +1964,17 @@ void DrawEditorPanels(UiState& state, const PanelContext& context)
     // The dockspace fills the window and every panel docks into it (see BuildDefaultDockLayout). Rebuild on request —
     // frame one, or `layout.reset` / Window > Reset Layout — which is what makes an author's scattered arrangement
     // recoverable; before this existed, scattering panels was permanent.
-    SubmitDockspace(state.RequestLayoutReset, StatusBarHeight());
+    // The menu bar goes first: it is the strip whose height everything else is offset by, and ImGui only knows a
+    // window's submitted size after it has been drawn — measuring before Begin-ing it returns null.
+    DrawMenuBar(state, context);
+
+    // Both strips sit above the dock area, so the inset is their sum. Measured (not assumed) because the menu bar's
+    // height is not GetFrameHeight(): passing only one of them left the toolbar painted over the top panel row, which
+    // showed up as an outliner whose first rows could not be clicked.
+    SubmitDockspace(state.RequestLayoutReset, StatusBarHeight(), MeasureChrome(ToolbarHeight()).DockTopInset);
     state.RequestLayoutReset = false;
 
-    DrawMenuBar(state, context);
+    DrawMainToolBar(state, context);
 
     // Order matters only for focus/stacking: the viewport first so it is the default focus target (and therefore gets
     // keyboard input) when nothing else was clicked.

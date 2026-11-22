@@ -451,6 +451,11 @@ bool EditorApplication::Start()
         m_ActiveScenePath = m_Config.ScenePath;
     }
 
+    // --play seeds the initial play state; from here the toolbar owns it (SetScriptsPlaying). Seeded *before* the
+    // hosted loop starts so no frame can observe a default that contradicts the command line, and read once rather than
+    // polled from the config so a mid-session toggle has one obvious owner.
+    m_ScriptsPlaying = m_Config.PlayModeScripts;
+
     m_Application = std::make_unique<RuntimeApplication>(std::move(runtime));
     m_Application->SetEditorHost(this);
     m_AttachedHost = true;
@@ -524,6 +529,19 @@ bool EditorApplication::Start()
         HP_LOG_WARNING(kLogChannel, "content browser disabled: \"{}\" is not a usable project directory",
                        projectRoot.string());
     }
+
+    // Icons load after the content root because the project directory is where a project would override the built-in
+    // atlas. Failure is a warning inside Load, not an error here: every panel still works with text labels, and a
+    // missing cosmetic asset must not look like a broken engine in the log.
+    std::string iconError;
+    if (!m_Icons.Load(*m_Application->GetDevice(), *m_Ui, projectRoot.string(), {}, &iconError))
+    {
+        HP_LOG_DEBUG(kLogChannel, "icons unavailable: {}", iconError);
+    }
+
+    // --play seeds the initial play state; from here the toolbar owns it. Read once rather than polled from the config
+    // so a mid-session toggle has one obvious owner and the config stays a startup description, not live state.
+    m_ScriptsPlaying = m_Config.PlayModeScripts;
 
     RegisterEditorCommands(m_State->Console, *m_State, *this);
     m_State->AddLog("Hollowpoint editor — type `help` for commands.");
@@ -1073,10 +1091,10 @@ bool EditorApplication::GetCameraOverride(CameraState& outCamera) const
 
 bool EditorApplication::AreScriptsPaused() const
 {
-    // Edit mode is the only mode implemented, and it pauses gameplay scripts: they move things the author is placing.
-    // "Play" (scripts running with the editor attached) is written up in notes/EDITOR.md §2 rather than half-built — a
-    // button that resumes script ticks without pausing physics/undo semantics would be worse than no button.
-    return !m_Config.PlayModeScripts;
+    // Edit mode pauses gameplay scripts: they move things the author is placing. The toolbar can resume them (see
+    // SetScriptsPlaying), which is a script-tick toggle and nothing more — no PIE snapshot, no undo boundary
+    // (notes/EDITOR.md §2) — so the control that exposes it says "scripts" rather than implying a play session.
+    return !m_ScriptsPlaying;
 }
 
 bool EditorApplication::RenderScenePass(const FrameContext& context)
@@ -1229,6 +1247,8 @@ bool EditorApplication::RenderScenePass(const FrameContext& context)
     panelContext.Application = this;
     panelContext.Console = &m_State->Console;
     panelContext.ViewportTextureId = m_ViewportTextureId;
+    panelContext.Icons = &m_Icons;
+    panelContext.ScriptsPlaying = AreScriptsPlaying();
     panelContext.RenderedWidth = static_cast<float>(m_ViewportWidth);
     panelContext.RenderedHeight = static_cast<float>(m_ViewportHeight);
     panelContext.FrameCount = context.FrameIndex;

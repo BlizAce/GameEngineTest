@@ -9,6 +9,7 @@
 #include "Hollowpoint/Core/RefCounted.h"
 #include "Hollowpoint/Core/Types.h"
 #include "Hollowpoint/ECS/Entity.h"
+#include "Hollowpoint/Editor/EditorIcons.h"
 #include "Hollowpoint/Editor/EditorPanels.h"
 #include "Hollowpoint/Graphics/GraphicsApi.h"
 #include "Hollowpoint/Math/MathCore.h"
@@ -301,6 +302,23 @@ public:
     bool ConsumeInputEvent(const Platform::InputEvent& event) override;
     bool GetCameraOverride(Renderer::CameraState& outCamera) const override;
     bool AreScriptsPaused() const override;
+
+    //! True when gameplay scripts are ticking (the toolbar's Play state). Edit mode — the default — has them stopped.
+    [[nodiscard]] HP_EDITOR_API bool AreScriptsPlaying() const noexcept
+    {
+        return m_ScriptsPlaying;
+    }
+
+    //! Starts or stops the script tick, which is what the toolbar's Play/Pause buttons do.
+    /**
+     * Honest about its scope: this resumes Lua, nothing else. There is no PIE session — no snapshot of the world to
+     * restore on Stop, no undo boundary (notes/EDITOR.md §2). A control that implied either would be worse than
+     * absent, so the button's tooltip and the status bar both say "scripts", and Stop leaves the world mutated.
+     */
+    HP_EDITOR_API void SetScriptsPlaying(bool playing) noexcept
+    {
+        m_ScriptsPlaying = playing;
+    }
     bool RenderScenePass(const Runtime::FrameContext& context) override;
     void OnResize(UInt32 framebufferWidth, UInt32 framebufferHeight) override;
 
@@ -332,9 +350,17 @@ private:
     //  merely unlikely.
     bool m_AttachedHost = false;
 
+    //! Runtime mirror of EditorConfig::PlayModeScripts, changed by the toolbar's Play/Pause (see SetScriptsPlaying).
+    //  Seeded from the config in Start() so --play still means "start playing".
+    bool m_ScriptsPlaying = false;
+
     ImGuiContext* m_ImGuiContext = nullptr;  //!< Owned; released with ImGui::DestroyContext here.
 
     Ref<class UiRenderer> m_Ui;
+
+    //! The editor's glyph atlas (toolbar/panel/row icons). Empty-but-valid when the asset is missing: panels then draw
+    //  text labels alone, which is reported once at startup rather than per frame.
+    EditorIconSet m_Icons;
 
     std::unique_ptr<UiState> m_State;
 

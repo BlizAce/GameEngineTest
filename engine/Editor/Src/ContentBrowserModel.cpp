@@ -102,7 +102,8 @@ bool ContentBrowserModel::Refresh(const std::filesystem::path& relativePath, std
         {
             *outError = "content browser has no root set";
         }
-        HP_LOG_ERROR("EDITOR", "%s", outError != nullptr ? outError->c_str() : "no root");
+        // {} not %s: HP_LOG_* formats with std::format, so "%s" is literal text and the real message was never printed.
+        HP_LOG_ERROR("EDITOR", "{}", outError != nullptr ? *outError : "no root");
         return false;
     }
 

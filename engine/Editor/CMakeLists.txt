@@ -31,6 +31,7 @@ target_sources(HollowpointEditor PRIVATE
     Include/Hollowpoint/Editor/EditorApplication.h
     Include/Hollowpoint/Editor/EditorPanels.h
     Include/Hollowpoint/Editor/EditorConsole.h
+    Include/Hollowpoint/Editor/EditorIcons.h
     Include/Hollowpoint/Editor/EditorInput.h
     Include/Hollowpoint/Editor/EditorSelection.h
     Include/Hollowpoint/Editor/EditorStyle.h
@@ -43,6 +44,8 @@ target_sources(HollowpointEditor PRIVATE
     Src/EditorApplication.cpp
     Src/EditorPanels.cpp
     Src/EditorConsole.cpp
+    Src/EditorIconTable.inl
+    Src/EditorIcons.cpp
     Src/EditorInput.cpp
     Src/EditorSelection.cpp
     Src/EditorStyle.cpp
@@ -64,7 +67,11 @@ target_link_libraries(HollowpointEditor PUBLIC
     Hollowpoint::Renderer
     Hollowpoint::Game
     Hollowpoint::Runtime
-    Hollowpoint::CompilerSetup)
+    Hollowpoint::CompilerSetup
+    # stb_image decodes the icon atlas PNG (see Src/EditorIcons.cpp). Runtime already links hp_stb publicly for
+    # stb_image_write, but naming it here keeps the dependency explicit: if Runtime ever stops using stb, the editor's
+    # decoder must not silently lose its include path.
+    hp_stb)
 
 # ImGui is fetched only with the editor and Vulkan both on (see third_party/CMakeLists.txt), and this module's UI code
 # assumes it — so the target is a hard dependency here rather than an optional one with #ifdefs scattered through the

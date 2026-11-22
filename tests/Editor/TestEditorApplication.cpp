@@ -239,10 +239,10 @@ using Platform::PlatformScope;
 
 //! The panel titles the default layout docks, matching the constants in EditorPanels.cpp.
 constexpr const char* kViewportTitle = "Viewport";
-constexpr const char* kOutlinerTitle = "Outliner";
+constexpr const char* kOutlinerTitle = "World Outliner";
 constexpr const char* kDetailsTitle = "Details";
 constexpr const char* kContentTitle = "Content Browser";
-constexpr const char* kConsoleTitle = "Console";
+constexpr const char* kConsoleTitle = "Output Log";
 
 }  // namespace
 

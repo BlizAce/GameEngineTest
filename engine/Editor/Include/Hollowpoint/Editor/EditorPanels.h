@@ -38,6 +38,7 @@ using ECS::Entity;
 
 class EditorApplication;
 class EditorConsole;
+class EditorIconSet;
 
 //! What the viewport panel observed this frame, and what it is asking the application to do.
 /**
@@ -197,6 +198,17 @@ struct HP_EDITOR_API PanelContext
 
     //! ImGui texture id for the viewport image, or 0 before the first composed frame.
     UInt64 ViewportTextureId = 0;
+
+    //! The editor's icon atlas, or null when it failed to load (or this frame is a headless test with no device).
+    /**
+     * Borrowed; owned by EditorApplication and valid for the frame. Panels must treat null and unloaded identically —
+     * draw the text label alone — because that is the difference between "no icons today" and drawing someone else's
+     * glyph, which is the failure a user cannot diagnose.
+     */
+    const EditorIconSet* Icons = nullptr;  //!< not owned
+
+    //! Whether gameplay scripts are ticking this frame; drives the toolbar's Play/Pause glyph and the status bar.
+    bool ScriptsPlaying = false;
 
     //! Extent the scene was actually rendered at, in pixels. Reported (status bar, `viewport.info`) against the size
     //  the image is drawn at, so a mismatch — the bug class this whole panel exists to make visible — is legible:

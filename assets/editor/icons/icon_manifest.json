@@ -1,0 +1,444 @@
+{
+  "atlas": {
+    "width": 512,
+    "height": 512,
+    "cell": 32,
+    "cols": 16,
+    "rows": 16
+  },
+  "cell": 32,
+  "icons": [
+    {
+      "name": "new_level",
+      "index": 0,
+      "col": 0,
+      "row": 0,
+      "x": 0,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "open",
+      "index": 1,
+      "col": 1,
+      "row": 0,
+      "x": 32,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "save",
+      "index": 2,
+      "col": 2,
+      "row": 0,
+      "x": 64,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "save_all",
+      "index": 3,
+      "col": 3,
+      "row": 0,
+      "x": 96,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "save_as",
+      "index": 4,
+      "col": 4,
+      "row": 0,
+      "x": 128,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "cut",
+      "index": 5,
+      "col": 5,
+      "row": 0,
+      "x": 160,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "copy",
+      "index": 6,
+      "col": 6,
+      "row": 0,
+      "x": 192,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "paste",
+      "index": 7,
+      "col": 7,
+      "row": 0,
+      "x": 224,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "undo",
+      "index": 8,
+      "col": 8,
+      "row": 0,
+      "x": 256,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "redo",
+      "index": 9,
+      "col": 9,
+      "row": 0,
+      "x": 288,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "search",
+      "index": 10,
+      "col": 10,
+      "row": 0,
+      "x": 320,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "settings",
+      "index": 11,
+      "col": 11,
+      "row": 0,
+      "x": 352,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "play",
+      "index": 12,
+      "col": 12,
+      "row": 0,
+      "x": 384,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "pause",
+      "index": 13,
+      "col": 13,
+      "row": 0,
+      "x": 416,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "stop",
+      "index": 14,
+      "col": 14,
+      "row": 0,
+      "x": 448,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "step_frame",
+      "index": 15,
+      "col": 15,
+      "row": 0,
+      "x": 480,
+      "y": 0,
+      "size": 32
+    },
+    {
+      "name": "panel_outliner",
+      "index": 16,
+      "col": 0,
+      "row": 1,
+      "x": 0,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "panel_details",
+      "index": 17,
+      "col": 1,
+      "row": 1,
+      "x": 32,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "panel_content",
+      "index": 18,
+      "col": 2,
+      "row": 1,
+      "x": 64,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "panel_output_log",
+      "index": 19,
+      "col": 3,
+      "row": 1,
+      "x": 96,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "panel_placer",
+      "index": 20,
+      "col": 4,
+      "row": 1,
+      "x": 128,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "actor_empty",
+      "index": 21,
+      "col": 5,
+      "row": 1,
+      "x": 160,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "actor_cube",
+      "index": 22,
+      "col": 6,
+      "row": 1,
+      "x": 192,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "actor_light",
+      "index": 23,
+      "col": 7,
+      "row": 1,
+      "x": 224,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "actor_camera",
+      "index": 24,
+      "col": 8,
+      "row": 1,
+      "x": 256,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "actor_script",
+      "index": 25,
+      "col": 9,
+      "row": 1,
+      "x": 288,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "group_folder",
+      "index": 26,
+      "col": 10,
+      "row": 1,
+      "x": 320,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "eye_open",
+      "index": 27,
+      "col": 11,
+      "row": 1,
+      "x": 352,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "eye_closed",
+      "index": 28,
+      "col": 12,
+      "row": 1,
+      "x": 384,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "asset_scene",
+      "index": 29,
+      "col": 13,
+      "row": 1,
+      "x": 416,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "asset_script",
+      "index": 30,
+      "col": 14,
+      "row": 1,
+      "x": 448,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "asset_mesh",
+      "index": 31,
+      "col": 15,
+      "row": 1,
+      "x": 480,
+      "y": 32,
+      "size": 32
+    },
+    {
+      "name": "asset_texture",
+      "index": 32,
+      "col": 0,
+      "row": 2,
+      "x": 0,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "asset_generic",
+      "index": 33,
+      "col": 1,
+      "row": 2,
+      "x": 32,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "view_lit",
+      "index": 34,
+      "col": 2,
+      "row": 2,
+      "x": 64,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "view_unlit",
+      "index": 35,
+      "col": 3,
+      "row": 2,
+      "x": 96,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "view_wireframe",
+      "index": 36,
+      "col": 4,
+      "row": 2,
+      "x": 128,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "view_show",
+      "index": 37,
+      "col": 5,
+      "row": 2,
+      "x": 160,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "camera_speed",
+      "index": 38,
+      "col": 6,
+      "row": 2,
+      "x": 192,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "view_game",
+      "index": 39,
+      "col": 7,
+      "row": 2,
+      "x": 224,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "view_immersive",
+      "index": 40,
+      "col": 8,
+      "row": 2,
+      "x": 256,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "view_bookmark",
+      "index": 41,
+      "col": 9,
+      "row": 2,
+      "x": 288,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "window_icon",
+      "index": 42,
+      "col": 10,
+      "row": 2,
+      "x": 320,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "chevron_down",
+      "index": 43,
+      "col": 11,
+      "row": 2,
+      "x": 352,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "chevron_right",
+      "index": 44,
+      "col": 12,
+      "row": 2,
+      "x": 384,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "close_x",
+      "index": 45,
+      "col": 13,
+      "row": 2,
+      "x": 416,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "reset_arrow",
+      "index": 46,
+      "col": 14,
+      "row": 2,
+      "x": 448,
+      "y": 64,
+      "size": 32
+    },
+    {
+      "name": "link_broken",
+      "index": 47,
+      "col": 15,
+      "row": 2,
+      "x": 480,
+      "y": 64,
+      "size": 32
+    }
+  ]
+}

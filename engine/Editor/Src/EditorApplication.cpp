@@ -529,6 +529,18 @@ bool EditorApplication::Start()
         HP_LOG_WARNING(kLogChannel, "content browser disabled: \"{}\" is not a usable project directory",
                        projectRoot.string());
     }
+    else
+    {
+        // SetRoot deliberately leaves the listing empty (it is a cheap setter, and its tests assert that), so the panel
+        // has to be told to read the folder — otherwise the Content Browser opens showing an empty project until someone
+        // happens to run `content.list` or navigate somewhere. An editor whose file panel is blank on launch reads as
+        // "this project has no assets", which is a lie about the user's work.
+        std::string listError;
+        if (!m_State->Content.Refresh(std::filesystem::path{}, &listError))
+        {
+            HP_LOG_WARNING(kLogChannel, "content browser could not list the project root: {}", listError);
+        }
+    }
 
     // Icons load after the content root because the project directory is where a project would override the built-in
     // atlas. Failure is a warning inside Load, not an error here: every panel still works with text labels, and a

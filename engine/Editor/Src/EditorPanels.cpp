@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -1267,6 +1268,54 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
     ImGui::End();
 }
 
+namespace
+{
+
+//! Content Browser glyph for an entry, chosen from its extension.
+/**
+ * Extension, not IsEngineAsset: the atlas distinguishes scene / script / mesh / texture, and those are the categories
+ * someone scans a folder for. Anything unrecognised gets the generic document rather than nothing, so rows stay aligned
+ * and an unfamiliar file still reads as "a file here" instead of a gap.
+ */
+[[nodiscard]] const char* ContentIconFor(const ContentEntry& entry)
+{
+    if (entry.IsDirectory)
+    {
+        return "group_folder";
+    }
+
+    const std::size_t dot = entry.Name.rfind('.');
+    if (dot == std::string::npos)
+    {
+        return "asset_generic";
+    }
+
+    std::string extension = entry.Name.substr(dot + 1);
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (extension == "hpscene")
+    {
+        return "asset_scene";
+    }
+    if (extension == "lua")
+    {
+        return "asset_script";
+    }
+    if (extension == "glb" || extension == "gltf" || extension == "obj" || extension == "fbx")
+    {
+        return "asset_mesh";
+    }
+    if (extension == "png" || extension == "jpg" || extension == "jpeg" || extension == "tga" || extension == "hdr"
+        || extension == "exr" || extension == "xcf")
+    {
+        return "asset_texture";
+    }
+    return "asset_generic";
+}
+
+}  // namespace
+
 void DrawContentPanel(UiState& state, const PanelContext& context)
 {
     if (!state.ShowContent)
@@ -1344,6 +1393,12 @@ void DrawContentPanel(UiState& state, const PanelContext& context)
             ImGui::TableNextColumn();
             const bool selected = entry.Name == state.SelectedContentName;
             const std::string rowLabel = entry.Name + "##file" + std::to_string(index);
+            // Icon then name, like the outliner: scanning a folder is a shape-matching task, and an all-text column
+            // forces reading every extension to know what a file is.
+            if (DrawIcon(context.Icons, ContentIconFor(entry), IconSizeForScale(state.UiScale, 14.0f)))
+            {
+                ImGui::SameLine();
+            }
             if (ImGui::Selectable(rowLabel.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns))
             {
                 // Single click selects by *name*: a refresh re-sorts the list, so an index would highlight a different

@@ -112,10 +112,10 @@ bool ContentBrowserModel::Refresh(const std::filesystem::path& relativePath, std
     {
         if (outError != nullptr)
         {
-            *outError =
-                ""
-                " + relativePath.string() + "
-                " is not a path inside the project root";
+            // Was written as `"" + relativePath.string() + " is not..."` across concatenated literals, which produced
+            // the literal text ` + relativePath.string() +  is not a path inside the project root` — the actual path was
+            // never in the message someone debugging a rejected navigation needs to see.
+            *outError = "\"" + relativePath.string() + "\" is not a path inside the project root";
         }
         return false;
     }
@@ -133,7 +133,7 @@ bool ContentBrowserModel::Refresh(const std::filesystem::path& relativePath, std
         {
             *outError = "cannot list \"" + target.string() + "\": " + error.message();
         }
-        HP_LOG_ERROR("EDITOR", "%s", outError != nullptr ? outError->c_str() : "list failed");
+        HP_LOG_ERROR("EDITOR", "{}", outError != nullptr ? *outError : "list failed");
         return false;
     }
 

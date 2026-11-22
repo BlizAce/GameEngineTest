@@ -9,6 +9,35 @@
 #include "Hollowpoint/Core/Log.h"
 #include "Hollowpoint/Platform/Window.h"
 
+// ---------------------------------------------------------------------------
+// Per-backend window-handle accessors (glfwGetX11Window, glfwGetWaylandWindow, ...).
+//
+// glfw3native.h is deliberately absent from GlfwInclude.h — it drags in <X11/Xlib.h> and <wayland-client.h>, whose
+// macros (None, Status, Bool, ...) leak into every engine file that includes GLFW. GetNativeHandle() below is the one
+// function in the engine that needs those accessors, so the header belongs here, in this translation unit, and only when
+// CMake confirmed the platform headers exist (HP_PLATFORM_HAS_NATIVE_HEADERS; see Platform/CMakeLists.txt). Without this
+// include the gated calls inside GetNativeHandle compile against no declaration — which is exactly what happened on any
+// machine that *does* carry the X11/Wayland headers, since the probe then enables a branch nothing declares.
+// ---------------------------------------------------------------------------
+#if defined(HP_PLATFORM_HAS_NATIVE_HEADERS)
+    #if defined(__clang__)
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wold-style-cast"
+        #pragma clang diagnostic ignored "-Wreserved-identifier"
+        #pragma clang diagnostic ignored "-Wpedantic"
+    #elif defined(__GNUC__)
+        #pragma GCC diagnostic push
+        #pragma GCC diagnostic ignored "-Wold-style-cast"
+        #pragma GCC diagnostic ignored "-Wpedantic"
+    #endif
+
+#include <GLFW/glfw3native.h>
+
+    #if defined(__clang__) || defined(__GNUC__)
+        #pragma GCC diagnostic pop
+    #endif
+#endif
+
 namespace Hollowpoint::Platform
 {
 

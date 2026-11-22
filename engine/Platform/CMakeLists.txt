@@ -39,10 +39,17 @@ if(NOT WIN32 AND NOT APPLE)
         message(STATUS "Hollowpoint Platform: Wayland native handles enabled")
     endif()
 
+    # X11 needs the whole header *set*, not just Xlib.h: glfw3native.h's X11 section includes <X11/Xlib.h>, which in
+    # turn includes <X11/X.h>, and a machine can ship part of that set (a runtime package dropping headers, or another
+    # package installing Xlib.h alone) — as this one does. Probing for Xlib.h alone enabled GLFW_EXPOSE_NATIVE_X11 on a
+    # tree that cannot compile it, so the build died inside the system header instead of disabling the accessor.
     find_file(HP_X11_XLIB_HEADER X11/Xlib.h)
-    if(HP_X11_XLIB_HEADER)
+    find_file(HP_X11_X_HEADER X11/X.h)
+    if(HP_X11_XLIB_HEADER AND HP_X11_X_HEADER)
         list(APPEND _hp_native_defs GLFW_EXPOSE_NATIVE_X11=1)
         message(STATUS "Hollowpoint Platform: X11 native handles enabled")
+    else()
+        message(STATUS "Hollowpoint Platform: X11 native handles disabled (X11/Xlib.h or X11/X.h not installed)")
     endif()
 elseif(WIN32)
     list(APPEND _hp_native_defs GLFW_EXPOSE_NATIVE_WIN32=1)

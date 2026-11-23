@@ -181,6 +181,33 @@ public:
     //! Destroys every selected entity and clears the selection.
     void DestroySelected();
 
+    // --- editor visibility ---------------------------------------------------------
+    // The outliner's eye widget calls these. Keeping the rule for *which* component carries visibility here, rather
+    // than in the panel, is what stops the two from drifting: a panel that guessed would draw an eye on rows where
+    // clicking does nothing, which is worse than no eye at all.
+    //
+    // No console twin by design: `entity.set MeshRenderer.visible <bool>` already writes this field through
+    // reflection, and a second command writing it directly would be two implementations of one action — the divergence
+    // this file's editing operations exist to prevent. Both routes land on the same bool, so neither can disagree.
+    //
+    // Visibility is MeshRenderer::Visible only — deliberately not LightComponent::Active or CameraComponent::Active.
+    // Those are serialised gameplay state ("this light is off in the game"), whereas hiding something while placing it
+    // must not change what a saved scene means.
+
+    //! True when the entity has something that can be hidden (a MeshRenderer). False rows get no eye affordance.
+    [[nodiscard]] bool HasEditorVisibility(const Entity& entity) const noexcept;
+
+    //! Current editor visibility of an entity; false when it is dead or has no visibility to report.
+    [[nodiscard]] bool IsEntityVisible(const Entity& entity) const noexcept;
+
+    //! Sets editor visibility on one entity. Returns false when the entity is dead or has nothing hideable — so a
+    //  widget never reports success for a click that changed nothing.
+    bool SetEntityVisible(const Entity& entity, bool visible);
+
+    //! Sets editor visibility on every selected entity that has any. Returns the number changed, so a caller can tell
+    //  "nothing was hideable" (0) from "I hid one thing" (1) instead of guessing.
+    Size SetSelectedVisible(bool visible);
+
     bool LoadProjectScene(const std::string& path);
     bool SaveProjectScene(const std::string& path);
     [[nodiscard]] const std::string& GetScenePath() const noexcept

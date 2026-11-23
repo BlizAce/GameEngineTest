@@ -750,6 +750,66 @@ void EditorApplication::DestroySelected()
     m_State->Selection.Clear();
 }
 
+bool EditorApplication::HasEditorVisibility(const Entity& entity) const noexcept
+{
+    if (m_Application == nullptr || entity.IsNull())
+    {
+        return false;
+    }
+    World& world = m_Application->GetWorld();
+    return world.IsAlive(entity) && world.TryGetComponent<Game::MeshRenderer>(entity) != nullptr;
+}
+
+bool EditorApplication::IsEntityVisible(const Entity& entity) const noexcept
+{
+    if (m_Application == nullptr || entity.IsNull())
+    {
+        return false;
+    }
+    World& world = m_Application->GetWorld();
+    if (!world.IsAlive(entity))
+    {
+        return false;
+    }
+    const Game::MeshRenderer* renderer = world.TryGetComponent<Game::MeshRenderer>(entity);
+    // No renderer means nothing here can be hidden — reported as visible so a row that shows no eye is never drawn
+    // looking like a hidden thing (which reads as "the object vanished", not "this object has no visibility").
+    return renderer == nullptr || renderer->Visible;
+}
+
+bool EditorApplication::SetEntityVisible(const Entity& entity, bool visible)
+{
+    if (!HasEditorVisibility(entity))
+    {
+        return false;
+    }
+    Game::MeshRenderer* renderer = m_Application->GetWorld().TryGetComponent<Game::MeshRenderer>(entity);
+    if (renderer == nullptr)  // HasEditorVisibility just said otherwise; only a re-entrant world change could differ
+    {
+        return false;
+    }
+    renderer->Visible = visible;
+    return true;
+}
+
+Size EditorApplication::SetSelectedVisible(bool visible)
+{
+    if (m_Application == nullptr || m_State == nullptr)
+    {
+        return 0;
+    }
+
+    Size changed = 0;
+    for (const Entity& entity : m_State->Selection.GetEntities())
+    {
+        if (SetEntityVisible(entity, visible))
+        {
+            ++changed;
+        }
+    }
+    return changed;
+}
+
 bool EditorApplication::LoadProjectScene(const std::string& path)
 {
     if (m_Application == nullptr)

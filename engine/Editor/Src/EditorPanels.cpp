@@ -216,6 +216,45 @@ bool IconButton(const EditorIconSet* icons, const char* name, const char* id, co
     return clicked;
 }
 
+//! A bare icon that acts as a button: glyph only, no frame. Used by the outliner's eye, where UE draws no button
+//! chrome and a framed control would read as decoration rather than a toggle.
+/**
+ * InvisibleButton rather than Button so nothing but the glyph is drawn; the hit target is still a real item with an id,
+ * so it cannot be confused with the row's selectable — the eye lives in its own table column, which gives each of them
+ * a separate rect and makes "click the eye" and "select the row" mutually exclusive by construction.
+ *
+ * With no atlas loaded the button stays clickable but shows ASCII instead of a glyph: an affordance that is invisible is
+ * indistinguishable from one that is missing, and "the eye does nothing" is a bug report nobody can act on.
+ */
+bool IconToggleButton(const EditorIconSet* icons, const char* name, const char* id, const char* tooltip, float size,
+                      const char* fallbackText = nullptr)
+{
+    const ImVec2 square(size, size);
+    const bool clicked = ImGui::InvisibleButton(id, square);
+    const bool hovered = ImGui::IsItemHovered();
+    if (tooltip != nullptr && tooltip[0] != '\0' && hovered)
+    {
+        ImGui::SetItemTooltip("%s", tooltip);
+    }
+
+    const ImVec2 min = ImGui::GetItemRectMin();
+    IconUvRect uv;
+    if (IconsAvailable(icons) && icons->Find(name, uv))
+    {
+        const ImU32 tint = ImGui::GetColorU32(hovered ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+        ImGui::GetWindowDrawList()->AddImage(ImTextureRef{static_cast<ImTextureID>(icons->GetTextureId())}, min,
+                                             ImVec2(min.x + size, min.y + size), ImVec2(uv.U0, uv.V0),
+                                             ImVec2(uv.U1, uv.V1), tint);
+    }
+    else if (fallbackText != nullptr)
+    {
+        ImGui::GetWindowDrawList()->AddText(min, ImGui::GetColorU32(ImGuiCol_Text), fallbackText);
+    }
+
+    ImGui::SameLine();
+    return clicked;
+}
+
 // ---------------------------------------------------------------------------
 // Dock layout
 // ---------------------------------------------------------------------------
@@ -263,6 +302,20 @@ constexpr float kContentShareOfBottom = 0.34f;
 [[nodiscard]] float ToolbarHeight()
 {
     return ImGui::GetFrameHeight() + 6.0f;
+}
+
+//! Minimum window size for the docked strips, overriding the theme's WindowMinSize for them only.
+/**
+ * The theme sets a generous WindowMinSize so a docked panel cannot be squeezed to nothing — right for panels, wrong for
+ * fixed-height strips. ImGui clamps a requested window size up to that minimum, so a 29px toolbar asked for 29 and got
+ * 140: an opaque strip painted over the top ~110px of every panel below it. The symptom was a World Outliner that
+ * reported real geometry and draw commands while showing nothing but its background — everything above its first
+ * covered row was hidden, so one theme value made three panels look broken at once (measured: toolbar 1600x140 with the
+ * dockspace host starting at y=52). Each strip passes this instead, so it can actually be as short as it asks.
+ */
+[[nodiscard]] ImVec2 StripMinSize(float height)
+{
+    return ImVec2(0.0f, height);
 }
 
 //! Where the dock area and toolbar begin: directly below the main menu bar, measured from the menu bar itself.
@@ -941,7 +994,11 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
         return;
     }
 
-    ImGui::Begin(kOutlinerTitle, &state.ShowOutliner);
+    if (!ImGui::Begin(kOutlinerTitle, &state.ShowOutliner))
+    {
+        ImGui::End();
+        return;
+    }
 
     // Toolbar first: the actions are what an author reaches for constantly, and hiding them below the list (as before)
     // meant scrolling to create an entity in a long scene.
@@ -989,6 +1046,8 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
         Entity Handle;
         std::string Label;
         const char* Icon = "actor_empty";  //!< atlas glyph for this row's type
+        bool Hideable = false;             //!< has something an eye can toggle (a MeshRenderer)
+        bool Visible = true;               //!< current editor visibility
     };
     std::vector<Row> rows;
 
@@ -1002,18 +1061,26 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
         std::string label = FormatEntityLabel(*context.SceneWorld, entity);
         if (ContainsIgnoreCase(label, state.OutlinerFilter))
         {
-            rows.push_back(Row{entity, std::move(label), OutlinerIconFor(*context.SceneWorld, entity)});
+            Row row{entity, std::move(label), OutlinerIconFor(*context.SceneWorld, entity)};
+            // Visibility is read here, during the gather, rather than while widgets are live: it comes from the same
+            // component lookup as the icon, so the row's glyph and its eye can never disagree about what they describe.
+            const Game::MeshRenderer* renderer = context.SceneWorld->TryGetComponent<Game::MeshRenderer>(entity);
+            row.Hideable = renderer != nullptr;
+            row.Visible = renderer == nullptr || renderer->Visible;
+            rows.push_back(std::move(row));
         }
     });
 
-    // A single Name column: the slot number the old panel showed is an implementation detail no author reads, and it
-    // took a third of the panel's width. Slots remain available in `entity.inspect` and the status bar.
-    if (ImGui::BeginTable("entities", 1,
+    // Name column stretches, the visibility column is a fixed strip. Two columns rather than drawing the eye over the
+    // name (the usual ImGui overlap dance) because a real column gives the affordance its own hit rect: clicking the
+    // eye cannot also select the row, and clicking the row cannot ever toggle visibility by accident.
+    if (ImGui::BeginTable("entities", 2,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY
                               | ImGuiTableFlags_Resizable))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Name");
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, IconSizeForScale(state.UiScale, 24.0f));
         ImGui::TableHeadersRow();
 
         for (const Row& row : rows)
@@ -1025,7 +1092,7 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
                           static_cast<unsigned long long>(row.Handle.Slot));
 
             ImGui::TableNextColumn();
-            // Icon then name, with the selectable spanning both: clicking anywhere on the row selects. The glyph is
+            // Icon then name, with the selectable spanning the column: clicking anywhere on it selects. The glyph is
             // drawn as part of the row (not in its own column) so a narrow panel still shows the whole label.
             const float iconSize = IconSizeForScale(state.UiScale, 14.0f);
             if (DrawIcon(context.Icons, row.Icon, iconSize))
@@ -1034,7 +1101,7 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
             }
             // Click selects, Ctrl+click toggles — the behaviour every outliner has, and both routes go through
             // EditorSelection so the viewport, the console and this list can never disagree about what is selected.
-            if (ImGui::Selectable(label, state.Selection.IsSelected(row.Handle), ImGuiSelectableFlags_SpanAllColumns))
+            if (ImGui::Selectable(label, state.Selection.IsSelected(row.Handle)))
             {
                 if (ImGui::GetIO().KeyCtrl)
                 {
@@ -1044,6 +1111,25 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
                 {
                     state.Selection.Select(row.Handle);
                 }
+            }
+
+            ImGui::TableNextColumn();
+            if (row.Hideable)
+            {
+                // The eye is the only per-row action, so it gets a tooltip rather than a label. Clicking it writes
+                // MeshRenderer::Visible through EditorApplication — the same field `entity.set` writes and the same
+                // field the renderer honours when collecting draws, so the glyph, the console and the viewport cannot
+                // drift apart.
+                ImGui::PushID(static_cast<unsigned long long>(row.Handle.Slot));
+                const float eyeSize = IconSizeForScale(state.UiScale, 14.0f);
+                if (IconToggleButton(context.Icons, row.Visible ? "eye_open" : "eye_closed", "##vis",
+                                     row.Visible ? "Hide (click to make invisible in the viewport)"
+                                                 : "Show (currently hidden)",
+                                     eyeSize, row.Visible ? "*" : "-"))
+                {
+                    context.Application->SetEntityVisible(row.Handle, !row.Visible);
+                }
+                ImGui::PopID();
             }
         }
 
@@ -1711,10 +1797,15 @@ void DrawMainToolBar(UiState& state, const PanelContext& context)
     // plausible ways of computing this (WorkPos.y alone, or WorkPos.y + GetFrameHeight()) were wrong here in different
     // directions.
     const ChromeStrips strips = MeasureChrome(height);
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, strips.BelowMenuBar));
-    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, height));
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, strips.BelowMenuBar), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, height), ImGuiCond_Always);
+    // WindowMinSize is pushed down because the theme's value (sized for docked panels) would otherwise raise this
+    // strip to 140px and paint it over the first ~110px of every panel below it — which is exactly what made the World
+    // Outliner look empty: its window was fine, its first rows were covered by an opaque toolbar. A fixed-height strip
+    // must be allowed to be that height.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * state.UiScale, 3.0f * state.UiScale));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * state.UiScale, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, StripMinSize(height));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::GetStyle().Colors[ImGuiCol_MenuBarBg]);
 
     if (ImGui::Begin("##MainToolBar", nullptr,
@@ -1798,7 +1889,7 @@ void DrawMainToolBar(UiState& state, const PanelContext& context)
 
     ImGui::End();
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleVar(3);
 }
 
 void DrawMenuBar(UiState& state, const PanelContext& context)
@@ -1910,6 +2001,9 @@ void DrawStatusBar(UiState& state, const PanelContext& context)
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + viewport->WorkSize.y - barHeight));
     ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, barHeight));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * state.UiScale, 2.0f * state.UiScale));
+    // See DrawMainToolBar: the theme's WindowMinSize would raise this strip to 140px and cover the bottom of every
+    // panel it is supposed to sit beside.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, StripMinSize(barHeight));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::GetStyle().Colors[ImGuiCol_MenuBarBg]);
 
     // NoNavFocus: without it a click on the status bar makes it the navigation window, and keyboard input (WASD flight,
@@ -1941,7 +2035,7 @@ void DrawStatusBar(UiState& state, const PanelContext& context)
 
     ImGui::End();
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);  // WindowPadding + WindowMinSize (see above)
 }
 
 std::vector<PanelRect> CollectPanelRectangles()

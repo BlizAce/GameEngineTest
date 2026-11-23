@@ -622,6 +622,190 @@ TEST_SUITE("EditorApplication")
         std::filesystem::remove_all(project);
     }
 
+    TEST_CASE("The outliner's visibility API only touches entities that can be hidden")
+    {
+        SKIP_WITHOUT_DISPLAY();
+
+        const std::filesystem::path project = ScratchPath("visibility");
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+
+        // A mesh entity is hideable; a bare entity is not. This distinction is what keeps the outliner from drawing an
+        // eye on a row where clicking would do nothing.
+        const Entity cube = editor.CreateEntity("Cube", "engine:cube");
+        const Entity bare = editor.CreateEntity("Empty", "");
+        REQUIRE_FALSE(cube.IsNull());
+        REQUIRE_FALSE(bare.IsNull());
+
+        CHECK(editor.HasEditorVisibility(cube));
+        CHECK_FALSE(editor.HasEditorVisibility(bare));
+        CHECK(editor.IsEntityVisible(cube));
+
+        // Hiding writes the same field `entity.set MeshRenderer.visible` writes — one bool, two front doors.
+        CHECK(editor.SetEntityVisible(cube, false));
+        CHECK_FALSE(editor.IsEntityVisible(cube));
+        const Game::MeshRenderer* renderer = editor.GetWorld().TryGetComponent<Game::MeshRenderer>(cube);
+        REQUIRE(renderer != nullptr);
+        CHECK_FALSE(renderer->Visible);
+
+        // Not hideable → reported as a failure rather than silently "succeeding", so the widget cannot light up an eye
+        // that changed nothing.
+        CHECK_FALSE(editor.SetEntityVisible(bare, false));
+        CHECK(editor.IsEntityVisible(bare));
+
+        // Selection-wide form counts what it changed: 1 hideable of 2 selected.
+        editor.GetSelection().Select(cube);
+        editor.GetSelection().AddToSelection(bare);
+        CHECK(editor.SetSelectedVisible(true) == 1u);
+        CHECK(editor.IsEntityVisible(cube));
+
+        // A dead entity answers "not hideable" instead of reading freed memory.
+        editor.GetSelection().Select(cube);
+        editor.DestroySelected();
+        CHECK_FALSE(editor.HasEditorVisibility(cube));
+        CHECK_FALSE(editor.SetEntityVisible(cube, false));
+
+        std::filesystem::remove_all(project);
+    }
+
+    TEST_CASE("Hiding an entity changes the composed viewport frame")
+    {
+        SKIP_WITHOUT_DISPLAY();
+
+        // The end-to-end claim the eye depends on: MeshRenderer::Visible is honoured by collection, so toggling it is
+        // visible rather than a flag nothing reads. Asserted inside the viewport's own rectangle (panel geometry), not
+        // over the whole frame, per this file's note on docked windows.
+        const std::filesystem::path project = ScratchPath("visframe");
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+
+        const Entity cube = editor.CreateEntity("Cube", "engine:cube");
+        REQUIRE_FALSE(cube.IsNull());
+
+        UInt32 width = 0;
+        UInt32 height = 0;
+        static_cast<void>(editor.Frame());
+        static_cast<void>(editor.Frame());  // let the dock layout settle so panel geometry is real
+        const std::vector<unsigned char> shown = Capture(editor, width, height);
+
+        CHECK(editor.SetEntityVisible(cube, false));
+        static_cast<void>(editor.Frame());
+        const std::vector<unsigned char> hidden = Capture(editor, width, height);
+
+        // The whole frame must change (the eye glyph changes too), and the change must include the viewport region.
+        CHECK(DifferenceFraction(shown, hidden) > 0.0f);
+
+        const Editor::PanelRect* viewport = FindPanelRect(editor.GetUiState(), kViewportTitle);
+        REQUIRE(viewport != nullptr);
+        REQUIRE(viewport->Width > 80.0f);
+
+        Size viewportDiffs = 0;
+        const UInt32 x0 = static_cast<UInt32>(viewport->X);
+        const UInt32 y0 = static_cast<UInt32>(viewport->Y);
+        const UInt32 xEnd = std::min(static_cast<UInt32>(viewport->X + viewport->Width), width);
+        const UInt32 yEnd = std::min(static_cast<UInt32>(viewport->Y + viewport->Height), height);
+        for (UInt32 y = y0; y < yEnd; ++y)
+        {
+            for (UInt32 x = x0; x < xEnd; ++x)
+            {
+                const Size base = (static_cast<Size>(y) * width + x) * 4u;
+                if (base + 2u >= hidden.size())
+                {
+                    continue;
+                }
+                const int delta = std::abs(static_cast<int>(shown[base]) - static_cast<int>(hidden[base]))
+                                  + std::abs(static_cast<int>(shown[base + 1]) - static_cast<int>(hidden[base + 1]))
+                                  + std::abs(static_cast<int>(shown[base + 2]) - static_cast<int>(hidden[base + 2]));
+                if (delta > 6)
+                {
+                    ++viewportDiffs;
+                }
+            }
+        }
+        CHECK_MESSAGE(viewportDiffs > 0u, "hiding the mesh left the viewport pixel-identical");
+
+        std::filesystem::remove_all(project);
+    }
+
+    TEST_CASE("Docked panels draw their own content — nothing opaque covers their top rows")
+    {
+        SKIP_WITHOUT_DISPLAY();
+
+        // Regression: the theme's WindowMinSize (260x140, meant to stop a docked panel being squeezed away) also clamps
+        // the toolbar and status bar strips, which ask for ~29px. The toolbar grew to 140 and painted over the top of
+        // every docked panel — the World Outliner then reported real geometry and real draw commands while showing only
+        // its background, so no amount of rectangle-asserting caught it. Asserting on pixels inside the panel is what
+        // sees this class of bug: a covered panel has content and no picture.
+        const std::filesystem::path project = ScratchPath("covered");
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+
+        // Two entities so the outliner's list has rows, and a selection so the Details panel has fields to draw.
+        const Entity cube = editor.CreateEntity("VisibleCubeName", "engine:cube");
+        REQUIRE_FALSE(cube.IsNull());
+
+        UInt32 width = 0;
+        UInt32 height = 0;
+        static_cast<void>(editor.Frame());
+        static_cast<void>(editor.Frame());  // let the dock layout settle so panel rects are real
+        const std::vector<unsigned char> pixels = Capture(editor, width, height);
+
+        struct Band
+        {
+            const char* Title;
+            UInt32 Height;  //!< how far below the panel's title bar to look for its own widgets
+        };
+
+        for (const Band band : {Band{kOutlinerTitle, 120u}, Band{kDetailsTitle, 120u}})
+        {
+            const Editor::PanelRect* rect = FindPanelRect(editor.GetUiState(), band.Title);
+            REQUIRE(rect != nullptr);
+            REQUIRE(rect->Width > 80.0f);
+            REQUIRE(rect->Height > 200.0f);
+
+            // Just inside the panel's content area: its first widget rows live here, and this is the band an oversized
+            // strip covers. Count light pixels (text/widget fill) against the dark panel background.
+            const UInt32 x0 = static_cast<UInt32>(rect->X) + 4u;
+            const UInt32 y0 = static_cast<UInt32>(rect->Y) + 8u;
+            const UInt32 xEnd = std::min(static_cast<UInt32>(rect->X + rect->Width) - 4u, width);
+            const UInt32 yEnd = std::min(y0 + band.Height, static_cast<UInt32>(rect->Y + rect->Height));
+
+            Size light = 0;
+            for (UInt32 y = y0; y < yEnd; ++y)
+            {
+                for (UInt32 x = x0; x < xEnd; ++x)
+                {
+                    const Size base = (static_cast<Size>(y) * width + x) * 4u;
+                    if (base + 2u >= pixels.size())
+                    {
+                        continue;
+                    }
+                    if (pixels[base] > 120u && pixels[base + 1] > 120u && pixels[base + 2] > 120u)
+                    {
+                        ++light;
+                    }
+                }
+            }
+
+            // std::string on purpose: doctest stringifies a `const char*` message operand as 1, which would make the
+            // failure say nothing about which panel regressed.
+            CHECK_MESSAGE(light > 50u, std::string(band.Title)
+                                                  << " shows only " << light
+                                                  << " light px in its top rows — something opaque is covering it");
+        }
+
+        std::filesystem::remove_all(project);
+    }
+
     TEST_CASE("Scene save and load round-trip through the editor's own commands")
     {
         SKIP_WITHOUT_DISPLAY();

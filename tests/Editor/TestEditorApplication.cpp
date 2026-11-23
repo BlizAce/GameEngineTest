@@ -8,7 +8,9 @@
 
 #include <doctest/doctest.h>
 
-#include <imgui.h>  // driving real mouse events at a widget (see the eye-click case)
+#include <imgui.h>       // driving real mouse events at a widget (see the eye-click case)
+#include <imgui_internal.h>  // IsAnyPopupOpen: detecting that a BeginMenu label was clicked, so the test can find the
+                             // menu instead of guessing its pixel position
 
 #include "Hollowpoint/Core/Log.h"
 #include "Hollowpoint/ECS/World.h"
@@ -923,6 +925,113 @@ TEST_SUITE("EditorApplication")
             }
             CHECK(editor.IsEntityVisible(cube));
         }
+
+        std::filesystem::remove_all(project);
+    }
+
+    TEST_CASE("The outliner's Create menu spawns what its items name")
+    {
+        SKIP_WITHOUT_DISPLAY();
+
+        // A dropdown is two interactions, not one: the click must open the menu AND a second click must land on the
+        // item. Asserting only the entity count after a scripted state.Run would pass even if the menu were unreachable,
+        // so this drives real mouse events through both steps and checks the created entity is the one the item names
+        // (a Cube with a mesh), not just "something appeared".
+        const std::filesystem::path project = ScratchPath("createmenu");
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+
+        UInt32 width = 0;
+        UInt32 height = 0;
+        static_cast<void>(editor.Frame());
+        static_cast<void>(editor.Frame());
+        static_cast<void>(Capture(editor, width, height));
+
+        const Editor::PanelRect* found = FindPanelRect(editor.GetUiState(), kOutlinerTitle);
+        REQUIRE(found != nullptr);
+        const Editor::PanelRect panel = *found;  // copy: PanelGeometry is reassigned every frame
+
+        ImGuiContext* context = editor.GetUiContext();
+        REQUIRE(context != nullptr);
+        ImGui::SetCurrentContext(context);
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigDebugIgnoreFocusLoss = true;
+        io.AddFocusEvent(true);
+
+        auto clickAt = [&editor, &io](float x, float y) {
+            io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(x, y);
+            io.AddMouseButtonEvent(0, true);
+            static_cast<void>(editor.Frame());
+            io.AddMouseButtonEvent(0, false);
+            static_cast<void>(editor.Frame());
+        };
+
+        const Size before = editor.GetWorld().GetAliveEntityCount();
+
+        // Step 1: find the point that opens the menu, detected rather than assumed. The exact pixel depends on UI scale,
+        // the docked tab bar's height and the panel's padding, so a hard-coded coordinate would be a guess that breaks
+        // for layout reasons while still proving nothing about clickability. IsAnyPopupOpen is the observable that says
+        // "a BeginMenu label was clicked", which is precisely the interaction under test.
+        float menuX = -1.0f;
+        float menuY = -1.0f;
+        for (int yStep = 0; yStep < 12 && menuX < 0.0f; ++yStep)
+        {
+            for (int xStep = 0; xStep < 6 && menuX < 0.0f; ++xStep)
+            {
+                const float candidateX = panel.X + 10.0f + static_cast<float>(xStep) * 12.0f;
+                const float candidateY = panel.Y + 8.0f + static_cast<float>(yStep) * 6.0f;
+                // Press, observe while held, then release: a menu opened by the press can be dismissed by the release on
+                // the next frame, so checking only after a full click would miss openings that really did happen.
+                io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+                io.AddMousePosEvent(candidateX, candidateY);
+                io.AddMouseButtonEvent(0, true);
+                static_cast<void>(editor.Frame());
+                const bool opened = context->OpenPopupStack.Size > 0;
+                io.AddMouseButtonEvent(0, false);
+                static_cast<void>(editor.Frame());
+                if (opened)
+                {
+                    menuX = candidateX;
+                    menuY = candidateY;
+                }
+            }
+        }
+
+        // Step 2: click an item of the popup that actually opened, using its own measured rect rather than an offset
+        // guess from the label. BeginMenu's popup is a window, so its position and size are authoritative for where its
+        // items are — and they can sit anywhere relative to the label (a menu near a screen edge flips sides).
+        bool spawned = false;
+        if (menuX >= 0.0f)
+        {
+            if (context->OpenPopupStack.Size == 0)
+            {
+                clickAt(menuX, menuY);  // reopen: the release above may have dismissed it
+            }
+            REQUIRE(context->OpenPopupStack.Size > 0);
+            ImGuiWindow* popup = context->OpenPopupStack.back().Window;
+            REQUIRE(popup != nullptr);
+            const ImVec2 popupPos = popup->Pos;
+            const float lineHeight = ImGui::GetFrameHeight();
+            INFO("popup at " << popupPos.x << "," << popupPos.y << " size " << popup->Size.x << "x" << popup->Size.y);
+
+            for (int step = 0; step < 8 && !spawned; ++step)
+            {
+                // Items stack from the popup's top padding, one frame height apart. x is offset into the label area —
+                // ImGui's menu rows span the full width, so any x inside the popup is a valid hit.
+                clickAt(popupPos.x + 24.0f, popupPos.y + 8.0f + static_cast<float>(step) * lineHeight);
+                spawned = editor.GetWorld().GetAliveEntityCount() > before;
+            }
+        }
+
+        INFO("menu hit at (" << menuX << "," << menuY << ") entities " << before << " -> "
+                             << editor.GetWorld().GetAliveEntityCount()
+                             << "  outliner rect=" << panel.X << "," << panel.Y << " " << panel.Width << "x"
+                             << panel.Height);
+        CHECK(spawned);
 
         std::filesystem::remove_all(project);
     }

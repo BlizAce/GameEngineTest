@@ -1002,14 +1002,27 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
 
     // Toolbar first: the actions are what an author reaches for constantly, and hiding them below the list (as before)
     // meant scrolling to create an entity in a long scene.
-    if (ImGui::Button("Entity"))
+    //
+    // One "Create" menu rather than one button per actor type, matching UE's Outliner. Every entry runs the same console
+    // command the text console takes, so the menu, the console and a scripted run cannot drift apart — and each lands in
+    // the Output Log, which flat buttons did not report anywhere. Only meshes the runtime actually resolves are offered:
+    // BuiltInMeshes registers cube, plane and cube-large (engine), so an entry here with no resolvable path would create
+    // an entity that logs "asset not available" and draws nothing.
+    if (ImGui::BeginMenu("Create"))
     {
-        static_cast<void>(context.Application->CreateEntity("Entity", ""));
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Cube"))
-    {
-        static_cast<void>(context.Application->CreateEntity("Cube", "engine:cube"));
+        if (ImGui::MenuItem("Empty Actor", nullptr, false, context.Application != nullptr))
+        {
+            state.Run("entity.create Entity");
+        }
+        if (ImGui::MenuItem("Cube", nullptr, false, context.Application != nullptr))
+        {
+            state.Run("entity.create Cube engine:cube");
+        }
+        if (ImGui::MenuItem("Plane", nullptr, false, context.Application != nullptr))
+        {
+            state.Run("entity.create Plane engine:plane");
+        }
+        ImGui::EndMenu();
     }
     ImGui::SameLine();
 

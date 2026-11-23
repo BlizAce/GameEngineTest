@@ -19,6 +19,8 @@
 #include "Hollowpoint/Math/MathCore.h"
 #include "Hollowpoint/MathReflection/MathReflection.h"
 #include "Hollowpoint/Reflection/Registry.h"
+#include "Hollowpoint/Renderer/Camera.h"
+#include "Hollowpoint/Renderer/Lights.h"
 #include "Hollowpoint/Scene/LocalTransform.h"
 #include "Hollowpoint/Scene/SceneIO.h"
 
@@ -871,6 +873,60 @@ TEST_SUITE("EditorPropertyView")
         REQUIRE(view.WriteBool(*field, false));
         CHECK_FALSE(renderer.CastsShadows);
         CHECK(view.FormatValue(*field) == "false");
+    }
+
+    TEST_CASE("FindByPath accepts the component-qualified form shown in the panel")
+    {
+        EnsureTypesRegistered();
+        World world;
+        const Entity entity = MakeEntity(world, "Cube");
+        Game::MeshRenderer& renderer = world.AddComponent<Game::MeshRenderer>(entity);
+
+        PropertyView view;
+        view.Build(world, entity);
+
+        // The panel groups rows under the component name, so `MeshRenderer.visible` is what an author types.
+        const PropertyField* qualified = view.FindByPath("MeshRenderer.visible");
+        REQUIRE(qualified != nullptr);
+        CHECK(qualified->IsEditable());
+        CHECK(view.WriteBool(*qualified, false));
+        CHECK_FALSE(renderer.Visible);
+
+        // Any case: every other console command name is matched case-insensitively too.
+        CHECK(view.FindByPath("meshrenderer.VISIBLE") != nullptr);
+
+        // A qualifier that names no component on this entity must not resolve — silently writing a field of some
+        // other component would be worse than the "no property" error.
+        CHECK(view.FindByPath("Light.visible") == nullptr);
+        CHECK(view.FindByPath("MeshRenderer.notAField") == nullptr);
+    }
+
+    TEST_CASE("A qualified path disambiguates a leaf two components share")
+    {
+        EnsureTypesRegistered();
+        World world;
+        const Entity entity = MakeEntity(world, "Lamp");
+        Renderer::CameraComponent& camera = world.AddComponent<Renderer::CameraComponent>(entity);
+        Renderer::LightComponent& light = world.AddComponent<Renderer::LightComponent>(entity);
+        camera.Active = true;
+        light.Active = false;
+
+        PropertyView view;
+        view.Build(world, entity);
+
+        // `active` exists on both Camera and Light. The qualifier picks the owner, so `Camera.active` cannot be a
+        // coin flip over field order.
+        const PropertyField* cameraActive = view.FindByPath("Camera.active");
+        REQUIRE(cameraActive != nullptr);
+        CHECK(cameraActive->ComponentName == "Camera");
+
+        const PropertyField* lightActive = view.FindByPath("Light.active");
+        REQUIRE(lightActive != nullptr);
+        CHECK(lightActive->ComponentName == "Light");
+
+        bool value = true;
+        REQUIRE(view.ReadBool(*lightActive, value));
+        CHECK_FALSE(value);
     }
 
     TEST_CASE("A dead or component-less entity yields no fields")

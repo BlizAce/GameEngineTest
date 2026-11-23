@@ -659,7 +659,11 @@ void RuntimeApplication::UpdateAndCollect()
     m_LightTransforms.clear();
 
     m_World.ForEachEntity([&](const Entity& entity) {
-        if (m_World.TryGetComponent<Game::MeshRenderer>(entity) != nullptr)
+        // Visible is honoured here rather than in the collector: the collector's job is to turn a list of entities into
+        // draw submissions, and an invisible object is not a submission with a flag — it is not submitted. Skipping at
+        // the boundary also means gizmos/selection keep seeing the entity (you must be able to click what you hid).
+        const Game::MeshRenderer* renderer = m_World.TryGetComponent<Game::MeshRenderer>(entity);
+        if (renderer != nullptr && renderer->Visible)
         {
             m_MeshEntities.push_back(entity);
             m_MeshTransforms.push_back(m_Transforms.GetWorldMatrix(m_World, entity));

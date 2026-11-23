@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <type_traits>
 
@@ -32,6 +33,25 @@ namespace
 {
 
 constexpr Size kMaxStructDepth = 8;
+
+//! Case-insensitive compare for component qualifiers: the panel's group header is the reflected type name
+//! ("MeshRenderer") and authors may type any case in the console, where every other command name is already
+//! matched case-insensitively.
+[[nodiscard]] bool IEquals(std::string_view a, std::string_view b)
+{
+    if (a.size() != b.size())
+    {
+        return false;
+    }
+    for (Size index = 0; index < a.size(); ++index)
+    {
+        if (std::tolower(static_cast<unsigned char>(a[index])) != std::tolower(static_cast<unsigned char>(b[index])))
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 [[nodiscard]] const TypeDescriptor* ResolveType(std::string_view typeName)
 {
@@ -259,6 +279,25 @@ const PropertyField* PropertyView::FindByPath(std::string_view path) const noexc
     for (const PropertyField& field : m_Fields)
     {
         if (field.Path == path)
+        {
+            return &field;
+        }
+    }
+
+    // Component-qualified form ("MeshRenderer.visible"): the panel shows every row grouped under its component's
+    // name, so that is the path an author reaches for in the console. Field paths are stored unqualified (two
+    // components can share a leaf name — `active` on both Camera and Light), so matching the qualifier against the
+    // owning component keeps `Camera.active` from writing whichever `active` happens to come first.
+    const Size separator = path.find('.');
+    if (separator == std::string_view::npos)
+    {
+        return nullptr;
+    }
+    const std::string_view qualifier = path.substr(0, separator);
+    const std::string_view leaf = path.substr(separator + 1);
+    for (const PropertyField& field : m_Fields)
+    {
+        if (IEquals(field.Path, leaf) && IEquals(field.ComponentName, qualifier))
         {
             return &field;
         }

@@ -1036,6 +1036,106 @@ TEST_SUITE("EditorApplication")
         std::filesystem::remove_all(project);
     }
 
+    TEST_CASE("The details panel's reset arrow is reachable and restores the default")
+    {
+        SKIP_WITHOUT_DISPLAY();
+
+        // The model layer proves IsDefault/ResetToDefault compute correctly, but a control nobody can click is not a
+        // feature — the same standard applied to the outliner's eye. Here the risk is geometric: the arrow is a 16px
+        // target pinned to the panel's right edge, where a wrong reservation pushes it outside the window (measured: an
+        // earlier revision drew it at x=1599..1615 in a panel ending at 1600). So this clicks the real widget and reads
+        // the component back.
+        const std::filesystem::path project = ScratchPath("resetarrow");
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+
+        const Entity cube = editor.CreateEntity("Cube", "engine:cube");
+        REQUIRE_FALSE(cube.IsNull());
+
+        UInt32 width = 0;
+        UInt32 height = 0;
+        static_cast<void>(editor.Frame());
+        static_cast<void>(editor.Frame());  // settle the dock layout so panel geometry is real
+        static_cast<void>(Capture(editor, width, height));
+
+        const Editor::PanelRect* found = FindPanelRect(editor.GetUiState(), "Details");
+        REQUIRE(found != nullptr);
+        // Copied by value: PanelGeometry is reassigned every frame, so a pointer into it dangles once the loop advances.
+        const Editor::PanelRect panel = *found;
+        REQUIRE(panel.Width > 200.0f);
+
+        Game::MeshRenderer* renderer = editor.GetWorld().TryGetComponent<Game::MeshRenderer>(cube);
+        REQUIRE(renderer != nullptr);
+
+        // Take roughness off its default (0.5) so the arrow exists, and confirm it is really off — otherwise the
+        // assertion below could pass by clicking nothing that matters.
+        renderer->Roughness = 0.9f;
+        static_cast<void>(editor.Frame());
+        REQUIRE(renderer->Roughness == doctest::Approx(0.9f));
+
+        // Ask the panel's own model what it sees, rather than assuming. If this says "default", no click can succeed
+        // and the failure is in the view, not in the mouse path.
+        const Editor::PropertyField* seen = editor.GetUiState()->Properties.FindByPath("roughness");
+        INFO("panel model: field found=" << (seen != nullptr)
+                                        << " IsDefault=" << (seen != nullptr ? editor.GetUiState()->Properties.IsDefault(*seen)
+                                                                            : false)
+                                        << " ShowDetails=" << editor.GetUiState()->ShowDetails);
+
+        ImGuiContext* context = editor.GetUiContext();
+        REQUIRE(context != nullptr);
+        ImGui::SetCurrentContext(context);
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigDebugIgnoreFocusLoss = true;
+        io.AddFocusEvent(true);
+
+        auto clickAt = [&editor, &io](float x, float y) {
+            io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(x, y);
+            io.AddMouseButtonEvent(0, true);
+            static_cast<void>(editor.Frame());
+            io.AddMouseButtonEvent(0, false);
+            static_cast<void>(editor.Frame());
+        };
+
+        // Both axes are scanned rather than guessed. The arrow is a ~16px target pinned to the panel's right edge and its
+        // exact offset depends on the reserved slot, which in turn depends on whether the icon atlas loaded (the fallback
+        // glyph is narrower) — so hard-coding x is exactly the fragility that made an earlier revision draw it off-panel.
+        // y varies with how many components and header rows sit above the field. What is asserted is that SOME point in
+        // the panel's right-edge band activates it, and that the value lands exactly on the default rather than merely
+        // moving (a stray drag on the numeric widget must not count).
+        bool reset = false;
+        float hitX = -1.0f;
+        float hitY = -1.0f;
+        for (int xStep = 0; xStep < 6 && !reset; ++xStep)
+        {
+            const float x = panel.X + panel.Width - 9.0f - static_cast<float>(xStep) * 6.0f;
+            for (int yStep = 0; yStep < 40 && !reset; ++yStep)
+            {
+                const float y = panel.Y + 40.0f + static_cast<float>(yStep) * 12.0f;
+                if (y > panel.Y + panel.Height - 8.0f)
+                {
+                    break;
+                }
+                clickAt(x, y);
+                if (renderer->Roughness == Game::MeshRenderer{}.Roughness)
+                {
+                    reset = true;
+                    hitX = x;
+                    hitY = y;
+                }
+            }
+        }
+
+        INFO("hit=(" << hitX << "," << hitY << ") panel " << panel.X << "," << panel.Y << " " << panel.Width << "x"
+                     << panel.Height << " roughness=" << renderer->Roughness);
+        CHECK(reset);
+
+        std::filesystem::remove_all(project);
+    }
+
     TEST_CASE("Scene save and load round-trip through the editor's own commands")
     {
         SKIP_WITHOUT_DISPLAY();

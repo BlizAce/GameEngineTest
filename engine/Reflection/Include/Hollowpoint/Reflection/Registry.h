@@ -165,6 +165,26 @@ template <typename T>
     return std::string_view(typeid(T).name());
 }
 
+//! Type-erased construction of a default instance, captured by RegisterType<T> so the registry can mint one for a type
+//! it no longer has the template argument for. `new T()` is the real constructor — member initialisers and all — which
+//! is the whole point: an inspector's "reset" must produce what the type itself would have produced.
+template <typename T>
+[[nodiscard]] inline void* ConstructDefault()
+{
+    return static_cast<void*>(new T());
+}
+
+//! Runs ~T then frees. Paired with ConstructDefault; see TypeDescriptor::DestroyDefaultInstance for why this cannot be
+//! a plain free().
+template <typename T>
+inline void DestroyDefault(void* instance)
+{
+    if (instance != nullptr)
+    {
+        delete static_cast<T*>(instance);
+    }
+}
+
 }  // namespace Detail
 
 // ---------------------------------------------------------------------------
@@ -336,6 +356,15 @@ template <typename T>
 TypeBuilder Registry::RegisterType(std::string_view name, std::string_view baseTypeName)
 {
     TypeDescriptor& descriptor = AllocateType(name, Detail::TypeInfoName<T>(), sizeof(T), alignof(T), baseTypeName);
+
+    // Default construction is recorded per registration rather than looked up later: the registry stores only the
+    // mangled type-info string, and turning that back into `new T()` requires the template argument this call still
+    // has. Assignment (not "only if null") is deliberate — inside a RegisterType<T> call the type IS T, so re-entrant
+    // registration under the same name must not keep a stale factory for a different T; that case is already reported
+    // as an error by AllocateType.
+    descriptor.m_ConstructDefault = &Detail::ConstructDefault<T>;
+    descriptor.m_DestroyDefault = &Detail::DestroyDefault<T>;
+
     return TypeBuilder(descriptor);
 }
 

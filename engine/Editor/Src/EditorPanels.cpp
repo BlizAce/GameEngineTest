@@ -765,9 +765,25 @@ namespace
  * Call EndFieldRow() after the widget. Both are here rather than inline so the Push/Pop pairing cannot be broken by an
  * early `continue` in the field loop — the bug class that produces a corrupted style stack several panels later.
  */
-void BeginFieldRow(std::string_view label, float labelWidth)
+//! Width to reserve at the end of an editable row for the reset arrow, so the widget cannot claim the whole line and
+//! shove the glyph past the window edge.
+/**
+ * Reserved even when the icon atlas is unavailable, because the fallback there is a text glyph ("*") that occupies
+ * width just the same — returning zero made the arrow's position depend on whether assets happened to load from the
+ * current working directory, which is exactly how it ended up off-panel under the test harness (which runs from
+ * build/debug, where the CWD-relative atlas is absent) while looking right in a normal launch.
+ */
+[[nodiscard]] float ResetSlotWidth(const EditorIconSet* icons, float iconSize)
 {
-    ImGui::PushItemWidth(-1.0f);
+    const float glyph = icons != nullptr ? iconSize : ImGui::CalcTextSize("*").x;
+    return glyph + ImGui::GetStyle().ItemSpacing.x;
+}
+
+void BeginFieldRow(std::string_view label, float labelWidth, float trailing = 0.0f)
+{
+    // Negative item width means "this far from the content region's right edge", so adding the reserved slot is what
+    // keeps the arrow inside the window instead of off-screen.
+    ImGui::PushItemWidth(-(1.0f + trailing));
     ImGui::TextUnformatted(label.data(), label.data() + label.size());
     ImGui::SameLine(labelWidth);
 }
@@ -775,6 +791,30 @@ void BeginFieldRow(std::string_view label, float labelWidth)
 void EndFieldRow()
 {
     ImGui::PopItemWidth();
+}
+
+//! UE's per-property reset arrow, drawn at the end of a field row.
+/**
+ * Shown only when the value differs from what a freshly constructed component holds — and that comparison comes from
+ * constructing the component (Reflection's DefaultInstance), not from defaults copied into the editor, so the arrow can
+ * never offer to reset a field to something the engine would not produce itself.
+ *
+ * Absent rather than greyed when there is nothing to reset: an arrow on every row of a brand-new entity is noise that
+ * also hides by contrast the rows that genuinely differ, and a disabled control invites the question "why can't I?" for
+ * a field that needs no resetting.
+ */
+void DrawResetAffordance(UiState& state, const EditorIconSet* icons, const PropertyField& field, float iconSize)
+{
+    if (state.Properties.IsDefault(field))
+    {
+        return;
+    }
+
+    ImGui::SameLine();
+    if (IconToggleButton(icons, "reset_arrow", "##reset", "Reset to default", iconSize, "*"))
+    {
+        static_cast<void>(state.Properties.ResetToDefault(field));
+    }
 }
 
 [[nodiscard]] std::vector<std::pair<Int64, std::string>> EnumEntries(const PropertyField& field)
@@ -1199,6 +1239,10 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
     }
     labelWidth = std::min(labelWidth, ImGui::GetContentRegionAvail().x * 0.55f);
 
+    // Slightly smaller than the outliner's row icons: this sits inline with a text field, where a full-size glyph
+    // outweighs the value it describes.
+    const float resetIconSize = IconSizeForScale(state.UiScale, 12.0f);
+
     for (const std::string& componentName : state.Properties.GetComponentNames())
     {
         if (!ImGui::CollapsingHeader(componentName.c_str(), ImGuiTreeNodeFlags_DefaultOpen))
@@ -1211,6 +1255,12 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
             // PushID on the path: two components can carry same-named fields (Position on a transform and on a camera),
             // and ImGui ids are per-window — without this they collide and editing one moves the other.
             ImGui::PushID(field.Path.c_str());
+
+            // Reserved for EVERY editable row, not only the ones currently showing an arrow. Measured why: reserving it
+            // per-row made the widget change width the moment a value crossed its default, so a field being dragged
+            // snapped narrower under the cursor mid-drag. A permanently unused few pixels on default rows is the cheaper
+            // of those two, and it keeps every row in a component aligned with its neighbours.
+            const float resetSlot = ResetSlotWidth(context.Icons, resetIconSize);
 
             if (!field.IsEditable())
             {
@@ -1225,7 +1275,7 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
                 {
                     bool value = false;
                     static_cast<void>(state.Properties.ReadBool(field, value));
-                    BeginFieldRow(field.Path, labelWidth);
+                    BeginFieldRow(field.Path, labelWidth, resetSlot);
                     if (ImGui::Checkbox("##v", &value))
                     {
                         static_cast<void>(state.Properties.WriteBool(field, value));
@@ -1240,7 +1290,7 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
                     static_cast<void>(state.Properties.ReadString(field, text));
                     char buffer[512];
                     FillBuffer(text, buffer, sizeof(buffer));
-                    BeginFieldRow(field.Path, labelWidth);
+                    BeginFieldRow(field.Path, labelWidth, resetSlot);
                     // The field name is stripped from the row's storage id so the visible label is the path alone;
                     // "##v" keeps the widget id distinct from the TextUnformatted that precedes it.
                     if (ImGui::InputText("##v", buffer, sizeof(buffer)))
@@ -1270,7 +1320,7 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
                         }
                     }
 
-                    BeginFieldRow(field.Path, labelWidth);
+                    BeginFieldRow(field.Path, labelWidth, resetSlot);
                     const char* preview = currentIndex >= 0 ? entries[static_cast<Size>(currentIndex)].second.c_str()
                                                             : "(value not in enum)";
                     if (ImGui::BeginCombo("##v", preview))
@@ -1319,7 +1369,7 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
                     static_cast<void>(state.Properties.ReadReal(field, existing));
                     float value = static_cast<float>(existing);
 
-                    BeginFieldRow(field.Path, labelWidth);
+                    BeginFieldRow(field.Path, labelWidth, resetSlot);
                     if (ImGui::DragFloat("##v", &value, DragSpeedFor(field.Path), 0.0f, 0.0f,
                                          DragFormatFor(static_cast<ValueKind>(field.Kind))))
                     {
@@ -1333,12 +1383,17 @@ void DrawDetailsPanel(UiState& state, const PanelContext& context)
                 {
                     // Any kind reflection gains later: shown formatted rather than dropped. A read-only row is honest
                     // about what the panel does not edit yet; silently omitting it is not.
-                    BeginFieldRow(field.Path, labelWidth);
+                    BeginFieldRow(field.Path, labelWidth, resetSlot);
                     ImGui::TextDisabled("%s", state.Properties.FormatValue(field).c_str());
                     EndFieldRow();
                     break;
                 }
             }
+
+            // One draw site for every widget kind: each editable branch above finishes with EndFieldRow(), so the arrow
+            // lands at the end of that field's row — including the unnamed-enum fallback, where it belongs next to the
+            // integer widget an author would actually be editing.
+            DrawResetAffordance(state, context.Icons, field, resetIconSize);
 
             ImGui::PopID();
         }
@@ -2129,6 +2184,7 @@ void DrawEditorPanels(UiState& state, const PanelContext& context)
     // Snapshot geometry last, after every panel has submitted its window, so the rectangles reflect this frame's layout
     // rather than the previous one (see UiState::PanelGeometry for why a snapshot at all).
     state.PanelGeometry = CollectPanelRectangles();
+
 }
 
 }  // namespace Hollowpoint::Editor

@@ -967,4 +967,121 @@ TEST_SUITE("EditorPropertyView")
             CHECK(field.ComponentName == "MeshRenderer");
         }
     }
+
+    TEST_CASE("A freshly built component reports every field as default")
+    {
+        EnsureTypesRegistered();
+        World world;
+        const Entity entity = MakeEntity(world, "Cube");
+        world.AddComponent<Game::MeshRenderer>(entity);
+
+        PropertyView view;
+        view.Build(world, entity);
+
+        // The baseline that makes a reset button trustworthy: nothing edited, so nothing may offer a reset. If any
+        // field reports otherwise, the comparison is wrong (wrong width, wrong kind, or defaults read from an object
+        // that is not actually default-constructed) and the panel would invite the author to "fix" a value they never
+        // touched.
+        for (const PropertyField& field : view.GetFieldsForComponent("MeshRenderer"))
+        {
+            CHECK_MESSAGE(view.IsDefault(field), "field \"" << field.Path << "\" reported off-default on a new entity");
+        }
+
+        // The entity's name is the one field that is legitimately off-default here, because MakeEntity set it. Asserted
+        // rather than skipped: it proves IsDefault compares values instead of just answering "true", and it documents
+        // what the panel will show — a reset arrow on Name that would blank the label.
+        const PropertyField* name = view.FindByPath("name");
+        REQUIRE(name != nullptr);
+        CHECK_FALSE(view.IsDefault(*name));
+    }
+
+    TEST_CASE("ResetToDefault restores numeric, bool, enum and string fields")
+    {
+        EnsureTypesRegistered();
+        World world;
+        const Entity entity = MakeEntity(world, "Cube");
+        Game::MeshRenderer& renderer = world.AddComponent<Game::MeshRenderer>(entity);
+
+        PropertyView view;
+        view.Build(world, entity);
+
+        // Each of these was chosen because it exercises a different read/write path: ToDouble for reals, AsBool for
+        // bools, the descriptor's ReadEnumAt for enums (which knows the underlying integer width), and ReadString for
+        // strings. A reset that only works for floats is three quarters broken.
+        struct Case
+        {
+            const char* Path;
+            void (*Edit)(Game::MeshRenderer&);
+        };
+        const Case cases[] = {
+            {"roughness", [](Game::MeshRenderer& r) { r.Roughness = 0.1f; }},
+            {"metallic", [](Game::MeshRenderer& r) { r.Metallic = 0.9f; }},
+            {"visible", [](Game::MeshRenderer& r) { r.Visible = false; }},
+            {"castsShadows", [](Game::MeshRenderer& r) { r.CastsShadows = false; }},
+            {"culling", [](Game::MeshRenderer& r) { r.Culling = Game::MeshCullMode::None; }},
+            {"meshPath", [](Game::MeshRenderer& r) { r.MeshPath = "assets/sword.glb"; }},
+        };
+
+        for (const Case& testCase : cases)
+        {
+            testCase.Edit(renderer);
+
+            // Rebuild so the field addresses point at the mutated component.
+            view.Build(world, entity);
+            const PropertyField* field = view.FindByPath(testCase.Path);
+            REQUIRE_MESSAGE(field != nullptr, "no field \"" << testCase.Path << "\"");
+
+            INFO("field: " << testCase.Path);
+            CHECK_FALSE(view.IsDefault(*field));
+            REQUIRE(view.ResetToDefault(*field));
+            CHECK(view.IsDefault(*field));
+
+            // And the value really landed in the component — not merely in the view's idea of it.
+            view.Build(world, entity);
+            const PropertyField* reloaded = view.FindByPath(testCase.Path);
+            REQUIRE(reloaded != nullptr);
+            CHECK(view.IsDefault(*reloaded));
+        }
+
+        // Spot-check the restored values against what a default-constructed component holds, so "IsDefault says true"
+        // cannot be satisfied by a comparison that is vacuously equal on both sides.
+        const Game::MeshRenderer fresh;
+        CHECK(renderer.Roughness == doctest::Approx(fresh.Roughness));
+        CHECK(renderer.Metallic == doctest::Approx(fresh.Metallic));
+        CHECK(renderer.Visible == fresh.Visible);
+        CHECK(renderer.CastsShadows == fresh.CastsShadows);
+        CHECK(renderer.Culling == fresh.Culling);
+        CHECK(renderer.MeshPath == fresh.MeshPath);
+    }
+
+    TEST_CASE("ResetToDefault works through a struct member path")
+    {
+        EnsureTypesRegistered();
+        World world;
+        const Entity entity = MakeEntity(world, "Cube");
+        Scene::LocalTransform& transform = world.AddComponent<Scene::LocalTransform>(entity);
+        transform.Position.X = 4.25f;
+
+        PropertyView view;
+        view.Build(world, entity);
+
+        // A multi-segment path is the interesting case: resolving "position.x" has to slice at the dot and descend into
+        // the reflected Vec3, otherwise the lookup fails and the affordance silently never appears for every vector
+        // field in the editor — which is most of them.
+        const PropertyField* positionX = view.FindByPath("position.x");
+        REQUIRE(positionX != nullptr);
+        CHECK_FALSE(view.IsDefault(*positionX));
+
+        REQUIRE(view.ResetToDefault(*positionX));
+        CHECK(transform.Position.X == doctest::Approx(Scene::LocalTransform{}.Position.X));
+        CHECK(view.IsDefault(*positionX));
+
+        // Sibling members are untouched: resetting one axis must not zero the others.
+        transform.Position.Y = 7.5f;
+        view.Build(world, entity);
+        const PropertyField* again = view.FindByPath("position.x");
+        REQUIRE(again != nullptr);
+        REQUIRE(view.ResetToDefault(*again));
+        CHECK(transform.Position.Y == doctest::Approx(7.5));
+    }
 }

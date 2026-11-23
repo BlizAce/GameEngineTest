@@ -18,6 +18,11 @@ class Registry;
 class TypeDescriptor;
 class EnumDescriptor;
 
+//! Type-erased default construction/destruction for a reflected type, captured by RegisterType<T>. Kept next to
+//! EnumAccessor/EnumWriter in Registry.h, which establishes the convention for these registration-time hooks.
+using DefaultFactory = void* (*)();
+using DefaultDestroyer = void (*)(void*);
+
 // ---------------------------------------------------------------------------
 // ArrayOps — type-erased operations for a reflected std::vector<T>.
 //
@@ -370,6 +375,24 @@ public:
         return m_BaseType;
     }
 
+    //! Type-erased default construction/destruction, captured by RegisterType<T>. Null for a descriptor that was
+    //! somehow created without going through the templated registration path; callers must treat null as "no defaults
+    //! available" and hide the reset affordance rather than guess at values.
+    [[nodiscard]] DefaultFactory GetDefaultFactory() const noexcept
+    {
+        return m_ConstructDefault;
+    }
+
+    //! Runs ~T and frees an instance made by GetDefaultFactory(). Safe to call with null. See Registry.h for why a
+    //! plain free() would leak (a reflected component may own a std::string).
+    void DestroyDefaultInstance(void* instance) const
+    {
+        if (m_DestroyDefault != nullptr)
+        {
+            m_DestroyDefault(instance);
+        }
+    }
+
 private:
     friend class Registry;
 
@@ -378,6 +401,8 @@ private:
     Size m_Size = 0;
     Size m_Align = 0;
     const TypeDescriptor* m_BaseType = nullptr;
+    DefaultFactory m_ConstructDefault = nullptr;
+    DefaultDestroyer m_DestroyDefault = nullptr;
 
     // Fields live in a heap block owned by the registry. Component types range from two to thirty fields and
     // are described once at startup, so one allocation per type is the right trade over an inline buffer that
@@ -385,6 +410,51 @@ private:
     FieldDescriptor* m_Fields = nullptr;
     Size m_FieldCount = 0;
     Size m_FieldCapacity = 0;
+};
+
+// ---------------------------------------------------------------------------
+// DefaultInstance — an RAII default-constructed instance of a reflected type.
+//
+// Exists for one reason: producing defaults needs a heap allocation whose destructor is type-erased, so a caller that
+// forgets to release it leaks whatever the type owns (MeshRenderer holds a std::string) — and that leak would happen per
+// reset click, in the editor, invisibly. Holding the descriptor alongside the pointer makes the correct pairing the only
+// option the type offers.
+//
+// Why defaults come from construction at all: "reset to default" means "the value this field would have had if nobody
+// touched it", and the only trustworthy definition is what the type itself produces on construction. Hard-coding
+// defaults in the editor duplicates a fact the type already owns, drifts the moment a constructor changes, and silently
+// omits whichever field nobody remembered to mirror.
+// ---------------------------------------------------------------------------
+
+class HP_REFLECTION_API DefaultInstance
+{
+public:
+    //! Constructs a default instance of `name`, or an empty one when the type is unknown or was registered without a
+    //  factory. Empty() distinguishes those cases so a caller can hide its reset affordance instead of guessing values.
+    explicit DefaultInstance(std::string_view name);
+
+    ~DefaultInstance();
+
+    DefaultInstance(const DefaultInstance&) = delete;
+    DefaultInstance& operator=(const DefaultInstance&) = delete;
+    DefaultInstance(DefaultInstance&&) = delete;
+    DefaultInstance& operator=(DefaultInstance&&) = delete;
+
+    [[nodiscard]] bool Empty() const noexcept
+    {
+        return m_Instance == nullptr;
+    }
+
+    //! The instance's base address, or null. Fields are located in it with FieldDescriptor::GetAddress exactly as they
+    //  are in a live component, so the same read/write path serves both.
+    [[nodiscard]] void* Get() const noexcept
+    {
+        return m_Instance;
+    }
+
+private:
+    const TypeDescriptor* m_Descriptor = nullptr;  //!< not owned; the registry outlives every instance
+    void* m_Instance = nullptr;
 };
 
 }  // namespace Hollowpoint::Reflection

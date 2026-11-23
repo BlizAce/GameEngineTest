@@ -345,6 +345,33 @@ const TypeDescriptor& Registry::GetTypeByRegistrationIndex(Size index) const
     return *m_Impl->Types[index];
 }
 
+DefaultInstance::DefaultInstance(std::string_view name)
+{
+    const TypeDescriptor* descriptor = Registry::Get().FindType(name);
+    if (descriptor == nullptr || descriptor->GetDefaultFactory() == nullptr)
+    {
+        // Reported, not asserted: a type with no factory was registered without going through RegisterType<T>, and the
+        // only sensible response downstream is to hide its reset affordance. Crashing the tool over a missing button
+        // would destroy unsaved work for a cosmetic gap.
+        HP_LOG_WARNING("REFLECTION", "no default factory for type \"{}\"; cannot produce a default instance", name);
+        return;
+    }
+
+    m_Instance = descriptor->GetDefaultFactory()();
+    // The descriptor is only kept once construction succeeded: its DestroyDefaultInstance is what frees this pointer, so
+    // an instance with no descriptor could never be released correctly — better to report empty than to hold garbage.
+    m_Descriptor = m_Instance != nullptr ? descriptor : nullptr;
+}
+
+DefaultInstance::~DefaultInstance()
+{
+    if (m_Descriptor != nullptr)
+    {
+        m_Descriptor->DestroyDefaultInstance(m_Instance);
+    }
+    m_Instance = nullptr;
+}
+
 void TypeBuilder::AddRawField(const char* name, std::ptrdiff_t offset, ValueKind kind, const char* structTypeInfoName,
                               const char* arrayElementTypeInfoName, HashValue enumGuid,
                               const FieldAttributes& attributes, const ArrayOps& arrayOps, EnumAccessor readEnum,

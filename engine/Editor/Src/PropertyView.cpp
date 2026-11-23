@@ -22,6 +22,7 @@ namespace Hollowpoint::Editor
 
 using Core::Int64;
 using Reflection::ArrayOps;
+using Reflection::DefaultInstance;
 using Reflection::EnumDescriptor;
 using Reflection::FieldDescriptor;
 using Reflection::Registry;
@@ -373,6 +374,259 @@ namespace
 }
 
 }  // namespace
+
+namespace
+{
+
+//! Resolves a built property path to the chain of field descriptors leading to its leaf, starting at the component's
+//! descriptor. Used to locate the same leaf inside a freshly default-constructed instance, which is how "is this value
+//! still the default?" and "reset it" are answered without hard-coding a single default value in the editor.
+//!
+//! Returns false when any path segment names an array element ("Weights[3]"): a default instance has empty arrays, so
+//! there is no such element to read a default from. Callers treat that as "no reset affordance", not as an error — an
+//! author resetting one element of a list to some imaginary per-index default would be guessing anyway.
+[[nodiscard]] bool ResolveFieldChain(const std::string& componentName, const std::string& path,
+                                     std::vector<const Reflection::FieldDescriptor*>& outChain)
+{
+    outChain.clear();
+
+    const TypeDescriptor* componentType = Registry::Get().FindType(componentName);
+    if (componentType == nullptr)
+    {
+        return false;
+    }
+
+    std::string_view remaining = path;
+    // Built paths never include the component prefix, but accepting it keeps a panel-generated path and an author-typed
+    // one interchangeable — the same reason FindByPath accepts it.
+    if (remaining.rfind(componentName + ".", 0) == 0)
+    {
+        remaining = remaining.substr(componentName.size() + 1);
+    }
+
+    const TypeDescriptor* current = componentType;
+    while (!remaining.empty())
+    {
+        std::string_view name = remaining;
+        if (name.find('[') != std::string_view::npos)
+        {
+            return false;  // array element: no default instance to read from, see the header comment
+        }
+
+        // Truncate at the dot *before* looking the segment up: "Position.x" must resolve as Field("Position") then
+        // Field("x"). Slicing the remainder alone is not enough — leaving the dot in `name` makes FindField fail and the
+        // whole chain resolve to nothing.
+        const Size dot = name.find('.');
+        if (dot != std::string_view::npos)
+        {
+            name = name.substr(0, dot);
+        }
+        remaining = dot == std::string_view::npos ? std::string_view{} : remaining.substr(dot + 1);
+
+        if (name.empty() || current == nullptr)
+        {
+            return false;
+        }
+
+        const FieldDescriptor* found = current->FindField(name);
+        if (found == nullptr)
+        {
+            return false;
+        }
+        outChain.push_back(found);
+
+        // Only descend for a struct field that still has a segment left to resolve.
+        current = remaining.empty() ? nullptr : found->GetStructType();
+    }
+
+    return !outChain.empty();
+}
+
+}  // namespace
+
+const Reflection::DefaultInstance* PropertyView::DefaultsFor(const std::string& componentName) const
+{
+    auto stored = m_Defaults.find(componentName);
+    if (stored != m_Defaults.end())
+    {
+        return stored->second->Empty() ? nullptr : stored->second.get();
+    }
+
+    auto created = std::make_unique<DefaultInstance>(componentName);
+    // Empty entries are stored too: a type with no factory would otherwise be retried — and its warning re-logged — on
+    // every field of every frame.
+    const Reflection::DefaultInstance* result = created->Empty() ? nullptr : created.get();
+    m_Defaults.emplace(componentName, std::move(created));
+    return result;
+}
+
+bool PropertyView::IsDefault(const PropertyField& field) const
+{
+    if (!field.IsEditable())
+    {
+        return true;  // nothing to reset, so nothing is off-default
+    }
+
+    std::vector<const FieldDescriptor*> chain;
+    if (!ResolveFieldChain(field.ComponentName, field.Path, chain))
+    {
+        return true;
+    }
+
+    const Reflection::DefaultInstance* defaults = DefaultsFor(field.ComponentName);
+    if (defaults == nullptr)
+    {
+        return true;
+    }
+
+    // Walk the identical chain in the default instance. GetAddress is the same accessor the ECS path uses, so a layout
+    // change or padding difference cannot make the two sides disagree — they are both computed from the descriptor.
+    void* address = defaults->Get();
+    for (const FieldDescriptor* descriptor : chain)
+    {
+        address = descriptor->GetAddress(address);
+        if (address == nullptr)
+        {
+            return true;
+        }
+    }
+
+    const ValueKind kind = static_cast<ValueKind>(field.Kind);
+    switch (kind)
+    {
+        case ValueKind::Boolean:
+        {
+            ScalarValue live{};
+            ScalarValue fresh{};
+            if (!Reflection::ReadScalar(field.Address, kind, live) || !Reflection::ReadScalar(address, kind, fresh))
+            {
+                return false;
+            }
+            return live.AsBool == fresh.AsBool;
+        }
+
+        case ValueKind::String:
+        {
+            std::string_view fresh;
+            if (!Reflection::ReadString(address, fresh))
+            {
+                return false;
+            }
+            std::string live;
+            if (!ReadString(field, live))
+            {
+                return false;
+            }
+            return live == fresh;
+        }
+
+        case ValueKind::Enum:
+        {
+            const FieldDescriptor* leaf = chain.back();
+            Int64 live = 0;
+            Int64 fresh = 0;
+            if (!leaf->ReadEnumAt(field.Address, live) || !leaf->ReadEnumAt(address, fresh))
+            {
+                return false;
+            }
+            return live == fresh;
+        }
+
+        default:
+        {
+            // Every numeric leaf goes through the same scalar read on both sides, so width and signedness cannot skew
+            // the comparison (an Int8 field compared as int64 would otherwise report a difference that does not exist).
+            ScalarValue live{};
+            ScalarValue fresh{};
+            if (!Reflection::ReadScalar(field.Address, kind, live) || !Reflection::ReadScalar(address, kind, fresh))
+            {
+                return false;
+            }
+            return Reflection::Detail::ToDouble(live) == Reflection::Detail::ToDouble(fresh);
+        }
+    }
+}
+
+bool PropertyView::ResetToDefault(const PropertyField& field) noexcept
+{
+    if (!field.IsEditable())
+    {
+        return false;
+    }
+
+    std::vector<const FieldDescriptor*> chain;
+    if (!ResolveFieldChain(field.ComponentName, field.Path, chain))
+    {
+        return false;
+    }
+
+    const Reflection::DefaultInstance* defaults = DefaultsFor(field.ComponentName);
+    if (defaults == nullptr)
+    {
+        return false;
+    }
+
+    void* address = defaults->Get();
+    for (const FieldDescriptor* descriptor : chain)
+    {
+        address = descriptor->GetAddress(address);
+        if (address == nullptr)
+        {
+            return false;
+        }
+    }
+
+    const ValueKind kind = static_cast<ValueKind>(field.Kind);
+
+    // Writes go through the view's own Write* helpers rather than straight to Reflection: those are the functions the
+    // panel and `entity.set` already use, so a reset cannot clamp or store differently from any other edit.
+    switch (kind)
+    {
+        case ValueKind::Boolean:
+        {
+            ScalarValue raw{};
+            if (!Reflection::ReadScalar(address, kind, raw))
+            {
+                return false;
+            }
+            return WriteBool(field, raw.AsBool);
+        }
+
+        case ValueKind::String:
+        {
+            std::string_view fresh;
+            if (!Reflection::ReadString(address, fresh))
+            {
+                return false;
+            }
+            // Copied into a temporary because `fresh` views memory owned by the default instance, which dies with this
+            // scope; WriteString takes a view and copies internally, but only after reading it.
+            const std::string copy(fresh);
+            return WriteString(field, copy);
+        }
+
+        case ValueKind::Enum:
+        {
+            Int64 fresh = 0;
+            if (!chain.back()->ReadEnumAt(address, fresh))
+            {
+                return false;
+            }
+            return WriteEnum(field, fresh);
+        }
+
+        default:
+        {
+            ScalarValue raw{};
+            if (!Reflection::ReadScalar(address, kind, raw))
+            {
+                return false;
+            }
+            return WriteReal(field, Reflection::Detail::ToDouble(raw));
+        }
+    }
+}
+
 
 bool PropertyView::ReadReal(const PropertyField& field, double& outValue) const noexcept
 {

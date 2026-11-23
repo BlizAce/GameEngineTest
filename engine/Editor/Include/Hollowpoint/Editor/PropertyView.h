@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -7,6 +8,7 @@
 #include "Hollowpoint/Core/Types.h"
 #include "Hollowpoint/ECS/Entity.h"
 #include "Hollowpoint/ECS/World.h"
+#include "Hollowpoint/Reflection/Descriptors.h"
 
 // ---------------------------------------------------------------------------
 // PropertyView — the data model behind the details panel.
@@ -93,7 +95,6 @@ public:
     [[nodiscard]] std::vector<std::string> GetComponentNames() const;
 
     [[nodiscard]] const PropertyField* FindByPath(std::string_view path) const noexcept;
-
     // --- typed reads/writes (the widget calls these; tests call them directly) ---------
 
     [[nodiscard]] bool ReadReal(const PropertyField& field, double& outValue) const noexcept;
@@ -112,6 +113,25 @@ public:
     //  same text — a console that prints more precision than the widget hides discrepancies instead of finding them.
     [[nodiscard]] std::string FormatValue(const PropertyField& field) const;
 
+    // --- defaults ----------------------------------------------------------------------
+
+    //! True when `field` currently holds what a freshly constructed component would hold.
+    /**
+     * The default is produced by constructing a real instance of the component type (see Reflection's DefaultInstance),
+     * never from a table of values copied into the editor. That distinction is the point: a reset button wired to
+     * hand-written constants silently disagrees with the constructor the moment either changes, and the panel then offers
+     * to "reset" a field to something the engine never produces.
+     *
+     * Returns true for fields that cannot be compared — array elements (a default instance has empty arrays) and types
+     * registered without a default factory. Treating unknown as "already default" hides the affordance rather than
+     * offering a reset to a guessed value, which is the failure mode worth avoiding in a tool holding unsaved work.
+     */
+    [[nodiscard]] bool IsDefault(const PropertyField& field) const;
+
+    //! Writes the freshly-constructed component's value back into `field`, through the same Write* path as any other
+    //  edit so clamping and enum handling cannot diverge. False when no default is available or the write was refused.
+    bool ResetToDefault(const PropertyField& field) noexcept;
+
 private:
     //! Recursively expands struct/array fields into leaves. Depth-capped: reflection cannot have cycles today (a
     //  component may not contain itself), but a hand-built descriptor could, and an inspector that recurses forever is
@@ -119,9 +139,27 @@ private:
     void AppendFields(void* componentAddress, const void* structTypeOpaque, std::string_view prefix,
                       std::string_view componentName, Size depth);
 
+    //! The cached default instance for one component type, constructing it on first use and returning nullptr when the
+    //  type has no default factory.
+    /**
+     * Cached per type rather than constructed per query because the panel asks this for every visible field on every
+     * frame: `new T()` per field would allocate tens of times a second in an idle editor, which is exactly what
+     * GetFields' comment rules out for the rest of this class. A type's defaults cannot change while the process runs —
+     * they are whatever its constructor produces — so nothing invalidates the entry, and it holds no pointer into the
+     * world, so destroying components or entities cannot make it stale.
+     */
+    [[nodiscard]] const Reflection::DefaultInstance* DefaultsFor(const std::string& componentName) const;
+
     Entity m_Entity;  //!< What the list describes; a null handle means "nothing built".
     Size m_StructureVersion = 0;
     std::vector<PropertyField> m_Fields;
+
+    //! Component type name -> its default instance. Keyed by string because that is what PropertyField carries and
+    //  what the registry is looked up by; the number of distinct component types on one entity is small enough that a
+    //  map's lookup cost is irrelevant next to drawing the rows.
+    // mutable: IsDefault is a read-only query and the panel calls it per field per frame, but the first call for a type
+    // has to construct its default instance. Caching inside a const query is the only way to avoid re-allocating there.
+    mutable std::map<std::string, std::unique_ptr<Reflection::DefaultInstance>> m_Defaults;
 };
 
 }  // namespace Hollowpoint::Editor

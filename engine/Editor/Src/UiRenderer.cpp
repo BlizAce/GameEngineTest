@@ -257,7 +257,13 @@ void UiRenderer::Impl::RefreshTextures(ImDrawData* drawData)
 
         const bool wantsCreate = tex->Status == ImTextureStatus_WantCreate;
         const bool wantsUpdate = tex->Status == ImTextureStatus_WantUpdates;
-        if (!wantsCreate && !wantsUpdate)
+        // ImGui asks for a texture only until we report it handled, and never again — but our own entry can outlive that
+        // handshake by vanishing underneath it: EnsurePipeline drops every cached atlas when it rebuilds for a different
+        // target format (offscreen capture does exactly that). Honouring ImGui's OK then leaves the id permanently
+        // unmapped, so BindingsForCommand falls through to the opaque white fallback and every glyph draws as a solid
+        // block — white multiplied out of the rest of the frame, which is why nothing else looked wrong. Re-issue here
+        // instead: the pixel data is still resident on the ImTextureData, so the atlas is rebuilt from it on next frame.
+        if (!wantsCreate && !wantsUpdate && existing != Textures.end())
         {
             continue;  // OK: nothing this backend must do
         }

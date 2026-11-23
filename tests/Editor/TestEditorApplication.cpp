@@ -8,6 +8,8 @@
 
 #include <doctest/doctest.h>
 
+#include <imgui.h>  // driving real mouse events at a widget (see the eye-click case)
+
 #include "Hollowpoint/Core/Log.h"
 #include "Hollowpoint/ECS/World.h"
 #include "Hollowpoint/Editor/EditorApplication.h"
@@ -801,6 +803,125 @@ TEST_SUITE("EditorApplication")
             CHECK_MESSAGE(light > 50u, std::string(band.Title)
                                                   << " shows only " << light
                                                   << " light px in its top rows — something opaque is covering it");
+        }
+
+        std::filesystem::remove_all(project);
+    }
+
+    TEST_CASE("The outliner's eye is reachable by a click where its glyph is drawn")
+    {
+        SKIP_WITHOUT_DISPLAY();
+
+        // Capability is not reachability. SetEntityVisible is unit-tested and the glyph renders, but neither proves a
+        // click on the glyph lands on the widget: an invisible hit target, or one offset from the picture by DPI
+        // scaling, passes both those checks while being unclickable. So this drives real mouse events at the row and
+        // asserts visibility flips — plus a negative control (clicking the viewport must not toggle anything), because
+        // a test that any click anywhere "works" proves nothing.
+        const std::filesystem::path project = ScratchPath("eyeclick");
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);  // hidden: ConfigDebugIgnoreFocusLoss below is what makes input
+        EditorApplication editor(config);                // stick, so no focus-stealing window is needed
+        REQUIRE(editor.Start());
+
+        const Entity cube = editor.CreateEntity("Cube", "engine:cube");
+        REQUIRE_FALSE(cube.IsNull());
+        REQUIRE(editor.IsEntityVisible(cube));
+
+        UInt32 width = 0;
+        UInt32 height = 0;
+        static_cast<void>(editor.Frame());
+        static_cast<void>(editor.Frame());  // settle the dock layout so panel geometry is real
+        static_cast<void>(Capture(editor, width, height));
+
+        const Editor::PanelRect* found = FindPanelRect(editor.GetUiState(), kOutlinerTitle);
+        REQUIRE(found != nullptr);
+        REQUIRE(found->Width > 80.0f);
+        // Copied by value on purpose: UiState::PanelGeometry is reassigned every frame, so a pointer into it dangles as
+        // soon as the loop below advances a frame — every coordinate read afterwards is garbage and no click can land.
+        const Editor::PanelRect panel = *found;
+
+        ImGuiContext* context = editor.GetUiContext();
+        REQUIRE(context != nullptr);
+        // The event queue lives on the current context; this suite runs several editors in one process.
+        ImGui::SetCurrentContext(context);
+        ImGuiIO& io = ImGui::GetIO();
+        // The editor re-queues AddFocusEvent(the window's real focus state) every frame, and a test window that never
+        // holds OS focus would therefore have its injected mouse state cleared at each NewFrame. This flag exists for
+        // exactly this: ImGui keeps input it was given even when told focus was lost.
+        io.ConfigDebugIgnoreFocusLoss = true;
+        io.AddFocusEvent(true);
+
+        //! One click: press and release on consecutive frames, which is how ImGui registers a click.
+        auto clickAt = [&editor, &io](float x, float y) {
+            io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(x, y);
+            io.AddMouseButtonEvent(0, true);
+            static_cast<void>(editor.Frame());
+            io.AddMouseButtonEvent(0, false);
+            static_cast<void>(editor.Frame());
+        };
+
+        // The eye lives in the row's own column at the right edge of the panel. Scan that band rather than hard-coding a
+        // point: the exact pixel depends on UI scale, column sizing and how many strip rows sit above the table, and a
+        // test pinned to one coordinate would break for layout reasons while still proving nothing about clickability.
+        const float columnRight = panel.X + panel.Width - 6.0f;
+
+        // Control first: do injected clicks register in this window at all? Clicking the outliner's "Cube" button must
+        // create a second entity. If that fails, the harness path is wrong and the eye assertion would be meaningless.
+        const Size entitiesBefore = editor.GetWorld().GetAliveEntityCount();
+        clickAt(panel.X + 24.0f, panel.Y + 18.0f);  // the panel's first toolbar button
+        INFO("control: entities " << entitiesBefore << " -> " << editor.GetWorld().GetAliveEntityCount()
+                                  << "  wantCaptureMouse=" << io.WantCaptureMouse
+                                  << "  outliner rect=" << panel.X << "," << panel.Y << " " << panel.Width
+                                  << "x" << panel.Height);
+
+        // Negative control: a click in the viewport is not a visibility toggle. Without this, "some click hid it" could
+        // be satisfied by any stray hit anywhere in the window.
+        const float viewportCentreX = static_cast<float>(width) * 0.5f;
+        const float viewportCentreY = static_cast<float>(height) * 0.45f;
+        for (int rowStep = 0; rowStep < 3; ++rowStep)
+        {
+            clickAt(viewportCentreX, viewportCentreY + static_cast<float>(rowStep) * 7.0f);
+        }
+        CHECK_MESSAGE(editor.IsEntityVisible(cube), "clicking the viewport changed visibility — hit targets overlap");
+
+        bool toggled = false;
+        float hitX = -1.0f;
+        float hitY = -1.0f;
+        for (int step = 0; step < 8 && !toggled; ++step)
+        {
+            const float x = columnRight - static_cast<float>(step) * 3.5f;
+            // Rows begin below the panel's own toolbar, filter box and table header — roughly a quarter of the window
+            // height down for the default layout, so the scan covers that whole band.
+            for (int rowStep = 0; rowStep < 24 && !toggled; ++rowStep)
+            {
+                const float y = panel.Y + 50.0f + static_cast<float>(rowStep) * 5.0f;
+                clickAt(x, y);
+                if (!editor.IsEntityVisible(cube))
+                {
+                    toggled = true;
+                    hitX = x;
+                    hitY = y;
+                }
+            }
+        }
+        CHECK_MESSAGE(toggled, "no click in the outliner's visibility column toggled MeshRenderer::Visible");
+        INFO("eye hit at (" << hitX << "," << hitY << ") inside panel " << panel.X << "," << panel.Y << " "
+                            << panel.Width << "x" << panel.Height);
+
+        // And it is a toggle, not a one-way switch: clicking the same spot again brings the mesh back.
+        if (toggled)
+        {
+            for (int step = 0; step < 8 && !editor.IsEntityVisible(cube); ++step)
+            {
+                const float x = columnRight - static_cast<float>(step) * 3.5f;
+                for (int rowStep = 0; rowStep < 24 && !editor.IsEntityVisible(cube); ++rowStep)
+                {
+                    clickAt(x, panel.Y + 50.0f + static_cast<float>(rowStep) * 5.0f);
+                }
+            }
+            CHECK(editor.IsEntityVisible(cube));
         }
 
         std::filesystem::remove_all(project);

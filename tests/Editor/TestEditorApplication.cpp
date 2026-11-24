@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -19,6 +20,7 @@
 #include "Hollowpoint/Editor/EditorPanels.h"
 #include "Hollowpoint/Editor/EditorSelection.h"
 #include "Hollowpoint/Editor/EntityName.h"
+#include "Hollowpoint/Editor/ViewCamera.h"
 #include "Hollowpoint/Game/MeshRenderer.h"
 #include "Hollowpoint/Platform/PlatformInit.h"
 #include "Hollowpoint/Scene/LocalTransform.h"
@@ -563,6 +565,38 @@ TEST_SUITE("EditorApplication")
         // view.speed and ui.scale are clamped, so a mistyped value cannot produce an unusable editor.
         CHECK(editor.RunStartupCommand("view.speed 0.0001"));
         CHECK_FALSE(editor.RunStartupCommand("view.speed -5"));
+
+        // --- view.show: the viewport toolbar's Show menu, command twin ---------------------------------------
+        // The menu item and this line must agree, so both are asserted against the same field. Argument handling
+        // matters more here than it looks: "1"/"true"/anything-else is the whole parsing surface of a toggle command,
+        // and a silently-accepted typo (`view.show compas 0`) would leave an author believing an overlay was hidden.
+        const Editor::UiState* state = editor.GetUiState();
+        REQUIRE(state != nullptr);
+
+        CHECK(editor.RunStartupCommand("view.show compass 0"));
+        CHECK_FALSE(state->ShowViewportCompass);
+        CHECK(editor.RunStartupCommand("view.show compass true"));
+        CHECK(state->ShowViewportCompass);
+
+        CHECK(editor.RunStartupCommand("view.show hint 0"));
+        CHECK_FALSE(state->ShowViewportHint);
+        CHECK(editor.RunStartupCommand("view.show info 1"));
+        CHECK(state->ShowViewportInfo);
+
+        // Rejected forms must leave the flag exactly as it was — the same rule `viewport.camera` is tested on above.
+        CHECK(editor.RunStartupCommand("view.show compass 1"));
+        CHECK_FALSE(editor.RunStartupCommand("view.show compas 0"));
+        CHECK(state->ShowViewportCompass);
+        CHECK_FALSE(editor.RunStartupCommand("view.show compass"));
+        CHECK_FALSE(editor.RunStartupCommand("view.show compass 0 extra"));
+
+        // The readout is a diagnostic, so Reset Layout returns it to off rather than switching every overlay on: the
+        // state after a reset has to be the state a fresh session starts in, or "reset" means nothing.
+        CHECK(editor.RunStartupCommand("view.show info 1"));
+        CHECK(state->ShowViewportInfo);
+        CHECK(editor.RunStartupCommand("layout.reset"));
+        CHECK_FALSE(state->ShowViewportInfo);
+        CHECK(state->ShowViewportCompass);
 
         std::filesystem::remove_all(project);
     }
@@ -1132,6 +1166,273 @@ TEST_SUITE("EditorApplication")
         INFO("hit=(" << hitX << "," << hitY << ") panel " << panel.X << "," << panel.Y << " " << panel.Width << "x"
                      << panel.Height << " roughness=" << renderer->Roughness);
         CHECK(reset);
+
+        std::filesystem::remove_all(project);
+    }
+
+    TEST_CASE("The viewport toolbar's Show menu toggles the axis compass, visibly")
+    {
+        SKIP_WITHOUT_DISPLAY();
+
+        // Three claims, each of which the others cannot prove: the dropdown opens from a click on its label (not from
+        // some other point in the strip), its item flips the state flag, and flipping that flag changes pixels inside
+        // the viewport. The last one is what separates this from the dozens of controls in an editor that set a bool
+        // nothing reads — and it is checked by diffing the frame with the overlay off and then back on, so scene drift
+        // cannot satisfy it (nothing animates in edit mode; the camera is fixed).
+        const std::filesystem::path project = ScratchPath("vpshow");
+        std::filesystem::remove_all(project);
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+        REQUIRE_FALSE(editor.CreateEntity("Cube", "engine:cube").IsNull());
+
+        UInt32 width = 0;
+        UInt32 height = 0;
+        static_cast<void>(editor.Frame());
+        static_cast<void>(editor.Frame());  // settle the dock layout so panel geometry is real
+        const std::vector<unsigned char> withCompass = Capture(editor, width, height);
+
+        const Editor::PanelRect* found = FindPanelRect(editor.GetUiState(), kViewportTitle);
+        REQUIRE(found != nullptr);
+        const Editor::PanelRect viewportPanel = *found;  // by value: PanelGeometry is reassigned every frame
+        REQUIRE(viewportPanel.Width > 80.0f);
+
+        ImGuiContext* context = editor.GetUiContext();
+        REQUIRE(context != nullptr);
+        ImGui::SetCurrentContext(context);
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigDebugIgnoreFocusLoss = true;
+        io.AddFocusEvent(true);
+
+        auto pressAndObserve = [&editor, &io, &context](float x, float y) {
+            io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(x, y);
+            io.AddMouseButtonEvent(0, true);
+            static_cast<void>(editor.Frame());
+            const bool anyPopupOpen = context->OpenPopupStack.Size > 0;
+            io.AddMouseButtonEvent(0, false);
+            static_cast<void>(editor.Frame());
+            return anyPopupOpen;
+        };
+
+        // Find the dropdown by pressing across its row rather than hard-coding a point: the strip sits below the
+        // panel's tab bar, whose height depends on the theme and scale, and a test pinned to one y would fail for
+        // layout reasons while proving nothing about clickability.
+        float menuX = -1.0f;
+        float menuY = -1.0f;
+        for (int yStep = 0; yStep < 8 && menuX < 0.0f; ++yStep)
+        {
+            const float candidateY = viewportPanel.Y + 22.0f + static_cast<float>(yStep) * 4.0f;
+            for (int xStep = 0; xStep < 8 && menuX < 0.0f; ++xStep)
+            {
+                const float candidateX = viewportPanel.X + 12.0f + static_cast<float>(xStep) * 10.0f;
+                if (pressAndObserve(candidateX, candidateY))
+                {
+                    menuX = candidateX;
+                    menuY = candidateY;
+                }
+            }
+        }
+        REQUIRE_MESSAGE(menuX >= 0.0f, "no press in the viewport toolbar's left end opened a dropdown");
+
+        // Re-open and drive its first item from the popup's own measured rect (a menu near an edge can flip sides, so
+        // offsets from the label are not trustworthy).
+        if (context->OpenPopupStack.Size == 0)
+        {
+            static_cast<void>(pressAndObserve(menuX, menuY));
+        }
+        REQUIRE(context->OpenPopupStack.Size > 0);
+        ImGuiWindow* popup = context->OpenPopupStack.back().Window;
+        REQUIRE(popup != nullptr);
+        const ImVec2 popupPos = popup->Pos;
+        INFO("popup at " << popupPos.x << "," << popupPos.y << " size " << popup->Size.x << "x" << popup->Size.y);
+
+        // The first item is the axis-compass checkbox. Its square sits at the row's left, inside the popup's padding;
+        // clicking there lands on the widget whether or not the label extends further.
+        const float lineHeight = ImGui::GetFrameHeight();
+        bool flippedByClick = false;
+        for (int step = 0; step < 4 && !flippedByClick; ++step)
+        {
+            io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(popupPos.x + 12.0f, popupPos.y + 8.0f + static_cast<float>(step) * lineHeight);
+            io.AddMouseButtonEvent(0, true);
+            static_cast<void>(editor.Frame());
+            io.AddMouseButtonEvent(0, false);
+            static_cast<void>(editor.Frame());
+            flippedByClick = editor.GetUiState() != nullptr && !editor.GetUiState()->ShowViewportCompass;
+        }
+        CHECK_MESSAGE(flippedByClick, "clicking the Show menu's first item did not hide the axis compass");
+
+        // --- the flag that menu writes actually changes pixels ---------------------------------------------
+        // Reachability is proven above (a real click flipped UiState::ShowViewportCompass); what remains is that some-
+        // thing *reads* it. Driven by `view.show` rather than by more clicks so the two captures differ only by the
+        // overlay — no popup in either frame — and with the navigation hint switched off, since it appears and vanishes
+        // with pointer position and would be an uncontrolled variable.
+        //
+        // The comparison is restricted to the compass's own square rather than the whole frame. Measured, not assumed:
+        // a whole-frame diff reports ~0.1% differing pixels even when the overlay is hard-wired on, because the status
+        // bar's fps readout changes between captures — so "> 0 over the frame" passes for the wrong reason and would
+        // have called a dead toggle a working one. Inside the compass rect the same-state control pair comes out at
+        // zero, which is what makes "hiding it changed pixels here" mean something.
+        CHECK(editor.RunStartupCommand("view.show hint 0"));
+
+        const Editor::ViewportInteraction& view = editor.GetUiState()->Viewport;
+        REQUIRE(view.ImageWidth > 120.0f);
+        REQUIRE(view.ImageHeight > 120.0f);
+        // Where DrawViewportOverlay puts the disc: centre at (right - 52, top + 46), radius 30, plus its plate.
+        const UInt32 regionX = static_cast<UInt32>(view.ImageScreenLeft + view.ImageWidth - 88.0f);
+        const UInt32 regionY = static_cast<UInt32>(view.ImageScreenTop + 6.0f);
+        const UInt32 regionSize = 80u;
+
+        auto countDifferences = [width](const std::vector<unsigned char>& a, const std::vector<unsigned char>& b,
+                                        UInt32 x0, UInt32 y0, UInt32 side) {
+            Size differing = 0;
+            for (UInt32 y = y0; y < y0 + side; ++y)
+            {
+                for (UInt32 x = x0; x < x0 + side; ++x)
+                {
+                    const Size base = (static_cast<Size>(y) * width + x) * 4u;
+                    if (base + 2u >= a.size())
+                    {
+                        continue;
+                    }
+                    const int delta = static_cast<int>(a[base]) - static_cast<int>(b[base]);
+                    const int deltaG = static_cast<int>(a[base + 1]) - static_cast<int>(b[base + 1]);
+                    const int deltaB = static_cast<int>(a[base + 2]) - static_cast<int>(b[base + 2]);
+                    if (delta > 6 || delta < -6 || deltaG > 6 || deltaG < -6 || deltaB > 6 || deltaB < -6)
+                    {
+                        ++differing;
+                    }
+                }
+            }
+            return differing;
+        };
+
+        CHECK(editor.RunStartupCommand("view.show compass 1"));
+        static_cast<void>(editor.Frame());
+        const std::vector<unsigned char> compassOn = Capture(editor, width, height);
+
+        CHECK(editor.RunStartupCommand("view.show compass 0"));
+        static_cast<void>(editor.Frame());
+        const std::vector<unsigned char> compassOff = Capture(editor, width, height);
+
+        // Re-assert the flag through the same field the menu item's checkbox binds to, so a command that quietly wrote
+        // a different field could not satisfy the pixel checks below.
+        REQUIRE(editor.GetUiState() != nullptr);
+        CHECK_FALSE(editor.GetUiState()->ShowViewportCompass);
+
+        const Size hidden = countDifferences(compassOn, compassOff, regionX, regionY, regionSize);
+
+        // Control: the same state captured twice inside the same rect. Zero (or near it) here is what licenses reading
+        // `hidden` as "the compass" rather than as noise.
+        CHECK(editor.RunStartupCommand("view.show compass 1"));
+        static_cast<void>(editor.Frame());
+        const std::vector<unsigned char> compassOnAgain = Capture(editor, width, height);
+        const Size noiseFloor = countDifferences(compassOn, compassOnAgain, regionX, regionY, regionSize);
+
+        INFO("compass-region pixels differing: on-vs-off "
+             << hidden << ", same-state control " << noiseFloor << "  rect " << regionX << "," << regionY << " "
+             << regionSize << "x" << regionSize << "  menu hit (" << menuX << "," << menuY << ")");
+
+        // A disc of radius 30 covers ~2800 px, so a working toggle moves hundreds of pixels here; one is enough to fail
+        // the assertion above if nothing draws, and the bound below rules out a token difference from anti-aliasing.
+        CHECK_MESSAGE(hidden > 200u,
+                      "hiding the axis compass changed only " << hidden << " px in its own region — nothing reads it");
+        CHECK_MESSAGE(noiseFloor < hidden / 4u, "the same-state control differs by "
+                                                    << noiseFloor << " px against the toggle's " << hidden
+                                                    << "; the comparison cannot separate signal from noise");
+
+        std::filesystem::remove_all(project);
+    }
+
+    TEST_CASE("The viewport toolbar's fly-speed field is draggable and drives camera motion")
+    {
+        SKIP_WITHOUT_DISPLAY();
+
+        // The slider is the one control in this strip that binds straight to UiState::Navigation, so its risk is not
+        // "does the flag exist" but "does a drag land on the widget, and is the field it writes the one the camera
+        // maths reads". A field bound to a copy would move on screen forever while the camera never changed speed.
+        const std::filesystem::path project = ScratchPath("camspeed");
+        std::filesystem::remove_all(project);
+        std::filesystem::create_directories(project);
+
+        EditorConfig config = MakeTestConfig(project);
+        EditorApplication editor(config);
+        REQUIRE(editor.Start());
+
+        static_cast<void>(editor.Frame());
+        static_cast<void>(editor.Frame());  // settle the dock layout so panel geometry is real
+
+        const Editor::UiState* state = editor.GetUiState();
+        REQUIRE(state != nullptr);
+        const Editor::PanelRect* found = FindPanelRect(state, kViewportTitle);
+        REQUIRE(found != nullptr);
+        const Editor::PanelRect viewportPanel = *found;
+
+        ImGuiContext* context = editor.GetUiContext();
+        REQUIRE(context != nullptr);
+        ImGui::SetCurrentContext(context);
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigDebugIgnoreFocusLoss = true;
+        io.AddFocusEvent(true);
+
+        const float speedBefore = state->Navigation.FlyMetresPerSecond;
+        REQUIRE(speedBefore > 0.0f);
+
+        // Press, drag right by a fixed amount, release — the gesture an author makes. x is scanned because the field
+        // sits after the Show button and a text label, whose combined width depends on the theme's font metrics.
+        bool moved = false;
+        float hitX = -1.0f;
+        float hitY = -1.0f;
+        for (int yStep = 0; yStep < 8 && !moved; ++yStep)
+        {
+            const float y = viewportPanel.Y + 22.0f + static_cast<float>(yStep) * 4.0f;
+            for (int xStep = 0; xStep < 16 && !moved; ++xStep)
+            {
+                const float x = viewportPanel.X + 50.0f + static_cast<float>(xStep) * 8.0f;
+                io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+                io.AddMousePosEvent(x, y);
+                io.AddMouseButtonEvent(0, true);
+                static_cast<void>(editor.Frame());
+                // A steady drag: ImGui's drag widgets accumulate from the mouse delta, so the pointer has to actually
+                // move across frames rather than jump.
+                for (int step = 1; step <= 4; ++step)
+                {
+                    io.AddMousePosEvent(x + static_cast<float>(step) * 9.0f, y);
+                    static_cast<void>(editor.Frame());
+                }
+                io.AddMouseButtonEvent(0, false);
+                static_cast<void>(editor.Frame());
+
+                if (state->Navigation.FlyMetresPerSecond != speedBefore)
+                {
+                    moved = true;
+                    hitX = x;
+                    hitY = y;
+                }
+            }
+        }
+        CHECK_MESSAGE(moved, "no drag in the viewport toolbar changed Navigation::FlyMetresPerSecond (was "
+                                 << speedBefore << ")");
+        INFO("speed " << speedBefore << " -> " << state->Navigation.FlyMetresPerSecond << " dragging at (" << hitX
+                      << "," << hitY << ") panel " << viewportPanel.X << "," << viewportPanel.Y);
+
+        // The camera reads the same field: FlyView is unit-tested against ViewNavigationSpeeds, so what is verified
+        // here is that a dragged value survives into the state the application passes to it — which the toolbar's own
+        // binding could get wrong (a local copy would move on screen and change nothing).
+        CHECK(editor.RunStartupCommand("view.speed 40"));
+        const float commanded = state->Navigation.FlyMetresPerSecond;
+        CHECK(commanded == doctest::Approx(40.0));
+
+        Math::Vec3 eye(0.0f, 0.0f, 0.0f);
+        Math::Vec3 target(0.0f, 0.0f, -10.0f);
+        Editor::ViewAxisInput forward;
+        forward.Forward = 1.0f;
+        static_cast<void>(Editor::FlyView(eye, target, forward, 1.0f, state->Navigation));
+        CHECK_MESSAGE(std::abs(eye.Z) > 30.0f,
+                      "at a commanded 40 m/s one second of flight moved the eye to z=" << eye.Z);
 
         std::filesystem::remove_all(project);
     }

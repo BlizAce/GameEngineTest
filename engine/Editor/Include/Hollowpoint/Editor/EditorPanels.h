@@ -136,6 +136,20 @@ struct HP_EDITOR_API UiState
     bool ShowContent = true;
     bool ShowConsole = true;
 
+    //! Viewport overlays, toggled by the viewport toolbar's Show menu and by `view.show`.
+    /**
+     * These are the only three things in the viewport that can actually be switched off: every other candidate for a
+     * UE-style "Show" submenu (Grid, Lights, Billboards, Camera Speed Lock) has no renderer support yet, and this
+     * file's rule is that an affordance with no effect is worse than a missing one. Each flag here has a consumer in
+     * DrawViewportOverlay, so toggling it changes pixels — which is what the tests assert.
+     */
+    bool ShowViewportCompass = true;
+    bool ShowViewportHint = true;
+
+    //! Rendered-vs-displayed extent of the scene image, drawn in the viewport's bottom-left when on. Off by default:
+    //  it is a diagnostic, and the numbers are already one `layout.report` away for anyone who wants them permanently.
+    bool ShowViewportInfo = false;
+
     //! Viewport gesture state, filled by DrawViewportPanel and consumed by EditorApplication::RenderScenePass.
     ViewportInteraction Viewport;
 

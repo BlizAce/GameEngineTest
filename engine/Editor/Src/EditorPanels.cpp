@@ -255,6 +255,46 @@ bool IconToggleButton(const EditorIconSet* icons, const char* name, const char* 
     return clicked;
 }
 
+//! A toolbar dropdown: a compact button with its arrow against its own label, plus the popup it opens.
+/**
+ * ImGui's BeginMenu is written for menu bars and for vertical menus, not for a toolbar row: in a normal window it takes
+ * `Selectable` with SpanAvailWidth, so the hit area runs to the window's right edge and the submenu arrow is painted at
+ * that far edge — which is why the outliner's "Create" button had a detached `▶` sitting ~300 px away from the word it
+ * belonged to, next to the panel's border. A reader takes it for a separate control (a collapse toggle) and clicks it.
+ *
+ * Button + OpenPopup + BeginPopup is the standard way out: same popup semantics (and the same ImGui::OpenPopupStack a
+ * test can inspect), but the button sizes to its label and the arrow is drawn where the label ends. The arrow is
+ * geometry via RenderArrow rather than a "▾" character, because there is no guarantee the loaded font carries that
+ * glyph — and a missing glyph renders as nothing, i.e. exactly the affordance we are trying to add.
+ *
+ * Returns true while the popup is open, so the caller's items sit inside it and must end with EndPopup().
+ */
+bool ToolbarDropdown(const char* popupId, const char* label)
+{
+    const float arrowRoom = ImGui::GetFontSize() * 1.4f;
+    const ImVec2 labelSize = ImGui::CalcTextSize(label);
+    ImGui::Button(label, ImVec2(labelSize.x + arrowRoom, 0.0f));
+
+    // Open on press, not on release. A Button reports "clicked" only once the button is let go, which would make this
+    // control behave unlike every other menu in the window (and unlike UE): press-drag-release onto an item — the way
+    // menus are actually used — would never work, and a scripted press could not even see the menu open. IsMouseClicked
+    // is the press edge of the raw input, so it fires on the frame the button goes down regardless of the Button having
+    // consumed the click; the hover test is what stops a covered button from opening its menu.
+    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+    {
+        ImGui::OpenPopup(popupId);
+    }
+
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 size = ImGui::GetItemRectSize();
+    ImGui::RenderArrow(ImGui::GetWindowDrawList(),
+                       ImVec2(min.x + size.x - arrowRoom * 0.75f, min.y + (size.y - ImGui::GetFontSize()) * 0.5f),
+                       ImGui::GetColorU32(ImGuiCol_Text), ImGuiDir_Down);
+
+    ImGui::SameLine();
+    return ImGui::BeginPopup(popupId);
+}
+
 // ---------------------------------------------------------------------------
 // Dock layout
 // ---------------------------------------------------------------------------
@@ -280,6 +320,15 @@ constexpr float kLeftSplit = 0.20f;
 constexpr float kRightSplitOfRemaining = 0.28f;
 constexpr float kBottomSplitOfRemaining = 0.30f;
 constexpr float kContentShareOfBottom = 0.34f;
+
+//! Bounds offered by the viewport toolbar's fly-speed slider.
+/**
+ * The `view.speed` command is deliberately looser (it only rejects non-positive values), so these are the widget's
+ * limits rather than the engine's: a drag control gives no other way to reject nonsense, and at zero the camera goes
+ * dead with nothing on screen to explain it. Named here rather than inline because the numbers are a judgement call
+ * about feel that the next person will want to find and argue with. */
+constexpr float kMinFlySpeed = 0.1f;
+constexpr float kMaxFlySpeed = 250.0f;
 
 //! Height of the bottom status strip, in content units at 1x scale.
 /**
@@ -583,6 +632,38 @@ void RegisterUiCommands(EditorConsole& console, UiState& state, EditorApplicatio
             return true;
         });
 
+    // The viewport's own overlays get a command as well as the Show menu, for the same reason every other affordance
+    // here does: one implementation, so the menu item and a typed line cannot disagree about what "turn off the
+    // compass" means. Only overlays with a real consumer in DrawViewportOverlay are accepted — an alias for something
+    // that does nothing would advertise a feature the renderer lacks.
+    console.RegisterFixed(
+        "view.show", "Show or hide a viewport overlay: view.show <compass|hint|info> <0|1>.", ArgumentCount::Exact, 2,
+        [&state](const std::vector<std::string>& arguments, std::string& outReply, std::string& outError) {
+            const bool visible = arguments[1] != "0" && ToLower(arguments[1]) != "false";
+            const std::string which = ToLower(arguments[0]);
+
+            if (which == "compass")
+            {
+                state.ShowViewportCompass = visible;
+            }
+            else if (which == "hint")
+            {
+                state.ShowViewportHint = visible;
+            }
+            else if (which == "info")
+            {
+                state.ShowViewportInfo = visible;
+            }
+            else
+            {
+                outError = "unknown overlay \"" + arguments[0] + "\" (compass, hint, info)";
+                return false;
+            }
+
+            outReply = which + " " + (visible ? "shown" : "hidden");
+            return true;
+        });
+
     // Layout and appearance commands exist because a docked layout you cannot get back to is a worse tool than a fixed
     // one: the first thing an author does after scattering panels is look for Reset Layout, and there was nothing.
     console.RegisterFixed("layout.reset", "Restore the default panel layout, showing any hidden panel.",
@@ -596,6 +677,13 @@ void RegisterUiCommands(EditorConsole& console, UiState& state, EditorApplicatio
                               state.ShowDetails = true;
                               state.ShowContent = true;
                               state.ShowConsole = true;
+
+                              // Viewport overlays too — but back to their *defaults*, not all-on: the extent readout is
+                              // a diagnostic that stays off unless asked for, and a reset that switched it on would
+                              // leave the editor in a state no fresh session ever has.
+                              state.ShowViewportCompass = true;
+                              state.ShowViewportHint = true;
+                              state.ShowViewportInfo = false;
 
                               // Deferred to the next DrawEditorPanels: the docking builder needs a submitted dockspace,
                               // and this command can run before any frame exists (--command layout.reset).
@@ -1043,12 +1131,16 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
     // Toolbar first: the actions are what an author reaches for constantly, and hiding them below the list (as before)
     // meant scrolling to create an entity in a long scene.
     //
-    // One "Create" menu rather than one button per actor type, matching UE's Outliner. Every entry runs the same console
-    // command the text console takes, so the menu, the console and a scripted run cannot drift apart — and each lands in
-    // the Output Log, which flat buttons did not report anywhere. Only meshes the runtime actually resolves are offered:
-    // BuiltInMeshes registers cube, plane and cube-large (engine), so an entry here with no resolvable path would create
-    // an entity that logs "asset not available" and draws nothing.
-    if (ImGui::BeginMenu("Create"))
+    // One "Create" menu rather than one button per actor type, matching UE's Outliner. Every entry runs the same
+    // console command the text console takes, so the menu, the console and a scripted run cannot drift apart — and each
+    // lands in the Output Log, which flat buttons did not report anywhere. Only meshes the runtime actually resolves
+    // are offered: BuiltInMeshes registers cube, plane and cube-large (engine), so an entry here with no resolvable
+    // path would create an entity that logs "asset not available" and draws nothing.
+    //
+    // ToolbarDropdown rather than BeginMenu: as a BeginMenu this row claimed the panel's whole width and painted its
+    // submenu arrow against the panel's right border, ~300 px from the word it belonged to — legible as a separate
+    // control (and measured in a capture, not assumed).
+    if (ToolbarDropdown("##OutlinerCreateMenu", "Create"))
     {
         if (ImGui::MenuItem("Empty Actor", nullptr, false, context.Application != nullptr))
         {
@@ -1062,10 +1154,11 @@ void DrawOutlinerPanel(UiState& state, const PanelContext& context)
         {
             state.Run("entity.create Plane engine:plane");
         }
-        ImGui::EndMenu();
+        ImGui::EndPopup();
     }
-    ImGui::SameLine();
 
+    // ToolbarDropdown leaves the cursor on its own row (it calls SameLine itself, like IconButton), so Delete follows
+    // on the same line without the caller having to remember to arrange it.
     const bool canDelete = !state.Selection.IsEmpty();
     if (!canDelete)
     {
@@ -1676,39 +1769,147 @@ void DrawCompassAxis(ImDrawList& drawList, const ImVec2& origin, const Vec3& axi
  * reserving layout rows is what made the old viewport compute its size twice (once for the image, once for the text)
  * and get both wrong.
  */
-void DrawViewportOverlay(const PanelContext& context, const ImVec2& imageMin, const ImVec2& imageSize)
+void DrawViewportOverlay(UiState& state, const PanelContext& context, const ImVec2& imageMin, const ImVec2& imageSize)
 {
     ImDrawList* drawList = ImGui::GetWindowDrawList();
 
     // A translucent plate behind the compass keeps it legible over a bright sky, which a bare line drawing never is.
-    const ImVec2 compassCentre(imageMin.x + imageSize.x - 52.0f, imageMin.y + 46.0f);
-    drawList->AddCircleFilled(compassCentre, 30.0f, IM_COL32(12, 13, 15, 140));
+    if (state.ShowViewportCompass)
+    {
+        const ImVec2 compassCentre(imageMin.x + imageSize.x - 52.0f, imageMin.y + 46.0f);
+        drawList->AddCircleFilled(compassCentre, 30.0f, IM_COL32(12, 13, 15, 140));
 
-    const ViewBasis basis = GetViewBasis(context.CameraPosition, context.CameraTarget);
-    DrawCompassAxis(*drawList, compassCentre, Vec3(1.0f, 0.0f, 0.0f), basis, 20.0f, IM_COL32(224, 92, 92, 255), "X");
-    DrawCompassAxis(*drawList, compassCentre, Vec3(0.0f, 1.0f, 0.0f), basis, 20.0f, IM_COL32(120, 214, 120, 255), "Y");
-    DrawCompassAxis(*drawList, compassCentre, Vec3(0.0f, 0.0f, 1.0f), basis, 20.0f, IM_COL32(108, 156, 244, 255), "Z");
+        const ViewBasis basis = GetViewBasis(context.CameraPosition, context.CameraTarget);
+        DrawCompassAxis(*drawList, compassCentre, Vec3(1.0f, 0.0f, 0.0f), basis, 20.0f, IM_COL32(224, 92, 92, 255),
+                        "X");
+        DrawCompassAxis(*drawList, compassCentre, Vec3(0.0f, 1.0f, 0.0f), basis, 20.0f, IM_COL32(120, 214, 120, 255),
+                        "Y");
+        DrawCompassAxis(*drawList, compassCentre, Vec3(0.0f, 0.0f, 1.0f), basis, 20.0f, IM_COL32(108, 156, 244, 255),
+                        "Z");
+    }
 
     // Navigation hint, top-left, only while navigating or when the pointer is over the viewport — a permanent caption
     // would be noise after the first minute and the point is to teach the controls, not decorate the panel.
-    ImGui::SetCursorScreenPos(ImVec2(imageMin.x + 10.0f, imageMin.y + 8.0f));
-    if (context.ViewportHintVisible)
+    if (state.ShowViewportHint && context.ViewportHintVisible)
     {
+        ImGui::SetCursorScreenPos(ImVec2(imageMin.x + 10.0f, imageMin.y + 8.0f));
         ImGui::TextColored(ImVec4(0.75f, 0.78f, 0.83f, 0.92f),
                            "RMB fly · MMB orbit · Shift sprint · wheel zoom · LMB select · F frame");
+    }
+
+    // Rendered-vs-displayed extent plus the fly speed, bottom-left, on demand only (Show > Extent readout). This exists
+    // because the two questions a viewport that "looks wrong" asks are whether the image is being resampled and how
+    // fast it will move — and both answers used to need `layout.report`, then squinting at numbers in a wall of text.
+    // Printed against each other here, a mismatch (which is what a crop *is*) reads off the viewport itself. The speed
+    // is included because a fly-speed control with no readout makes "what did that slider do?" unanswerable.
+    if (state.ShowViewportInfo)
+    {
+        char extent[128];
+        std::snprintf(extent, sizeof(extent), "rendered %.0fx%.0f · displayed %.0fx%.0f · fly %.1f m/s",
+                      static_cast<double>(context.RenderedWidth), static_cast<double>(context.RenderedHeight),
+                      static_cast<double>(imageSize.x), static_cast<double>(imageSize.y),
+                      static_cast<double>(state.Navigation.FlyMetresPerSecond));
+        const ImVec2 labelSize = ImGui::CalcTextSize(extent);
+        const ImVec2 textPos(imageMin.x + 8.0f, imageMin.y + imageSize.y - labelSize.y - 6.0f);
+        drawList->AddRectFilled(ImVec2(textPos.x - 4.0f, textPos.y - 2.0f),
+                                ImVec2(textPos.x + labelSize.x + 4.0f, textPos.y + labelSize.y + 2.0f),
+                                IM_COL32(12, 13, 15, 165));
+        drawList->AddText(textPos, IM_COL32(198, 204, 212, 255), extent);
     }
 }
 
 }  // namespace
 
+//! The viewport's own toolbar: controls that belong to the scene view rather than to the editor window.
+/**
+ * Drawn as a real row *inside* the panel, above the image — not as an overlay painted on top of it. UE floats its
+ * viewport toolbar over the scene, but here the image's extent is measured with GetContentRegionAvail so that the
+ * render target and the drawn rect agree by construction; a floating strip would either sit over the top rows of the
+ * scene or force an arithmetic subtraction of its own height, which is exactly the estimate that used to crop the
+ * viewport and sprout two scrollbars. A row costs the scene ~26 px and keeps every measurement honest.
+ *
+ * Like the main toolbar, it carries only actions that do something. UE's viewport toolbar also offers New/Open Level,
+ * Lit/Unlit/Wireframe shading, a Camera dropdown with saved viewpoints, Build and a Play (PIE) button: none of those
+ * have an implementation behind them in this engine yet (notes/EDITOR_UI_REVIEW.md F4), so they are absent rather than
+ * mocked.
+ */
+void DrawViewportToolBar(UiState& state, const PanelContext& context)
+{
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * state.UiScale, 0.0f));
+
+    // --- Show: the overlays this viewport can actually switch off -------------------------------------------
+    // Three items, and each one has a consumer in DrawViewportOverlay. That is the whole admission test for this menu:
+    // UE's Show submenu lists Grid, Lights, Billboards, Camera Speed Lock and friends, every one of which needs
+    // renderer support this engine does not have. A dropdown full of toggles that change nothing teaches people to
+    // distrust the dropdown, which is worse than a short one.
+    if (ToolbarDropdown("##ViewportShowMenu", "Show"))
+    {
+        ImGui::Checkbox("Axis compass", &state.ShowViewportCompass);
+        ImGui::Checkbox("Navigation hint", &state.ShowViewportHint);
+        // Off by default and labelled as what it is: the two numbers are already printed by `layout.report`, so this is
+        // for watching them while dragging a splitter rather than for everyday use.
+        ImGui::Checkbox("Extent readout", &state.ShowViewportInfo);
+        ImGui::Separator();
+        if (ImGui::MenuItem("All overlays on"))
+        {
+            state.ShowViewportCompass = true;
+            state.ShowViewportHint = true;
+        }
+        ImGui::EndPopup();
+    }
+
+    // --- Camera speed ---------------------------------------------------------------------------------------
+    // The same number `view.speed` sets, edited here because hunting for a console line to change how fast the camera
+    // moves is the single most annoying thing about editors that only expose it in a settings page. Bound straight to
+    // UiState::Navigation rather than through a command: Navigation *is* panel state (see EditorPanels.h), so unlike
+    // every other widget here there is no engine state to reach for, and one field keeps the slider, the console and
+    // the fly maths in agreement by construction.
+    ImGui::TextDisabled("Fly speed");
+    ImGui::SameLine();
+    float speed = state.Navigation.FlyMetresPerSecond;
+    // Bounded both ways because a drag widget gives no other chance to reject nonsense: at zero the camera stops and
+    // the author has no idea why, and past a few hundred metres per second a single frame's drag crosses the scene.
+    // Both bounds sit inside what `view.speed` accepts (any positive number), so the slider can never show a value the
+    // console would refuse — the loose direction is intentional: typing a speed is deliberate, dragging is not.
+    ImGui::PushItemWidth(110.0f * state.UiScale);
+    if (ImGui::DragFloat("##camspeed", &speed, 0.5f * state.UiScale, kMinFlySpeed, kMaxFlySpeed, "%.1f m/s"))
+    {
+        state.Navigation.FlyMetresPerSecond = speed;
+    }
+    ImGui::PopItemWidth();
+    ImGui::SetItemTooltip(
+        "WASD/QE movement speed while the pointer is over the viewport.\nShift multiplies it by %.0f.",
+        static_cast<double>(state.Navigation.SprintMultiplier));
+
+    // --- Right-aligned: where the camera is -------------------------------------------------------------------
+    // The compass says which way; this says from where. Cheap and always true, and it makes the empty right-hand side
+    // of the strip informative instead of decorative.
+    const Vec3 camera = context.CameraPosition;
+    char where[80];
+    std::snprintf(where, sizeof(where), "%.1f, %.1f, %.1f", static_cast<double>(camera.X),
+                  static_cast<double>(camera.Y), static_cast<double>(camera.Z));
+    const float labelWidth = ImGui::CalcTextSize(where).x;
+    // Offset rather than a right-align helper: SameLine takes a distance from the window's content origin, so the
+    // target is "wherever this row still has room, minus the label". Measuring the remaining width instead of assuming
+    // the panel is N pixels wide is what keeps the readout inside the strip when the splitter moves.
+    ImGui::SameLine(std::max(0.0f, ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - labelWidth));
+    ImGui::TextDisabled("%s", where);
+
+    ImGui::PopStyleVar();
+}
+
 void DrawViewportPanel(UiState& state, const PanelContext& context)
 {
     ImGui::Begin(kViewportTitle);
 
+    DrawViewportToolBar(state, context);
+
     // The image takes the panel's entire remaining content area. This is the fix for the crop: previously the scene was
-    // rendered at an *estimated* window-minus-panels extent and then drawn at that fixed pixel size, so it overflowed the
-    // panel by ~130 px, got clipped, and sprouted two scrollbars — while being projected at an aspect ratio nobody could
-    // see. Measuring here means the render target and the drawn rect agree by construction.
+    // rendered at an *estimated* window-minus-panels extent and then drawn at that fixed pixel size, so it overflowed
+    // the panel by ~130 px, got clipped, and sprouted two scrollbars — while being projected at an aspect ratio nobody
+    // could see. Measuring here means the render target and the drawn rect agree by construction. Measurement happens
+    // *after* the toolbar row above for exactly that reason: whatever the strip costs in height is subtracted rather
+    // than guessed.
     ImVec2 available = ImGui::GetContentRegionAvail();
     if (available.x < 1.0f)
     {
@@ -1759,7 +1960,7 @@ void DrawViewportPanel(UiState& state, const PanelContext& context)
     viewport.PointerOverImage =
         ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) && !ImGui::GetIO().WantCaptureMouse;
 
-    DrawViewportOverlay(context, imageMin, available);
+    DrawViewportOverlay(state, context, imageMin, available);
 
     // --- input: read here (after NewFrame, where ImGui's edge detection is defined), apply next frame in the app ----
     const ImGuiIO& io = ImGui::GetIO();

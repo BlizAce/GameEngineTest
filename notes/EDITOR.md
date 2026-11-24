@@ -104,13 +104,19 @@ and interaction is what automated tests see least of.
 
 Every panel action routes through `EditorConsole`, so the requirement in AGENTS.md ("every editor action will have a
 scripting/console command equivalent") holds for what exists: `scene.load/save`, `entity.create/destroy/set/inspect`,
-`content.list/open`, `viewport.camera`, `pick.at`, `screenshot`, `script.run`, `editor.select/clear/info/input/quit`,
-`panels.show`.
+`content.list/open`, `viewport.camera`, `view.frame/speed/show`, `pick.at`, `screenshot`, `script.run`,
+`editor.select/clear/info/input/quit`, `editor.scripts.play/pause/stop`, `panels.show`, `layout.reset/report`, `ui.scale`.
+(`help` prints the live list, so this sentence cannot go stale in a way a reader would be misled by — it is the prose
+convenience, not the source of truth.)
 
 Two honest asymmetries:
 * The console takes a string where a widget would offer a constrained control (a checkbox, an enum combo). `entity.set`
   therefore tries bool words, then a number, then stores text — which is right for both `Visible false` and
   `roughness 0.2`, and fails at the reflection layer rather than storing zero when the kind does not match.
+* The reverse also happens now: the viewport toolbar's fly-speed field clamps to 0.1–250 m/s while `view.speed` accepts any
+  positive number. A drag widget needs bounds (an unbounded drag runs away with the value and there is no other way to say
+  "stop"), whereas a typed value is deliberate, so the command stays looser than the control rather than refusing something
+  an author asked for on purpose.
 * `script.run` executes a Lua file; the sandboxed engine API in `engine/Scripting/.../EngineAPI.h` is the scripted path for
   scene work and is where richer agent operations belong. The editor console is a front end to engine code, not a second
   scripting host — it must not grow its own bindings that scripts cannot reach.
